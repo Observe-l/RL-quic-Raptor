@@ -34,6 +34,7 @@ type SendOptions struct {
 	BlockPause    time.Duration
 	WarnDgramSize int           // bytes; 0 disables
 	PostWait      time.Duration // linger before closing
+	AckEvery      int           // write 1B on a stream every N datagrams (ack-eliciting); <=0 uses default
 }
 
 // ClientSendFile connects and sends a file using QFEC header + RaptorQ symbols over datagrams.
@@ -49,6 +50,10 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	L := opts.L
 	if L <= 0 {
 		L = DefaultL
+	}
+	ackEvery := opts.AckEvery
+	if ackEvery <= 0 {
+		ackEvery = 8
 	}
 
 	f, err := os.Open(path)
@@ -110,12 +115,15 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	keepStr, _ := conn.OpenStream()
 	keepDone := make(chan struct{})
 	kaStop := make(chan struct{})
+	// Channel to request ack-eliciting writes without blocking the sender loop.
+	ackReq := make(chan struct{}, 32)
 	go func() {
 		defer close(keepDone)
 		if keepStr == nil {
 			return
 		}
-		t := time.NewTicker(50 * time.Millisecond)
+		// Fallback keepalive ticker (when not writing per-ackEvery below)
+		t := time.NewTicker(750 * time.Millisecond)
 		defer t.Stop()
 		b := []byte{0}
 		for {
@@ -125,6 +133,10 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 			case <-kaStop:
 				return
 			case <-t.C:
+				_ = keepStr.SetWriteDeadline(time.Now().Add(10 * time.Millisecond))
+				_, _ = keepStr.Write(b)
+			case <-ackReq:
+				_ = keepStr.SetWriteDeadline(time.Now().Add(5 * time.Millisecond))
 				_, _ = keepStr.Write(b)
 			}
 		}
@@ -133,6 +145,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	// Metrics counters
 	start := time.Now()
 	var sentDgrams, sentBytes, sendErrs, dtleCount int64
+	var dgramsSinceAck int
 
 	// Send symbols per block
 	buf := make([]byte, K*L)
@@ -202,6 +215,14 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 				} else {
 					sentDgrams++
 					sentBytes += int64(len(b))
+				}
+			}
+			// Make this packet train ack-eliciting periodically to allow CC to progress.
+			if keepStr != nil {
+				dgramsSinceAck++
+				if dgramsSinceAck >= ackEvery {
+					select { case ackReq <- struct{}{}: default: }
+					dgramsSinceAck = 0
 				}
 			}
 			if opts.PaceEach > 0 {

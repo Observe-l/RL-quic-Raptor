@@ -68,10 +68,10 @@ configure_netem() {
 }
 
 run_client() {
-  local scheme=$1 N=$2 K=$3 L=$4 lossP=$5 pace=$6 blockPause=$7 postWait=$8
+  local scheme=$1 N=$2 K=$3 L=$4 pace=$5 blockPause=$6 postWait=$7
   local start_ns end_ns
   start_ns=$(date +%s%N)
-  "$BIN_DIR/quicfec-client" -addr "$NS_IP_ADDR:4242" -file "$FILE" -N "$N" -K "$K" -L "$L" -loss "$lossP" -pace "$pace" -block-pause "$blockPause" -post-wait "$postWait" -dgram-warn 1400
+  "$BIN_DIR/quicfec-client" -addr "$NS_IP_ADDR:4242" -file "$FILE" -N "$N" -K "$K" -L "$L" -pace "$pace" -ack-every 2 -block-pause "$blockPause" -post-wait "$postWait" -dgram-warn 1400
   end_ns=$(date +%s%N)
   echo "$start_ns $end_ns"
 }
@@ -112,23 +112,23 @@ main() {
 
   # T1: Ingress-only shaping (server inbound) 20 Mbps, 40±5 ms, loss=0
   configure_netem false true 40 5 20 0 0
-  read s1 e1 < <(run_client raptorq 8 6 1100 0.0 100us 0 1s)
+  read s1 e1 < <(run_client raptorq 8 6 1100 0 0 1s)
   g1=$(calc_goodput "$s1" "$e1")
   echo "[T1] goodput_mbps=$g1 (expect ~19-20)"; verify_md5 || true
 
   # T2: Egress+Ingress both 10 Mbps
   configure_netem true true 40 5 10 0 0
-  read s2 e2 < <(run_client raptorq 8 6 1100 0.0 100us 0 1s)
+  read s2 e2 < <(run_client raptorq 8 6 1100 0 0 1s)
   g2=$(calc_goodput "$s2" "$e2")
   echo "[T2] goodput_mbps=$g2 (expect ~9-10)"; verify_md5 || true
 
   # T3: Random loss 5%: compare no FEC overhead vs 15% overhead (K=40,N=46)
   configure_netem true true 40 5 50 0.05 0
   # No extra repairs (N=K=40): expect higher failure probability
-  read s3a e3a < <(run_client raptorq 40 40 1100 0.0 300us 1ms 2ms)
+  read s3a e3a < <(run_client raptorq 40 40 1100 0 1ms 2ms)
   resA=0; verify_md5 || resA=$?
   # With ~15% overhead (K=40,N=46): expect success
-  read s3b e3b < <(run_client raptorq 46 40 1100 0.0 300us 1ms 2ms)
+  read s3b e3b < <(run_client raptorq 46 40 1100 0 1ms 2ms)
   g3b=$(calc_goodput "$s3b" "$e3b")
   resB=0; verify_md5 || resB=$?
   echo "[T3] no-overhead result=$resA; with-overhead goodput_mbps=$g3b result=$resB (expect resB==0)"

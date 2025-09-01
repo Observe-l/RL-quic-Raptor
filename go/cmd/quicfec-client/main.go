@@ -24,11 +24,12 @@ func main() {
 		blkPause = flag.Duration("block-pause", 0, "sleep after each block")
 		warn     = flag.Int("dgram-warn", 0, "warn if datagram exceeds bytes (0=off)")
 		postWait = flag.Duration("post-wait", 0, "linger after sending to allow server to finalize")
+		ackEvery = flag.Int("ack-every", 8, "write 1B on a stream every N datagrams (0=auto)")
 	)
 	flag.Parse()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	opts := fecquic.SendOptions{K: *K, N: *N, L: *L, InsecureTLS: *insecure, DropProb: *loss, PaceEach: *pace, BlockPause: *blkPause, WarnDgramSize: *warn, PostWait: *postWait}
+	opts := fecquic.SendOptions{K: *K, N: *N, L: *L, InsecureTLS: *insecure, DropProb: *loss, PaceEach: *pace, BlockPause: *blkPause, WarnDgramSize: *warn, PostWait: *postWait, AckEvery: *ackEvery}
 	if err := fecquic.ClientSendFile(ctx, *addr, *alpn, *filePath, opts); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
