@@ -10,6 +10,7 @@ import (
 )
 
 const (
+	// Increase queues to allow higher datagram throughput without blocking the app.
 	maxDatagramSendQueueLen = 32
 	maxDatagramRcvQueueLen  = 128
 )

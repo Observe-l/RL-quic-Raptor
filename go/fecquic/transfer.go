@@ -35,6 +35,7 @@ type SendOptions struct {
 	WarnDgramSize int           // bytes; 0 disables
 	PostWait      time.Duration // linger before closing
 	AckEvery      int           // write 1B on a stream every N datagrams (ack-eliciting); <=0 uses default
+	Transport     string        // "dgram" (default) or "stream"
 }
 
 // ClientSendFile connects and sends a file using QFEC header + RaptorQ symbols over datagrams.
@@ -53,7 +54,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	}
 	ackEvery := opts.AckEvery
 	if ackEvery <= 0 {
-		ackEvery = 8
+		ackEvery = 1
 	}
 
 	f, err := os.Open(path)
@@ -74,8 +75,10 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	qconf := &quic.Config{
 		EnableDatagrams: true,
 		// Prevent idle timeouts during datagram-heavy transfers by sending frequent PINGs.
-		KeepAlivePeriod: 50 * time.Millisecond,
-		MaxIdleTimeout:  90 * time.Second,
+		KeepAlivePeriod:                50 * time.Millisecond,
+		MaxIdleTimeout:                 90 * time.Second,
+		InitialStreamReceiveWindow:     8 * 1024 * 1024,
+		InitialConnectionReceiveWindow: 16 * 1024 * 1024,
 	}
 	conn, err := quic.DialAddr(ctx, addr, tlsConf, qconf)
 	if err != nil {
@@ -146,6 +149,8 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	start := time.Now()
 	var sentDgrams, sentBytes, sendErrs, dtleCount int64
 	var dgramsSinceAck int
+	var encTime time.Duration
+	var sendTime time.Duration
 
 	// Send symbols per block
 	buf := make([]byte, K*L)
@@ -171,11 +176,13 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 			return err
 		}
 		// Encode block
+		tEnc := time.Now()
 		pkts, encErr := fec.RaptorQEncodeBlock(buf, N, K, L)
 		if encErr != nil {
 			return encErr
 		}
-		// Emit datagrams with FEC header
+		encTime += time.Since(tEnc)
+		// Emit symbols per chosen transport
 		for _, p := range pkts {
 			h := fecwire.FECHeader{
 				Version:    1,
@@ -196,34 +203,50 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 			if rng != nil && rng.Float64() < opts.DropProb {
 				// simulate sender drop
 			} else {
-				// Best effort pacing: small sleep to avoid bursting
-				if err := conn.SendDatagram(b); err != nil {
-					// If too large now, skip; or backoff briefly
-					var dtle *quic.DatagramTooLargeError
-					if errors.As(err, &dtle) {
-						// Cannot send now due to MTU, drop repair symbol
-						// drop
-						dtleCount++
+				tSend := time.Now()
+				if opts.Transport == "stream" {
+					// Send on a dedicated uni stream for symbols
+					s, err := conn.OpenUniStream()
+					if err != nil {
+						return err
 					}
-					// other transient errs: small wait
-					sendErrs++
-					// second attempt (best-effort)
-					if err2 := conn.SendDatagram(b); err2 == nil {
+					if _, err := s.Write(b); err != nil {
+						return err
+					}
+					_ = s.Close()
+					sentDgrams++
+					sentBytes += int64(len(b))
+				} else {
+					// Default: datagrams
+					if keepStr != nil {
+						if ackEvery <= 1 || dgramsSinceAck+1 >= ackEvery {
+							select {
+							case ackReq <- struct{}{}:
+							default:
+							}
+							dgramsSinceAck = 0
+						}
+					}
+					if err := conn.SendDatagram(b); err != nil {
+						var dtle *quic.DatagramTooLargeError
+						if errors.As(err, &dtle) {
+							dtleCount++
+						}
+						sendErrs++
+						if err2 := conn.SendDatagram(b); err2 == nil {
+							sentDgrams++
+							sentBytes += int64(len(b))
+						}
+					} else {
 						sentDgrams++
 						sentBytes += int64(len(b))
 					}
-				} else {
-					sentDgrams++
-					sentBytes += int64(len(b))
 				}
+				sendTime += time.Since(tSend)
 			}
-			// Make this packet train ack-eliciting periodically to allow CC to progress.
+			// Count towards ack pacing decisions
 			if keepStr != nil {
 				dgramsSinceAck++
-				if dgramsSinceAck >= ackEvery {
-					select { case ackReq <- struct{}{}: default: }
-					dgramsSinceAck = 0
-				}
 			}
 			if opts.PaceEach > 0 {
 				time.Sleep(opts.PaceEach)
@@ -254,13 +277,18 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		dur = 1e-6
 	}
 	mbps := (float64(sentBytes) * 8 / 1e6) / dur
-	fmt.Fprintf(os.Stderr, "[client-stats] dgrams=%d bytes=%d dur_s=%.3f mbps=%.2f errs=%d dtle=%d\n", sentDgrams, sentBytes, dur, mbps, sendErrs, dtleCount)
+	fmt.Fprintf(os.Stderr, "[client-stats] dgrams=%d bytes=%d dur_s=%.3f mbps=%.2f errs=%d dtle=%d enc_ms=%.1f send_ms=%.1f\n", sentDgrams, sentBytes, dur, mbps, sendErrs, dtleCount, float64(encTime.Milliseconds()), float64(sendTime.Milliseconds()))
 	return nil
 }
 
 // ServerRecvFile listens for a connection on ln, receives the file, verifies SHA256 and writes to outDir.
 // Returns the path to the stored file.
 func ServerRecvFile(ctx context.Context, ln *quic.Listener, outDir string) (string, error) {
+	return ServerRecvFileWithRX(ctx, ln, outDir, RXOptions{})
+}
+
+// ServerRecvFileWithRX is like ServerRecvFile but allows configuring the receiver buffer.
+func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string, rx RXOptions) (string, error) {
 	// Accept one connection
 	conn, err := ln.Accept(ctx)
 	if err != nil {
@@ -281,7 +309,6 @@ func ServerRecvFile(ctx context.Context, ln *quic.Listener, outDir string) (stri
 	if err := hdr.UnmarshalBinary(hdrBytes); err != nil {
 		return "", err
 	}
-	L := int(hdr.ChunkL)
 	// Try read optional filename (u16 len + bytes); safe if EOF
 	var baseName string
 	var lb [2]byte
@@ -296,22 +323,6 @@ func ServerRecvFile(ctx context.Context, ln *quic.Listener, outDir string) (stri
 		}
 	}
 
-	// Prepare file
-	var finalBase string
-	if baseName != "" {
-		finalBase = baseName + ".recv"
-	} else {
-		finalBase = fmt.Sprintf("qfec_%d.bin", time.Now().UnixNano())
-	}
-	tmpPath := filepath.Join(outDir, finalBase+".part")
-	out, err := os.Create(tmpPath)
-	if err != nil {
-		return "", err
-	}
-	defer out.Close()
-	// Pre-size for efficiency and to avoid padding leaks
-	_ = out.Truncate(int64(hdr.FileSize))
-
 	// Drain any additional streams (e.g., client keepalive stream) to avoid flow control stalls.
 	go func() {
 		for {
@@ -323,114 +334,110 @@ func ServerRecvFile(ctx context.Context, ln *quic.Listener, outDir string) (stri
 			_ = s.Close()
 		}
 	}()
-
-	// Metrics
+	// Setup RX manager (buffer + decode workers)
+	// We don't know K from header directly; it will be carried on datagrams. We'll detect per-block.
+	rxm, err := newRXManager(hdr.FileSize, 0 /*K*/, int(hdr.ChunkL), outDir, baseName, rx)
+	if err != nil {
+		return "", err
+	}
+	rxm.start(rx)
 	recvStart := time.Now()
 	var rcvDgrams int64
-	var decBlocks int64
-	var decTime time.Duration
-
-	// RQ state per block
-	type dstate struct {
-		recv    []fec.Packet
-		decoded []byte
-		done    bool
-	}
-	blocks := map[uint16]*dstate{}
-	var receivedBytes uint64
-	var nextWriteID uint16
-	// Loop receiving datagrams until we have FileSize bytes reconstructed
-	for receivedBytes < hdr.FileSize {
-		b, err := conn.ReceiveDatagram(ctx)
-		if err != nil {
-			return "", err
-		}
-		rcvDgrams++
-		var fh fecwire.FECHeader
-		if !fh.UnmarshalBinary(b) {
-			continue
-		}
-		if fh.Scheme != fecwire.SchemeRaptorQ {
-			continue
-		}
-		if int(fh.PayloadLen) > len(b)-fecwire.HeaderLen {
-			continue
-		}
-		data := b[fecwire.HeaderLen : fecwire.HeaderLen+int(fh.PayloadLen)]
-		st := blocks[fh.BlockID]
-		if st == nil {
-			st = &dstate{recv: make([]fec.Packet, 0, int(fh.N))}
-			blocks[fh.BlockID] = st
-		}
-		st.recv = append(st.recv, fec.Packet{Index: int(fh.SymID), Data: append([]byte(nil), data...)})
-		// Try to write any ready consecutive blocks starting from nextWriteID
+	// Concurrent receivers: datagrams and uni streams
+	cctx, cancelRx := context.WithCancel(ctx)
+	defer cancelRx()
+	doneCh := make(chan struct{})
+	go func() {
+		defer close(doneCh)
+		// wait until file complete
 		for {
-			s, ok := blocks[nextWriteID]
-			if !ok {
-				break
+			if rxm.written.Load() >= hdr.FileSize {
+				return
 			}
-			rcvDgrams++
-			if s.done {
-				if _, err := out.Write(s.decoded); err != nil {
-					return "", err
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+	// DATAGRAM receiver
+	go func() {
+		for {
+			if rxm.written.Load() >= hdr.FileSize {
+				return
+			}
+			b, err := conn.ReceiveDatagram(cctx)
+			if err != nil {
+				if cctx.Err() != nil {
+					return
 				}
-				receivedBytes += uint64(len(s.decoded))
-				delete(blocks, nextWriteID)
-				nextWriteID++
 				continue
 			}
-			// Can we decode now?
-			// We require at least K symbols for this block.
-			if len(s.recv) < int(fh.K) {
-				break
+			rcvDgrams++
+			var fh fecwire.FECHeader
+			if !fh.UnmarshalBinary(b) || fh.Scheme != fecwire.SchemeRaptorQ {
+				continue
 			}
-			maxBlock := int(fh.K) * L
-			// Compute exact size for this block based on file size and position
-			// Bytes remaining at this position:
-			bytesBefore := uint64(int(nextWriteID) * maxBlock)
-			if bytesBefore >= hdr.FileSize {
-				return "", errors.New("invalid block ordering or size")
+			if int(fh.PayloadLen) > len(b)-fecwire.HeaderLen {
+				continue
 			}
+			data := b[fecwire.HeaderLen : fecwire.HeaderLen+int(fh.PayloadLen)]
+			maxBlock := int(fh.K) * int(hdr.ChunkL)
+			bytesBefore := uint64(int(fh.BlockID) * maxBlock)
 			remAtPos := int(hdr.FileSize - bytesBefore)
 			if remAtPos > maxBlock {
 				remAtPos = maxBlock
 			}
-			t0 := time.Now()
-			decoded, ok := fec.RaptorQDecodeBytes(s.recv, int(fh.N), int(fh.K), L, remAtPos)
-			decTime += time.Since(t0)
-			if !ok {
-				// Need more symbols; exit write loop and wait for more datagrams
-				// If we've already collected N symbols and still can't decode, fail fast
-				if len(s.recv) >= int(fh.N) {
-					return "", errors.New("fec decode failed for block")
-				}
-				break
-			}
-			if len(decoded) > remAtPos {
-				decoded = decoded[:remAtPos]
-			}
-			s.decoded = decoded
-			s.done = true
-			decBlocks++
-			// loop will attempt to write it immediately in next iteration
+			_ = rxm.ingest(fh.BlockID, int(fh.SymID), int(fh.N), int(fh.K), int(hdr.ChunkL), data, remAtPos)
 		}
-	}
-	// Verify SHA
-	if _, err := out.Seek(0, io.SeekStart); err != nil {
-		return "", err
-	}
-	sum, _, err := ComputeSHA256(out)
+	}()
+	// Uni stream receiver (symbols framed as {FEC header}{payload})
+	go func() {
+		for {
+			if rxm.written.Load() >= hdr.FileSize {
+				return
+			}
+			s, err := conn.AcceptUniStream(cctx)
+			if err != nil {
+				if cctx.Err() != nil {
+					return
+				}
+				continue
+			}
+			go func(us *quic.ReceiveStream) {
+				defer us.CancelRead(0)
+				for {
+					if rxm.written.Load() >= hdr.FileSize {
+						return
+					}
+					hdrb := make([]byte, fecwire.HeaderLen)
+					if _, err := io.ReadFull(us, hdrb); err != nil {
+						return
+					}
+					var fh fecwire.FECHeader
+					if !fh.UnmarshalBinary(hdrb) || fh.Scheme != fecwire.SchemeRaptorQ {
+						return
+					}
+					plen := int(fh.PayloadLen)
+					if plen <= 0 || plen > 65536 {
+						return
+					}
+					buf := make([]byte, plen)
+					if _, err := io.ReadFull(us, buf); err != nil {
+						return
+					}
+					maxBlock := int(fh.K) * int(hdr.ChunkL)
+					bytesBefore := uint64(int(fh.BlockID) * maxBlock)
+					remAtPos := int(hdr.FileSize - bytesBefore)
+					if remAtPos > maxBlock {
+						remAtPos = maxBlock
+					}
+					_ = rxm.ingest(fh.BlockID, int(fh.SymID), int(fh.N), int(fh.K), int(hdr.ChunkL), buf, remAtPos)
+				}
+			}(s)
+		}
+	}()
+	<-doneCh
+	cancelRx()
+	finalPath, err := rxm.closeAndFinalize(hdr.SHA256)
 	if err != nil {
-		return "", err
-	}
-	if sum != hdr.SHA256 {
-		return "", errors.New("sha256 mismatch")
-	}
-	finalPath := filepath.Join(outDir, finalBase)
-	if err := out.Close(); err != nil {
-		return "", err
-	}
-	if err := os.Rename(tmpPath, finalPath); err != nil {
 		return "", err
 	}
 	rdur := time.Since(recvStart).Seconds()
@@ -438,7 +445,13 @@ func ServerRecvFile(ctx context.Context, ln *quic.Listener, outDir string) (stri
 		rdur = 1e-6
 	}
 	mbps2 := (float64(hdr.FileSize) * 8 / 1e6) / rdur
-	fmt.Fprintf(os.Stderr, "[server-stats] dgrams=%d blocks=%d decode_ms=%.1f dur_s=%.3f mbps=%.2f -> %s\n", rcvDgrams, decBlocks, float64(decTime.Milliseconds()), rdur, mbps2, finalPath)
+	// best-effort metric extraction (type assert to access fields)
+	if rxm != nil {
+		fmt.Fprintf(os.Stderr, "[server-stats] dgrams=%d dur_s=%.3f mbps=%.2f dec_blocks=%d dec_ms=%d drop_repairs=%d -> %s\n",
+			rcvDgrams, rdur, mbps2, rxm.decBlocks.Load(), rxm.decTimeTotal.Load(), rxm.dropsRepairs.Load(), finalPath)
+	} else {
+		fmt.Fprintf(os.Stderr, "[server-stats] dgrams=%d dur_s=%.3f mbps=%.2f -> %s\n", rcvDgrams, rdur, mbps2, finalPath)
+	}
 	return finalPath, nil
 }
 
@@ -448,15 +461,17 @@ func ListenAndServe(ctx context.Context, addr, alpn, outDir string, tlsConf *tls
 		return "", errors.New("tlsConf required")
 	}
 	ln, err := quic.ListenAddr(addr, tlsConf, &quic.Config{
-		EnableDatagrams: true,
-		KeepAlivePeriod: 2 * time.Second,
-		MaxIdleTimeout:  90 * time.Second,
+		EnableDatagrams:                true,
+		KeepAlivePeriod:                2 * time.Second,
+		MaxIdleTimeout:                 90 * time.Second,
+		InitialStreamReceiveWindow:     8 * 1024 * 1024,
+		InitialConnectionReceiveWindow: 16 * 1024 * 1024,
 	})
 	if err != nil {
 		return "", err
 	}
 	defer ln.Close()
-	return ServerRecvFile(ctx, ln, outDir)
+	return ServerRecvFileWithRX(ctx, ln, outDir, RXOptions{})
 }
 
 // ListenAndServeLoop listens on addr and serves multiple transfers until ctx is done.
@@ -465,9 +480,11 @@ func ListenAndServeLoop(ctx context.Context, addr, alpn, outDir string, tlsConf 
 		return errors.New("tlsConf required")
 	}
 	ln, err := quic.ListenAddr(addr, tlsConf, &quic.Config{
-		EnableDatagrams: true,
-		KeepAlivePeriod: 2 * time.Second,
-		MaxIdleTimeout:  90 * time.Second,
+		EnableDatagrams:                true,
+		KeepAlivePeriod:                2 * time.Second,
+		MaxIdleTimeout:                 90 * time.Second,
+		InitialStreamReceiveWindow:     8 * 1024 * 1024,
+		InitialConnectionReceiveWindow: 16 * 1024 * 1024,
 	})
 	if err != nil {
 		return err
@@ -479,13 +496,48 @@ func ListenAndServeLoop(ctx context.Context, addr, alpn, outDir string, tlsConf 
 			return ctx.Err()
 		default:
 		}
-		path, err := ServerRecvFile(ctx, ln, outDir)
+		path, err := ServerRecvFileWithRX(ctx, ln, outDir, RXOptions{})
 		if err != nil {
 			// If the context was canceled or deadline exceeded, exit gracefully.
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return nil
 			}
 			// Otherwise, continue accepting future transfers.
+			continue
+		}
+		if onStored != nil {
+			onStored(path)
+		}
+	}
+}
+
+// ListenAndServeLoopWithRX allows configuring the receiver options.
+func ListenAndServeLoopWithRX(ctx context.Context, addr, alpn, outDir string, tlsConf *tls.Config, rx RXOptions, onStored func(string)) error {
+	if tlsConf == nil {
+		return errors.New("tlsConf required")
+	}
+	ln, err := quic.ListenAddr(addr, tlsConf, &quic.Config{
+		EnableDatagrams:                true,
+		KeepAlivePeriod:                2 * time.Second,
+		MaxIdleTimeout:                 90 * time.Second,
+		InitialStreamReceiveWindow:     8 * 1024 * 1024,
+		InitialConnectionReceiveWindow: 16 * 1024 * 1024,
+	})
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		path, err := ServerRecvFileWithRX(ctx, ln, outDir, rx)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil
+			}
 			continue
 		}
 		if onStored != nil {
