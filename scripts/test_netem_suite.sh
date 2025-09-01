@@ -42,12 +42,12 @@ start_servers() {
   echo "[srv] Starting gRPC netem server in netns..."
   sudo ip netns exec "$NS" bash -lc "\
     set -e; \
-    nohup '$BIN_DIR/quicfec-grpc-server' > /tmp/grpc-netem.log 2>&1 & echo \$! > /tmp/grpc-netem.pid"
-  sleep 0.3
+    nohup $BIN_DIR/quicfec-grpc-server > /tmp/grpc-netem.log 2>&1 & echo \$! > /tmp/grpc-netem.pid"
+  sleep 0.8
   echo "[srv] Starting QUIC-FEC data server in netns (:4242)..."
   sudo ip netns exec "$NS" bash -lc "\
     set -e; \
-    nohup '$BIN_DIR/quicfec-server' -addr ':4242' -out '$GO_DIR/test_data' > /tmp/quicfec-data.log 2>&1 & echo \$! > /tmp/quicfec-data.pid"
+    nohup $BIN_DIR/quicfec-server -addr ':4242' -out $GO_DIR/test_data > /tmp/quicfec-data.log 2>&1 & echo \$! > /tmp/quicfec-data.pid"
 }
 
 stop_servers() {
@@ -60,17 +60,18 @@ stop_servers() {
 
 configure_netem() {
   local egress=$1 ingress=$2 rtt=$3 jitter=$4 bw=$5 loss=$6 reorder=$7
-  echo "[ctl] Configure netem: eg=$egress in=$ing rtt=${rtt}/${jitter} bw=${bw}Mbps loss=${loss} reorder=${reorder}"
+  echo "[ctl] Configure netem: eg=$egress in=$ingress rtt=${rtt}/${jitter} bw=${bw}Mbps loss=${loss} reorder=${reorder}"
   "$BIN_DIR/quicfec-ctl" \
     -addr "$NS_IP_ADDR:50051" -cmd configure -dev "$V1" \
     -egress="$egress" -ingress="$ingress" -rtt "$rtt" -jitter "$jitter" -bw "$bw" -loss "$loss" -reorder "$reorder"
+  sleep 0.3
 }
 
 run_client() {
   local scheme=$1 N=$2 K=$3 L=$4 lossP=$5 pace=$6 blockPause=$7 postWait=$8
   local start_ns end_ns
   start_ns=$(date +%s%N)
-  "$BIN_DIR/quicfec-client" -addr "$NS_IP_ADDR:4242" -file "$FILE" -scheme "$scheme" -N "$N" -K "$K" -L "$L" -loss "$lossP" -pace "$pace" -block-pause "$blockPause" -post-wait "$postWait" -dgram-warn 1400
+  "$BIN_DIR/quicfec-client" -addr "$NS_IP_ADDR:4242" -file "$FILE" -N "$N" -K "$K" -L "$L" -loss "$lossP" -pace "$pace" -block-pause "$blockPause" -post-wait "$postWait" -dgram-warn 1400
   end_ns=$(date +%s%N)
   echo "$start_ns $end_ns"
 }
@@ -90,6 +91,11 @@ PY
 
 verify_md5() {
   local in="$FILE" out="$GO_DIR/test_data/$(basename "$FILE").recv"
+  # wait up to 3s for the server to finalize rename
+  for i in {1..30}; do
+    [[ -f "$out" ]] && break
+    sleep 0.1
+  done
   if [[ ! -f "$out" ]]; then echo "[verify] output missing: $out"; return 2; fi
   local a b; a=$(md5sum "$in" | awk '{print $1}'); b=$(md5sum "$out" | awk '{print $1}')
   if [[ "$a" != "$b" ]]; then echo "[verify] MD5 mismatch"; return 3; fi
@@ -104,15 +110,15 @@ main() {
   setup_ns
   start_servers
 
-  # T1: Egress-only shaping 20 Mbps, 40±5 ms, loss=0
-  configure_netem true false 40 5 20 0 0
-  read s1 e1 < <(run_client raptorq 8 6 1100 0.0 300us 2ms 2ms)
+  # T1: Ingress-only shaping (server inbound) 20 Mbps, 40±5 ms, loss=0
+  configure_netem false true 40 5 20 0 0
+  read s1 e1 < <(run_client raptorq 8 6 1100 0.0 100us 0 1s)
   g1=$(calc_goodput "$s1" "$e1")
   echo "[T1] goodput_mbps=$g1 (expect ~19-20)"; verify_md5 || true
 
   # T2: Egress+Ingress both 10 Mbps
   configure_netem true true 40 5 10 0 0
-  read s2 e2 < <(run_client raptorq 8 6 1100 0.0 300us 2ms 2ms)
+  read s2 e2 < <(run_client raptorq 8 6 1100 0.0 100us 0 1s)
   g2=$(calc_goodput "$s2" "$e2")
   echo "[T2] goodput_mbps=$g2 (expect ~9-10)"; verify_md5 || true
 

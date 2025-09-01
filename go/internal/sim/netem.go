@@ -40,15 +40,17 @@ func (m *NetemManager) Apply(net *NetScenario) error {
 	// Egress
 	if net.UseEgress {
 		m.egUnlimited = net.BandwidthMbps <= 0
+		// Always reset root qdisc to avoid tc 'change not supported' issues
+		_ = m.delRoot(m.dev)
 		if m.egUnlimited {
-			if err := m.replaceRootNetem(m.dev, net); err != nil {
+			if err := m.addRootNetem(m.dev, net); err != nil {
 				return err
 			}
 		} else {
-			if err := m.replaceRootHTB(m.dev, net.BandwidthMbps); err != nil {
+			if err := m.addRootHTB(m.dev, net.BandwidthMbps); err != nil {
 				return err
 			}
-			if err := m.replaceNetem(m.dev, "1:1", net); err != nil {
+			if err := m.addNetem(m.dev, "1:1", net); err != nil {
 				return err
 			}
 		}
@@ -62,15 +64,17 @@ func (m *NetemManager) Apply(net *NetScenario) error {
 			return err
 		}
 		m.inUnlimited = net.BandwidthMbps <= 0
+		// Reset IFB root before applying
+		_ = m.delRoot(m.ifb)
 		if m.inUnlimited {
-			if err := m.replaceRootNetem(m.ifb, net); err != nil {
+			if err := m.addRootNetem(m.ifb, net); err != nil {
 				return err
 			}
 		} else {
-			if err := m.replaceRootHTB(m.ifb, net.BandwidthMbps); err != nil {
+			if err := m.addRootHTB(m.ifb, net.BandwidthMbps); err != nil {
 				return err
 			}
-			if err := m.replaceNetem(m.ifb, "2:1", net); err != nil {
+			if err := m.addNetem(m.ifb, "1:1", net); err != nil {
 				return err
 			}
 		}
@@ -83,23 +87,38 @@ func (m *NetemManager) Update(net *NetScenario) error {
 		return nil
 	}
 	if net.UseEgress {
+		m.egUnlimited = net.BandwidthMbps <= 0
 		if m.egUnlimited {
-			if err := m.replaceRootNetem(m.dev, net); err != nil {
+			if err := m.addRootNetem(m.dev, net); err != nil {
 				return err
 			}
 		} else {
-			if err := m.replaceNetem(m.dev, "1:1", net); err != nil {
+			if err := m.addRootHTB(m.dev, net.BandwidthMbps); err != nil {
+				return err
+			}
+			if err := m.addNetem(m.dev, "1:1", net); err != nil {
 				return err
 			}
 		}
 	}
 	if net.UseIngress {
+		// Ensure IFB and redirection remain in place across updates
+		if err := m.ensureIFB(); err != nil {
+			return err
+		}
+		if err := m.redirectIngressToIFB(m.dev, m.ifb); err != nil {
+			return err
+		}
+		m.inUnlimited = net.BandwidthMbps <= 0
 		if m.inUnlimited {
-			if err := m.replaceRootNetem(m.ifb, net); err != nil {
+			if err := m.addRootNetem(m.ifb, net); err != nil {
 				return err
 			}
 		} else {
-			if err := m.replaceNetem(m.ifb, "2:1", net); err != nil {
+			if err := m.addRootHTB(m.ifb, net.BandwidthMbps); err != nil {
+				return err
+			}
+			if err := m.addNetem(m.ifb, "1:1", net); err != nil {
 				return err
 			}
 		}
@@ -118,11 +137,13 @@ func (m *NetemManager) Cleanup() error {
 	return nil
 }
 
-func (m *NetemManager) replaceRootHTB(dev string, mbps float32) error {
+func (m *NetemManager) addRootHTB(dev string, mbps float32) error {
 	if mbps <= 0 { // unlimited
-		return run("tc", "qdisc", "replace", "dev", dev, "root", "handle", "10:", "netem")
+		return m.addRootNetem(dev, &NetScenario{})
 	}
-	if err := run("tc", "qdisc", "replace", "dev", dev, "root", "handle", "1:", "htb", "default", "1"); err != nil {
+	// Ensure a clean root, then add HTB root and class 1:1
+	_ = m.delRoot(dev)
+	if err := run("tc", "qdisc", "add", "dev", dev, "root", "handle", "1:", "htb", "default", "1"); err != nil {
 		return err
 	}
 	rate := fmt.Sprintf("%.0fmbit", mbps)
@@ -132,26 +153,34 @@ func (m *NetemManager) replaceRootHTB(dev string, mbps float32) error {
 	return nil
 }
 
-func (m *NetemManager) replaceNetem(dev, parent string, net *NetScenario) error {
+func (m *NetemManager) addNetem(dev, parent string, net *NetScenario) error {
 	delay := fmt.Sprintf("%.2fms", net.RttMsMean)
 	jitter := fmt.Sprintf("%.2fms", net.RttJitterMs)
 	loss := fmt.Sprintf("%.3f%%", net.LossRate*100.0)
-	args := []string{"qdisc", "replace", "dev", dev, "parent", parent, "handle", "100:", "netem", "delay", delay, jitter, "loss", loss}
+	// Remove any existing child netem under this parent, then add fresh.
+	_ = run("tc", "qdisc", "del", "dev", dev, "parent", parent, "handle", "100:")
+	args := []string{"qdisc", "add", "dev", dev, "parent", parent, "handle", "100:", "netem", "delay", delay, jitter, "loss", loss}
 	if net.ReorderRate > 0 {
 		args = append(args, "reorder", fmt.Sprintf("%.2f%%", net.ReorderRate*100.0), "gap", "5")
 	}
 	return run("tc", args...)
 }
 
-func (m *NetemManager) replaceRootNetem(dev string, net *NetScenario) error {
+func (m *NetemManager) addRootNetem(dev string, net *NetScenario) error {
 	delay := fmt.Sprintf("%.2fms", net.RttMsMean)
 	jitter := fmt.Sprintf("%.2fms", net.RttJitterMs)
 	loss := fmt.Sprintf("%.3f%%", net.LossRate*100.0)
-	args := []string{"qdisc", "replace", "dev", dev, "root", "handle", "10:", "netem", "delay", delay, jitter, "loss", loss}
+	// Ensure a clean root then add netem as root
+	_ = m.delRoot(dev)
+	args := []string{"qdisc", "add", "dev", dev, "root", "handle", "10:", "netem", "delay", delay, jitter, "loss", loss}
 	if net.ReorderRate > 0 {
 		args = append(args, "reorder", fmt.Sprintf("%.2f%%", net.ReorderRate*100.0), "gap", "5")
 	}
 	return run("tc", args...)
+}
+
+func (m *NetemManager) delRoot(dev string) error {
+	return run("tc", "qdisc", "del", "dev", dev, "root")
 }
 
 func (m *NetemManager) ensureIFB() error {
