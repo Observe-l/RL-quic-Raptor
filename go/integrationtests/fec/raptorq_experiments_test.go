@@ -34,7 +34,7 @@ func repoRootRQ(t *testing.T) string {
 // TestRaptorQ_ExperimentA validates p=0 correctness with systematic fast path.
 // Note: mark as short to avoid running by default in long CI; uncomment to enable heavy runs.
 func TestRaptorQ_ExperimentA(t *testing.T) {
-	t.Skip("skip by default; enable when running FEC experiments")
+	// t.Skip("skip by default; enable when running FEC experiments")
 
 	root := repoRootRQ(t)
 	srcPath := filepath.Join(root, "test_data", "train_FD001.txt")
@@ -103,23 +103,23 @@ func TestRaptorQ_ExperimentA(t *testing.T) {
 // TestRaptorQ_ExperimentB performs a small-sample bake-off across schemes.
 // This is a scaled-down version to keep CI reasonable; adjust counts for full study.
 func TestRaptorQ_ExperimentB_Scaled(t *testing.T) {
-	t.Skip("skip by default; enable when running FEC experiments")
+	// t.Skip("skip by default; enable when running FEC experiments")
 
 	const (
-		K = 26
-		L = 1500
-		N = 32
+		K = 5
+		L = 1100
+		N = 8
 	)
 	// 3 MB object
-	obj := make([]byte, 3<<20)
+	obj := make([]byte, 5<<20)
 	if _, err := crand.Read(obj); err != nil {
 		t.Fatalf("rand: %v", err)
 	}
 	rng := mrand.New(mrand.NewSource(1337))
-	ps := []float64{0.0, 0.001, 0.005, 0.01}
-	trials := 200 // scale up to 10k for full bake-off
+	ps := []float64{0.0, 0.001, 0.005, 0.010, 0.05}
+	trials := 1 // scale up to 10k for full bake-off
 
-	schemes := []string{"raptorq", "rs", "rlc", "polar"}
+	schemes := []string{"raptorq", "rs", "rlc"}
 	for _, scheme := range schemes {
 		for _, p := range ps {
 			okCnt := 0

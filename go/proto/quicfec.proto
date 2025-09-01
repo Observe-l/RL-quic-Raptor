@@ -1,0 +1,106 @@
+syntax = "proto3";
+package quicfec;
+
+option go_package = "github.com/quic-go/quic-go/gen/quicfec;quicfec";
+
+import "google/protobuf/empty.proto";
+
+// Minimal Env interface to control tc netem and run rollouts.
+service Env {
+  rpc Configure(ExperimentConfig) returns (google.protobuf.Empty);
+  rpc Reset(google.protobuf.Empty) returns (Observation);
+  rpc Rollout(stream StepRequest) returns (stream StepResponse);
+}
+
+enum FecScheme {
+  FEC_RLC = 0;
+  FEC_RAPTORQ = 1;
+}
+
+message RaptorQParams {
+  uint32 payload_bytes          = 1;  // per-packet payload
+  uint32 k_packets              = 2;  // source packets per block/window
+  uint32 repair_packets         = 3;  // number of repair packets (or prefer rate)
+  uint32 symbol_bytes           = 4;  // symbol size (often aligns with payload)
+  uint32 coding_window_pkts     = 5;  // window/block size
+  uint32 max_repairs_per_rtt    = 6;
+  float  target_overhead_pct    = 7;  // 0..100
+  uint32 interleaver_span       = 8;  // for burst resilience
+  uint64 esi_seed               = 9;
+  uint32 decode_deadline_ms     = 10;
+  uint32 inactivation_threshold = 11;
+  uint32 encoder_threads        = 12;
+  uint32 decoder_threads        = 13;
+}
+
+message QuicParams {
+  string congestion_ctrl        = 1;   // "cubic","reno","bbr"
+  uint32 initial_cwnd_pkts      = 2;
+  uint32 max_datagram_size      = 3;
+  float  pacing_gain            = 4;
+  uint32 ack_frequency          = 5;
+  uint32 reordering_threshold   = 6;
+  uint32 stream_count           = 7;
+  uint64 send_buffer_bytes      = 8;
+}
+
+message NetScenario {
+  string dev                    = 1;   // e.g., "eth0" or veth peer name
+  bool   use_egress             = 2;   // apply shaping on egress (root qdisc)
+  bool   use_ingress            = 3;   // apply shaping on ingress (via IFB)
+  float  rtt_ms_mean            = 4;
+  float  rtt_jitter_ms          = 5;
+  float  bandwidth_mbps         = 6;   // 0 means unlimited
+  float  loss_rate              = 7;   // 0..1
+  float  reorder_rate           = 8;   // 0..1
+  float  burst_len_mean         = 9;
+  uint64 rng_seed               = 10;  // for reproducible randomization
+}
+
+message ExperimentConfig {
+  FecScheme    scheme = 1;  // RLC or RAPTORQ only
+  RaptorQParams rq    = 2;  // used when scheme == RAPTORQ (ignored otherwise)
+  QuicParams    quic  = 3;
+  NetScenario   net   = 4;
+}
+
+message Observation {
+  repeated double features      = 1;   // normalized features for RL
+  double rtt_ms_p95             = 2;
+  double goodput_mbps           = 3;
+  double fec_overhead_pct       = 4;
+  double loss_rate_ewma         = 5;
+  double burst_estimate         = 6;
+}
+
+message Action {
+  float  repair_rate            = 1;   // 0..0.5
+  uint32 window_pkts            = 2;   // 8..256
+  uint32 symbol_bytes           = 3;   // 256..4096
+  float  pacing_gain            = 4;   // 0.5..2
+}
+
+message StepRequest  { Action action = 1; }
+message StepMetrics {
+  double throughput_mbps        = 1;
+  double cwnd_pkts              = 2;
+  double inflight_pkts          = 3;
+  double rtt_ms_p50             = 4;
+  double rtt_ms_p95             = 5;
+  double rtt_ms_p99             = 6;
+  double decode_success_rate    = 7;
+  uint32 blocks_total           = 8;
+  uint32 blocks_completed       = 9;
+  uint32 repairs_sent           = 10;
+  uint32 original_sent          = 11;
+  uint32 residual_erasures      = 12;
+  double encode_time_ms_avg     = 13;
+  double decode_time_ms_avg     = 14;
+}
+message StepResponse {
+  Observation obs = 1;
+  double reward   = 2;
+  bool   done     = 3;
+  StepMetrics metrics = 4;
+  string info_json = 5; // raw detail for logging
+}
