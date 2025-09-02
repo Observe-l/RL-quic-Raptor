@@ -357,6 +357,27 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 			time.Sleep(5 * time.Millisecond)
 		}
 	}()
+	// Live stats ticker: print progress every 500ms
+	liveCtx, liveCancel := context.WithCancel(ctx)
+	go func() {
+		t := time.NewTicker(500 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-liveCtx.Done():
+				return
+			case <-t.C:
+				st := rxm.Stats()
+				elapsed := time.Since(recvStart).Seconds()
+				if elapsed < 1e-6 {
+					elapsed = 1e-6
+				}
+				mbps := (float64(rxm.written.Load()) * 8 / 1e6) / elapsed
+				fmt.Fprintf(os.Stderr, "[server-stats] live=1 dur_s=%.3f mbps=%.2f dec_blocks=%d dec_ms=%d decode_attempts=%d decode_fail=%d add_calls=%d add_ms=%d add_us=%d ready_blocks=%d ready_ms=%d ready_us=%d queued_ready=%d queued_ddl=%d dup=%d drop_repairs=%d drop_system=%d ring_drop_r=%d ring_drop_s=%d budget_drop_r=%d ingress_ms=%d ingress_us=%d classify_ms=%d classify_us=%d write_ms=%d write_us=%d inuse=%d ring=%d/%d written=%d size=%d\n",
+					elapsed, mbps, st.DecBlocks, st.DecMS, st.DecodeAttempts, st.DecodeFailures, st.AddSymCalls, st.AddSymMS, st.AddSymUS, st.ReadyBlocks, st.ReadyTimeMS, st.ReadyTimeUS, st.QueuedByReady, st.QueuedByDDL, st.Duplicates, st.DropRepairs, st.DropSystem, st.RingDropRepairs, st.RingDropSystem, st.BudgetDropRepairs, st.IngressMS, st.IngressUS, st.ClassifyMS, st.ClassifyUS, st.WriteMS, st.WriteUS, st.InUseBytes, st.RingSize, st.RingCap, rxm.written.Load(), hdr.FileSize)
+			}
+		}
+	}()
 	// DATAGRAM receiver
 	go func() {
 		for {
@@ -435,23 +456,25 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 		}
 	}()
 	<-doneCh
+	liveCancel()
 	cancelRx()
 	finalPath, err := rxm.closeAndFinalize(hdr.SHA256)
-	if err != nil {
-		return "", err
-	}
+	// Compute stats prior to returning to ensure visibility on failures.
+	st := rxm.Stats()
 	rdur := time.Since(recvStart).Seconds()
 	if rdur < 1e-6 {
 		rdur = 1e-6
 	}
 	mbps2 := (float64(hdr.FileSize) * 8 / 1e6) / rdur
-	// best-effort metric extraction (type assert to access fields)
-	if rxm != nil {
-		fmt.Fprintf(os.Stderr, "[server-stats] dgrams=%d dur_s=%.3f mbps=%.2f dec_blocks=%d dec_ms=%d drop_repairs=%d -> %s\n",
-			rcvDgrams, rdur, mbps2, rxm.decBlocks.Load(), rxm.decTimeTotal.Load(), rxm.dropsRepairs.Load(), finalPath)
-	} else {
-		fmt.Fprintf(os.Stderr, "[server-stats] dgrams=%d dur_s=%.3f mbps=%.2f -> %s\n", rcvDgrams, rdur, mbps2, finalPath)
+	if err != nil {
+		// Print stats including error so external scripts can parse.
+		fmt.Fprintf(os.Stderr, "[server-stats] dgrams=%d dur_s=%.3f mbps=%.2f dec_blocks=%d dec_ms=%d decode_attempts=%d decode_fail=%d add_calls=%d add_ms=%d add_us=%d ready_blocks=%d ready_ms=%d ready_us=%d queued_ready=%d queued_ddl=%d dup=%d drop_repairs=%d drop_system=%d ring_drop_r=%d ring_drop_s=%d budget_drop_r=%d ingress_ms=%d ingress_us=%d classify_ms=%d classify_us=%d write_ms=%d write_us=%d inuse=%d ring=%d/%d err=%v -> %s\n",
+			rcvDgrams, rdur, mbps2, st.DecBlocks, st.DecMS, st.DecodeAttempts, st.DecodeFailures, st.AddSymCalls, st.AddSymMS, st.AddSymUS, st.ReadyBlocks, st.ReadyTimeMS, st.ReadyTimeUS, st.QueuedByReady, st.QueuedByDDL, st.Duplicates, st.DropRepairs, st.DropSystem, st.RingDropRepairs, st.RingDropSystem, st.BudgetDropRepairs, st.IngressMS, st.IngressUS, st.ClassifyMS, st.ClassifyUS, st.WriteMS, st.WriteUS, st.InUseBytes, st.RingSize, st.RingCap, err, finalPath)
+		return "", err
 	}
+	// Success path: print stats
+	fmt.Fprintf(os.Stderr, "[server-stats] dgrams=%d dur_s=%.3f mbps=%.2f dec_blocks=%d dec_ms=%d decode_attempts=%d decode_fail=%d add_calls=%d add_ms=%d add_us=%d ready_blocks=%d ready_ms=%d ready_us=%d queued_ready=%d queued_ddl=%d dup=%d drop_repairs=%d drop_system=%d ring_drop_r=%d ring_drop_s=%d budget_drop_r=%d ingress_ms=%d ingress_us=%d classify_ms=%d classify_us=%d write_ms=%d write_us=%d inuse=%d ring=%d/%d -> %s\n",
+		rcvDgrams, rdur, mbps2, st.DecBlocks, st.DecMS, st.DecodeAttempts, st.DecodeFailures, st.AddSymCalls, st.AddSymMS, st.AddSymUS, st.ReadyBlocks, st.ReadyTimeMS, st.ReadyTimeUS, st.QueuedByReady, st.QueuedByDDL, st.Duplicates, st.DropRepairs, st.DropSystem, st.RingDropRepairs, st.RingDropSystem, st.BudgetDropRepairs, st.IngressMS, st.IngressUS, st.ClassifyMS, st.ClassifyUS, st.WriteMS, st.WriteUS, st.InUseBytes, st.RingSize, st.RingCap, finalPath)
 	return finalPath, nil
 }
 

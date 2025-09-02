@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +17,7 @@ type RXOptions struct {
 	BudgetBytes int           // total bytes for buffered symbols (default 10MB)
 	DDL         time.Duration // fixed decode deadline per block (default 50ms)
 	Workers     int           // decode workers (default numCPU)
+	IngressRing int           // ring size (power of two), default 4096
 }
 
 func (o *RXOptions) setDefaults() {
@@ -26,8 +28,18 @@ func (o *RXOptions) setDefaults() {
 		o.DDL = 50 * time.Millisecond
 	}
 	if o.Workers <= 0 {
-		o.Workers = 1 // keep simple; can tune later
+		o.Workers = max(runtime.NumCPU()-1, 1)
 	}
+	if o.IngressRing <= 0 {
+		o.IngressRing = 4096
+	}
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // writeTask represents a file write at a given offset.
@@ -48,7 +60,7 @@ type rxBlock struct {
 	queued bool
 	done   bool
 	// store received symbols by ESI to avoid duplicates and allow release
-	syms map[int][]byte
+	syms map[int]*slab
 }
 
 // rxManager owns memory accounting, blocks, decode and write queues.
@@ -76,14 +88,192 @@ type rxManager struct {
 
 	// writer
 	out     *os.File
-	outPath string
 	tmpPath string
 	written atomic.Uint64
 
 	// metrics
 	decBlocks    atomic.Int64
-	decTimeTotal atomic.Int64 // ms
+	decTimeTotal atomic.Int64 // ms (coarse)
 	dropsRepairs atomic.Int64
+	dropsSystem  atomic.Int64
+	// finer-grained metrics
+	ringDropRepairs   atomic.Int64 // ring full -> repair dropped at ingest
+	ringDropSystem    atomic.Int64 // ring full -> systematic dropped at ingest
+	budgetDropRepairs atomic.Int64 // budget pressure -> repair dropped at classify
+	dupSymbols        atomic.Int64 // duplicates discarded in classify
+	dropAfterQRep     atomic.Int64 // symbol dropped because block already queued/done (repair)
+	dropAfterQSys     atomic.Int64 // symbol dropped because block already queued/done (systematic)
+	addSymCount       atomic.Int64 // number of AddSymbol() calls
+	addSymTimeMs      atomic.Int64 // total time spent in AddSymbol() in ms
+	addSymTimeUs      atomic.Int64 // total time spent in AddSymbol() in µs
+	decodeAttempts    atomic.Int64 // number of Decode() attempts
+	decodeFailures    atomic.Int64 // Decode() returned !ok or error
+	queuedByDDL       atomic.Int64 // blocks queued due to DDL expiry
+	queuedByReady     atomic.Int64 // blocks queued when haveU >= K
+	readyBlocks       atomic.Int64 // blocks reaching haveU >= K
+	readyTimeMs       atomic.Int64 // sum of time-to-ready (ms)
+	readyTimeUs       atomic.Int64 // sum of time-to-ready (µs)
+	ingressProcMs     atomic.Int64
+	ingressProcUs     atomic.Int64
+	classifyProcMs    atomic.Int64
+	classifyProcUs    atomic.Int64
+	writeTimeMs       atomic.Int64
+	writeTimeUs       atomic.Int64
+
+	// ingress ring and slabs
+	ring  *mpscRing
+	slabs *sync.Pool
+}
+
+// Symbol carries one symbol into the classifier pipeline.
+type Symbol struct {
+	BlockID  uint16
+	ESI      int
+	N, K, L  int
+	DataSize int
+	IsRepair bool
+	Arrival  int64 // nano timestamp
+	Buf      []byte
+	slab     *slab
+}
+
+// slab wraps a reusable byte buffer with recorded length used.
+type slab struct {
+	b []byte
+	n int
+}
+
+// mpscRing: multiple producers, single consumer ring buffer for Symbols.
+type mpscRing struct {
+	buf  []Symbol
+	mask uint64
+	head atomic.Uint64 // consumer index
+	tail atomic.Uint64 // producer index
+}
+
+func newRing(capacity int) *mpscRing {
+	// round up to power of two
+	n := 1
+	for n < capacity {
+		n <<= 1
+	}
+	return &mpscRing{buf: make([]Symbol, n), mask: uint64(n - 1)}
+}
+
+func (r *mpscRing) tryPush(x Symbol) bool {
+	for {
+		tail := r.tail.Load()
+		head := r.head.Load()
+		if tail-head >= uint64(len(r.buf)) {
+			return false // full
+		}
+		// attempt to claim slot by CAS tail
+		if r.tail.CompareAndSwap(tail, tail+1) {
+			r.buf[tail&r.mask] = x
+			return true
+		}
+		// retry
+	}
+}
+
+// tryPopBatch returns up to max items; caller is the single consumer.
+func (r *mpscRing) tryPopBatch(dst []Symbol) int {
+	head := r.head.Load()
+	tail := r.tail.Load()
+	n := int(tail - head)
+	if n <= 0 {
+		return 0
+	}
+	if n > len(dst) {
+		n = len(dst)
+	}
+	for i := 0; i < n; i++ {
+		dst[i] = r.buf[(head+uint64(i))&r.mask]
+	}
+	r.head.Store(head + uint64(n))
+	return n
+}
+
+// RXStats carries aggregated metrics from rxManager.
+type RXStats struct {
+	DecBlocks         int64
+	DecMS             int64
+	DecUS             int64
+	DropRepairs       int64
+	DropSystem        int64
+	RingDropRepairs   int64
+	RingDropSystem    int64
+	BudgetDropRepairs int64
+	Duplicates        int64
+	DropAfterQRep     int64
+	DropAfterQSys     int64
+	AddSymCalls       int64
+	AddSymMS          int64
+	AddSymUS          int64
+	DecodeAttempts    int64
+	DecodeFailures    int64
+	QueuedByDDL       int64
+	QueuedByReady     int64
+	ReadyBlocks       int64
+	ReadyTimeMS       int64
+	ReadyTimeUS       int64
+	IngressMS         int64
+	IngressUS         int64
+	ClassifyMS        int64
+	ClassifyUS        int64
+	WriteMS           int64
+	WriteUS           int64
+	InUseBytes        int64
+	RingSize          int
+	RingCap           int
+}
+
+func (m *rxManager) Stats() RXStats {
+	// approximate ring depth by tail-head
+	var rs int
+	if m.ring != nil {
+		head := m.ring.head.Load()
+		tail := m.ring.tail.Load()
+		rs = int(tail - head)
+		if rs < 0 {
+			rs = 0
+		}
+		if rs > len(m.ring.buf) {
+			rs = len(m.ring.buf)
+		}
+	}
+	return RXStats{
+		DecBlocks:         m.decBlocks.Load(),
+		DecMS:             m.decTimeTotal.Load(),
+		DecUS:             0, // not tracked per-call; kept 0 for now
+		DropRepairs:       m.dropsRepairs.Load(),
+		DropSystem:        m.dropsSystem.Load(),
+		RingDropRepairs:   m.ringDropRepairs.Load(),
+		RingDropSystem:    m.ringDropSystem.Load(),
+		BudgetDropRepairs: m.budgetDropRepairs.Load(),
+		Duplicates:        m.dupSymbols.Load(),
+		DropAfterQRep:     m.dropAfterQRep.Load(),
+		DropAfterQSys:     m.dropAfterQSys.Load(),
+		AddSymCalls:       m.addSymCount.Load(),
+		AddSymMS:          m.addSymTimeMs.Load(),
+		AddSymUS:          m.addSymTimeUs.Load(),
+		DecodeAttempts:    m.decodeAttempts.Load(),
+		DecodeFailures:    m.decodeFailures.Load(),
+		QueuedByDDL:       m.queuedByDDL.Load(),
+		QueuedByReady:     m.queuedByReady.Load(),
+		ReadyBlocks:       m.readyBlocks.Load(),
+		ReadyTimeMS:       m.readyTimeMs.Load(),
+		ReadyTimeUS:       m.readyTimeUs.Load(),
+		IngressMS:         m.ingressProcMs.Load(),
+		IngressUS:         m.ingressProcUs.Load(),
+		ClassifyMS:        m.classifyProcMs.Load(),
+		ClassifyUS:        m.classifyProcUs.Load(),
+		WriteMS:           m.writeTimeMs.Load(),
+		WriteUS:           m.writeTimeUs.Load(),
+		InUseBytes:        m.inUse.Load(),
+		RingSize:          rs,
+		RingCap:           len(m.ring.buf),
+	}
 }
 
 func newRXManager(fileSize uint64, K, L int, outDir, baseName string, rx RXOptions) (*rxManager, error) {
@@ -101,6 +291,9 @@ func newRXManager(fileSize uint64, K, L int, outDir, baseName string, rx RXOptio
 		writeQ:   make(chan writeTask, 8192),
 		stopCh:   make(chan struct{}),
 	}
+	m.ring = newRing(rx.IngressRing)
+	// slab pool sized to L bytes; callers slice to used size
+	m.slabs = &sync.Pool{New: func() any { return &slab{b: make([]byte, L)} }}
 	finalBase := baseName
 	if finalBase == "" {
 		finalBase = "qfec_recv.bin"
@@ -131,7 +324,11 @@ func (m *rxManager) start(rx RXOptions) {
 			if max < int64(len(data)) {
 				data = data[:max]
 			}
+			t0 := time.Now()
 			_, _ = m.out.WriteAt(data, w.off)
+			d := time.Since(t0)
+			m.writeTimeMs.Add(d.Milliseconds())
+			m.writeTimeUs.Add(d.Microseconds())
 			m.written.Add(uint64(len(data)))
 		}
 	}()
@@ -149,10 +346,12 @@ func (m *rxManager) start(rx RXOptions) {
 					b.queued = false
 					continue
 				}
+				m.decodeAttempts.Add(1)
 				t0 := time.Now()
 				ok, bytes, err := b.dec.Decode()
 				if err != nil || !ok {
 					// decoding failed; likely need more symbols
+					m.decodeFailures.Add(1)
 					b.queued = false
 					continue
 				}
@@ -163,8 +362,11 @@ func (m *rxManager) start(rx RXOptions) {
 				m.decBlocks.Add(1)
 				// release memory and mark done
 				m.mu.Lock()
-				for _, p := range b.syms {
-					m.inUse.Add(int64(-len(p)))
+				for _, s := range b.syms {
+					m.inUse.Add(int64(-s.n))
+					// return buffer to pool
+					s.n = 0
+					m.slabs.Put(s)
 				}
 				b.syms = nil
 				b.done = true
@@ -176,6 +378,7 @@ func (m *rxManager) start(rx RXOptions) {
 	// DDL scheduler
 	m.wg.Add(1)
 	go func() {
+		m.queuedByDDL.Add(1)
 		defer m.wg.Done()
 		t := time.NewTicker(10 * time.Millisecond)
 		defer t.Stop()
@@ -199,57 +402,138 @@ func (m *rxManager) start(rx RXOptions) {
 			m.mu.Unlock()
 		}
 	}()
+	// Classifier: pop from ring in batches and update blocks (non-blocking ingress)
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		const batch = 64
+		buf := make([]Symbol, batch)
+		for {
+			select {
+			case <-m.stopCh:
+				return
+			default:
+			}
+			n := m.ring.tryPopBatch(buf)
+			if n == 0 {
+				time.Sleep(1 * time.Millisecond)
+				continue
+			}
+			t0 := time.Now()
+			for i := 0; i < n; i++ {
+				s := buf[i]
+				// admission: drop repair if over budget
+				cur := m.inUse.Load()
+				if int(cur)+len(s.Buf) > m.budget && s.IsRepair {
+					m.dropsRepairs.Add(1)
+					m.budgetDropRepairs.Add(1)
+					continue
+				}
+				// get or create block
+				m.mu.Lock()
+				b := m.blocks[s.BlockID]
+				if b == nil {
+					b = &rxBlock{id: s.BlockID, t0: time.Now(), K: s.K, N: s.N, L: s.L, dataSize: s.DataSize, syms: make(map[int]*slab, s.N)}
+					dec, err := fec.NewRaptorQDecoder(s.DataSize, s.L)
+					if err != nil {
+						m.mu.Unlock()
+						continue
+					}
+					b.dec = dec
+					m.blocks[s.BlockID] = b
+				}
+				// If already queued for decode or done, drop incoming symbols to avoid racing decoder.
+				if b.queued || b.done {
+					m.mu.Unlock()
+					// release slab immediately
+					s.slab.n = 0
+					m.slabs.Put(s.slab)
+					if s.IsRepair {
+						m.dropAfterQRep.Add(1)
+					} else {
+						m.dropAfterQSys.Add(1)
+						m.dropsSystem.Add(1)
+					}
+					continue
+				}
+				if _, ok := b.syms[s.ESI]; ok {
+					m.mu.Unlock()
+					// duplicate; release slab
+					s.slab.n = 0
+					m.slabs.Put(s.slab)
+					m.dupSymbols.Add(1)
+					continue
+				}
+				b.syms[s.ESI] = s.slab
+				m.inUse.Add(int64(len(s.Buf)))
+				m.mu.Unlock()
+				// feed decoder
+				tAdd := time.Now()
+				inc, _ := b.dec.AddSymbol(uint32(s.ESI), s.Buf)
+				m.addSymTimeMs.Add(time.Since(tAdd).Milliseconds())
+				m.addSymTimeUs.Add(time.Since(tAdd).Microseconds())
+				m.addSymCount.Add(1)
+				if inc {
+					b.haveU++
+					if b.haveU >= b.K && !b.queued {
+						// record time-to-ready once
+						m.readyBlocks.Add(1)
+						m.readyTimeMs.Add(time.Since(b.t0).Milliseconds())
+						m.readyTimeUs.Add(time.Since(b.t0).Microseconds())
+						b.queued = true
+						m.queuedByReady.Add(1)
+						m.decodeQ <- b
+					}
+				}
+			}
+			d := time.Since(t0)
+			m.classifyProcMs.Add(d.Milliseconds())
+			m.classifyProcUs.Add(d.Microseconds())
+		}
+	}()
 }
 
-// ingest one symbol; returns whether accepted.
+// ingest one symbol; returns whether enqueued into ingress ring.
 func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, dataSize int) bool {
+	t0 := time.Now()
 	isRepair := esi >= K
-	// admission: drop repairs if over budget
-	cur := m.inUse.Load()
-	if int(cur)+len(data) > m.budget && isRepair {
-		m.dropsRepairs.Add(1)
-		return false
+	// copy into an owned buffer (avoid holding references to network buffers)
+	sp := m.slabs.Get().(*slab)
+	if cap(sp.b) < len(data) {
+		sp.b = make([]byte, L)
 	}
-	m.mu.Lock()
-	b := m.blocks[blockID]
-	if b == nil {
-		b = &rxBlock{
-			id:       blockID,
-			t0:       time.Now(),
-			K:        K,
-			N:        N,
-			L:        L,
-			dataSize: dataSize,
-			syms:     make(map[int][]byte, N),
-		}
-		dec, err := fec.NewRaptorQDecoder(dataSize, L)
-		if err != nil {
-			m.mu.Unlock()
-			return false
-		}
-		b.dec = dec
-		m.blocks[blockID] = b
-	}
-	// drop duplicates
-	if _, ok := b.syms[esi]; ok {
-		m.mu.Unlock()
-		return false
-	}
-	// store symbol
-	p := make([]byte, len(data))
+	sp.n = len(data)
+	p := sp.b[:sp.n]
 	copy(p, data)
-	b.syms[esi] = p
-	m.inUse.Add(int64(len(p)))
-	m.mu.Unlock()
-
-	// feed decoder; if innovative, bump haveU
-	if inc, _ := b.dec.AddSymbol(uint32(esi), p); inc {
-		b.haveU++
-		if b.haveU >= b.K && !b.queued {
-			b.queued = true
-			m.decodeQ <- b
-		}
+	s := Symbol{
+		BlockID:  blockID,
+		ESI:      esi,
+		N:        N,
+		K:        K,
+		L:        L,
+		DataSize: dataSize,
+		IsRepair: isRepair,
+		Arrival:  time.Now().UnixNano(),
+		Buf:      p,
+		slab:     sp,
 	}
+	ok := m.ring.tryPush(s)
+	if !ok {
+		if isRepair {
+			m.dropsRepairs.Add(1)
+			m.ringDropRepairs.Add(1)
+		} else {
+			m.dropsSystem.Add(1)
+			m.ringDropSystem.Add(1)
+		}
+		// return buffer to pool on drop
+		sp.n = 0
+		m.slabs.Put(sp)
+		return false
+	}
+	d := time.Since(t0)
+	m.ingressProcMs.Add(d.Milliseconds())
+	m.ingressProcUs.Add(d.Microseconds())
 	return true
 }
 
