@@ -3,6 +3,7 @@ package ackhandler
 import (
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/quic-go/quic-go/internal/congestion"
@@ -127,13 +128,21 @@ func newSentPacketHandler(
 	tracer *logging.ConnectionTracer,
 	logger utils.Logger,
 ) *sentPacketHandler {
-	congestion := congestion.NewCubicSender(
-		congestion.DefaultClock{},
-		rttStats,
-		initialMaxDatagramSize,
-		true, // use Reno
-		tracer,
-	)
+	var congestionCtrl congestion.SendAlgorithmWithDebugInfos
+	if os.Getenv("QUIC_FEC_CC_BYPASS") == "1" {
+		congestionCtrl = congestion.NewNoopSender()
+		if tracer != nil && tracer.Debug != nil {
+			tracer.Debug("note", "CC bypass: using NoopSender (lab only)")
+		}
+	} else {
+		congestionCtrl = congestion.NewCubicSender(
+			congestion.DefaultClock{},
+			rttStats,
+			initialMaxDatagramSize,
+			true, // use Reno
+			tracer,
+		)
+	}
 
 	h := &sentPacketHandler{
 		peerCompletedAddressValidation: pers == protocol.PerspectiveServer,
@@ -142,7 +151,7 @@ func newSentPacketHandler(
 		handshakePackets:               newPacketNumberSpace(0, false),
 		appDataPackets:                 newPacketNumberSpace(0, true),
 		rttStats:                       rttStats,
-		congestion:                     congestion,
+		congestion:                     congestionCtrl,
 		perspective:                    pers,
 		tracer:                         tracer,
 		logger:                         logger,

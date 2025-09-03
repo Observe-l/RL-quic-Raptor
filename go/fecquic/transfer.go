@@ -55,8 +55,8 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		L = DefaultL
 	}
 	ackEvery := opts.AckEvery
-	if ackEvery <= 0 {
-		ackEvery = 1
+	if ackEvery < 0 {
+		ackEvery = 1 // negative => use default
 	}
 
 	f, err := os.Open(path)
@@ -128,7 +128,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	ackReq := make(chan struct{}, 32)
 	go func() {
 		defer close(keepDone)
-		if keepStr == nil {
+		if keepStr == nil || ackEvery == 0 {
 			return
 		}
 		// Fallback keepalive ticker (when not writing per-ackEvery below)
