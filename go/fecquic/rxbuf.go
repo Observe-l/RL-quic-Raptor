@@ -54,6 +54,8 @@ type rxBlock struct {
 	nextDDL time.Time // next DDL fire time
 	// store received symbols by ESI to avoid duplicates and allow release
 	syms map[int][]byte
+	// metrics timestamps
+	firstSeen time.Time
 }
 
 // rxManager owns memory accounting, blocks, decode and write queues.
@@ -95,6 +97,8 @@ type rxManager struct {
 	ctrlW   io.Writer   // underlying stream
 	ctrlOut chan []byte // buffered queue to dedicated writer
 	ctrlWG  sync.WaitGroup
+	// server metrics aggregator
+	met *serverMetrics
 }
 
 func newRXManager(fileSize uint64, K, L int, outDir, baseName string, rx RXOptions) (*rxManager, error) {
@@ -127,6 +131,8 @@ func newRXManager(fileSize uint64, K, L int, outDir, baseName string, rx RXOptio
 		return nil, err
 	}
 	m.out = out
+	// init metrics aggregator
+	m.met = newServerMetrics(int(fileSize))
 	return m, nil
 }
 
@@ -213,6 +219,10 @@ func (m *rxManager) start(rx RXOptions) {
 				b.done = true
 				delete(m.blocks, b.id)
 				m.mu.Unlock()
+				// metrics: per-cluster decode event
+				if m.met != nil {
+					m.met.OnClusterDecoded(b.firstSeen, time.Now(), b.attempt, usedRep)
+				}
 				// ACK success to sender if ctrl available
 				if m.ctrlOut != nil {
 					var buf bytespkg.Buffer
@@ -285,6 +295,12 @@ func (m *rxManager) start(rx RXOptions) {
 				}
 			}
 			m.mu.Unlock()
+			// metrics: record DDL snapshot for each block scheduled
+			if m.met != nil {
+				for _, b := range toDecode {
+					m.met.OnDDLTick(len(b.syms))
+				}
+			}
 			// send control and schedule decodes without holding lock
 			for _, n := range nacks {
 				var buf bytespkg.Buffer
@@ -351,6 +367,17 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 	copy(p, data)
 	b.syms[esi] = p
 	m.inUse.Add(int64(len(p)))
+	// metrics: mark first unique for this block and file + arrival counts
+	if b.firstSeen.IsZero() {
+		b.firstSeen = time.Now()
+	}
+	if m.met != nil {
+		now := time.Now()
+		m.met.OnUniqueSymbol(len(p), now, esi >= K)
+		if !m.met.gotFirst {
+			m.met.OnFirstUniqueSymbol(now)
+		}
+	}
 	m.mu.Unlock()
 
 	// feed decoder; if decoder reports readiness, queue a decode

@@ -726,6 +726,10 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 	if rxm != nil {
 		fmt.Fprintf(os.Stderr, "[server-stats] dgrams=%d dur_s=%.3f mbps=%.2f dec_blocks=%d dec_ms=%d drop_repairs=%d -> %s\n",
 			rcvDgrams, rdur, mbps2, rxm.decBlocks.Load(), rxm.decTimeTotal.Load(), rxm.dropsRepairs.Load(), finalPath)
+		if rxm.met != nil {
+			obs := rxm.met.Snapshot(time.Now())
+			obs.PrintJSON()
+		}
 	} else {
 		fmt.Fprintf(os.Stderr, "[server-stats] dgrams=%d dur_s=%.3f mbps=%.2f -> %s\n", rcvDgrams, rdur, mbps2, finalPath)
 	}
