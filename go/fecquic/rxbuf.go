@@ -44,7 +44,6 @@ type rxBlock struct {
 	dataSize int // exact bytes for this block (last block may be partial)
 
 	dec    *fec.RaptorQDecoder
-	haveU  int
 	queued bool
 	done   bool
 	// store received symbols by ESI to avoid duplicates and allow release
@@ -72,7 +71,9 @@ type rxManager struct {
 	decodeQ chan *rxBlock
 	writeQ  chan writeTask
 	stopCh  chan struct{}
-	wg      sync.WaitGroup
+	// wait groups: separate writer from decoders/scheduler
+	wg    sync.WaitGroup // writer
+	wgDec sync.WaitGroup // decoders + DDL scheduler
 
 	// writer
 	out     *os.File
@@ -133,20 +134,20 @@ func (m *rxManager) start(rx RXOptions) {
 			}
 			_, _ = m.out.WriteAt(data, w.off)
 			m.written.Add(uint64(len(data)))
+			// debug: print when nearing completion
+			if m.written.Load() >= m.fileSize {
+				//nolint
+				print("[rxbuf] wrote final bytes\n")
+			}
 		}
 	}()
 	// decode workers
 	for i := 0; i < rx.Workers; i++ {
-		m.wg.Add(1)
+		m.wgDec.Add(1)
 		go func() {
-			defer m.wg.Done()
+			defer m.wgDec.Done()
 			for b := range m.decodeQ {
 				if b.done {
-					continue
-				}
-				if b.haveU < b.K {
-					// not ready yet
-					b.queued = false
 					continue
 				}
 				t0 := time.Now()
@@ -174,9 +175,9 @@ func (m *rxManager) start(rx RXOptions) {
 		}()
 	}
 	// DDL scheduler
-	m.wg.Add(1)
+	m.wgDec.Add(1)
 	go func() {
-		defer m.wg.Done()
+		defer m.wgDec.Done()
 		t := time.NewTicker(10 * time.Millisecond)
 		defer t.Stop()
 		for {
@@ -242,10 +243,9 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 	m.inUse.Add(int64(len(p)))
 	m.mu.Unlock()
 
-	// feed decoder; if innovative, bump haveU
-	if inc, _ := b.dec.AddSymbol(uint32(esi), p); inc {
-		b.haveU++
-		if b.haveU >= b.K && !b.queued {
+	// feed decoder; if decoder reports readiness, queue a decode
+	if ready, _ := b.dec.AddSymbol(uint32(esi), p); ready {
+		if !b.queued {
 			b.queued = true
 			m.decodeQ <- b
 		}
@@ -254,8 +254,12 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 }
 
 func (m *rxManager) closeAndFinalize(expectedSHA [32]byte) (string, error) {
+	// stop scheduling, finish decoders, then drain writer
 	close(m.stopCh)
 	close(m.decodeQ)
+	// wait for all decoders and scheduler to finish
+	m.wgDec.Wait()
+	// now it's safe to close writeQ; writer will exit after draining
 	close(m.writeQ)
 	m.wg.Wait()
 	// Best-effort flush; no extra fsync here

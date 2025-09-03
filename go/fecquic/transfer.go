@@ -15,6 +15,7 @@ import (
 	quic "github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/fec"
 	"github.com/quic-go/quic-go/internal/fecwire"
+	"github.com/quic-go/quic-go/logging"
 )
 
 // Defaults per spec
@@ -40,6 +41,7 @@ type SendOptions struct {
 
 // ClientSendFile connects and sends a file using QFEC header + RaptorQ symbols over datagrams.
 func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptions) error {
+	ecnStats := NewECNStats()
 	K := opts.K
 	if K <= 0 {
 		K = DefaultK
@@ -73,6 +75,10 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 
 	tlsConf := &tls.Config{InsecureSkipVerify: opts.InsecureTLS, NextProtos: []string{alpn}}
 	qconf := &quic.Config{
+		// attach our ECN tracer to observe CE/ECT counts
+		Tracer: func(ctx context.Context, p logging.Perspective, cid logging.ConnectionID) *logging.ConnectionTracer {
+			return NewECNConnTracer(ecnStats)
+		},
 		EnableDatagrams: true,
 		// Prevent idle timeouts during datagram-heavy transfers by sending frequent PINGs.
 		KeepAlivePeriod:                50 * time.Millisecond,
@@ -151,6 +157,34 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	var dgramsSinceAck int
 	var encTime time.Duration
 	var sendTime time.Duration
+	// pacer/inter-send telemetry
+	var lastSend time.Time
+	var interSum time.Duration
+	var interCount int
+
+	// Live goodput printer
+	liveStop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-liveStop:
+				return
+			case <-ticker.C:
+				dur := time.Since(start).Seconds()
+				if dur < 1e-6 {
+					dur = 1e-6
+				}
+				b := sentBytes
+				mbps := (float64(b) * 8 / 1e6) / dur
+				_, _, rx0, rx1, rxce, _ := ecnStats.Snapshot()
+				fmt.Fprintf(os.Stderr, "[live-client] tx_bytes=%d mbps=%.2f ecn_rx: CE=%d, ECT0=%d, ECT1=%d\n", b, mbps, rxce, rx0, rx1)
+			}
+		}
+	}()
 
 	// Send symbols per block
 	buf := make([]byte, K*L)
@@ -170,8 +204,6 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 				break
 			}
 			buf = buf[:n]
-		} else if err == io.ErrUnexpectedEOF {
-			// handled above
 		} else if err != nil && err != io.EOF {
 			return err
 		}
@@ -242,6 +274,19 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 						sentBytes += int64(len(b))
 					}
 				}
+				// pacer: inter-send delta logging (avg every ~200 packets)
+				if !lastSend.IsZero() {
+					delta := tSend.Sub(lastSend)
+					interSum += delta
+					interCount++
+					if interCount >= 200 {
+						avg := float64(interSum.Microseconds()) / float64(interCount)
+						fmt.Fprintf(os.Stderr, "[pacer] avg_inter_us=%.0f\n", avg)
+						interSum = 0
+						interCount = 0
+					}
+				}
+				lastSend = tSend
 				sendTime += time.Since(tSend)
 			}
 			// Count towards ack pacing decisions
@@ -269,15 +314,18 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	if opts.PostWait > 0 {
 		time.Sleep(opts.PostWait)
 	}
-	// stop keepalive goroutine
+	// stop live printer and keepalive goroutine
+	close(liveStop)
 	close(kaStop)
 	<-keepDone
+	// Final stats
 	dur := time.Since(start).Seconds()
 	if dur < 1e-6 {
 		dur = 1e-6
 	}
 	mbps := (float64(sentBytes) * 8 / 1e6) / dur
-	fmt.Fprintf(os.Stderr, "[client-stats] dgrams=%d bytes=%d dur_s=%.3f mbps=%.2f errs=%d dtle=%d enc_ms=%.1f send_ms=%.1f\n", sentDgrams, sentBytes, dur, mbps, sendErrs, dtleCount, float64(encTime.Milliseconds()), float64(sendTime.Milliseconds()))
+	fmt.Fprintf(os.Stderr, "[client-stats] dgrams=%d bytes=%d dur_s=%.3f mbps=%.2f errs=%d dtle=%d enc_ms=%.1f send_ms=%.1f\n",
+		sentDgrams, sentBytes, dur, mbps, sendErrs, dtleCount, float64(encTime.Milliseconds()), float64(sendTime.Milliseconds()))
 	return nil
 }
 
@@ -296,31 +344,51 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 	}
 	defer conn.CloseWithError(0, "done")
 
-	// Receive header stream
-	stream, err := conn.AcceptStream(ctx)
-	if err != nil {
-		return "", err
-	}
-	hdrBytes := make([]byte, fileHeaderLen)
-	if _, err := io.ReadFull(stream, hdrBytes); err != nil {
-		return "", err
-	}
-	var hdr FileHeader
-	if err := hdr.UnmarshalBinary(hdrBytes); err != nil {
-		return "", err
-	}
-	// Try read optional filename (u16 len + bytes); safe if EOF
-	var baseName string
-	var lb [2]byte
-	n, err := io.ReadFull(stream, lb[:])
-	if err == nil && n == 2 {
-		need := int(lb[0]) | int(lb[1])<<8
-		if need > 0 && need < 4096 { // cap
-			buf := make([]byte, need)
-			if _, err := io.ReadFull(stream, buf); err == nil {
-				baseName = filepath.Base(string(buf))
+	// Receive header: find the stream that starts with magic "QFEC"
+	var (
+		hdrBytes = make([]byte, fileHeaderLen)
+		hdr      FileHeader
+		baseName string
+	)
+	for {
+		s, err := conn.AcceptStream(ctx)
+		if err != nil {
+			return "", err
+		}
+		// peek magic
+		if _, err := io.ReadFull(s, hdrBytes[:4]); err != nil {
+			// not enough data; drain and continue
+			_, _ = io.Copy(io.Discard, s)
+			_ = s.Close()
+			continue
+		}
+		if string(hdrBytes[:4]) != fileHeaderMagic {
+			// not our header; drain
+			_, _ = io.Copy(io.Discard, s)
+			_ = s.Close()
+			continue
+		}
+		// read the rest of the header
+		if _, err := io.ReadFull(s, hdrBytes[4:]); err != nil {
+			return "", err
+		}
+		if err := hdr.UnmarshalBinary(hdrBytes); err != nil {
+			return "", err
+		}
+		// Try read optional filename (u16 len + bytes); safe if EOF
+		var lb [2]byte
+		n, err := io.ReadFull(s, lb[:])
+		if err == nil && n == 2 {
+			need := int(lb[0]) | int(lb[1])<<8
+			if need > 0 && need < 4096 { // cap
+				buf := make([]byte, need)
+				if _, err := io.ReadFull(s, buf); err == nil {
+					baseName = filepath.Base(string(buf))
+				}
 			}
 		}
+		// header parsed; done
+		break
 	}
 
 	// Drain any additional streams (e.g., client keepalive stream) to avoid flow control stalls.
@@ -347,6 +415,26 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 	cctx, cancelRx := context.WithCancel(ctx)
 	defer cancelRx()
 	doneCh := make(chan struct{})
+	// progress ticker for visibility
+	progStop := make(chan struct{})
+	go func() {
+		if rxm == nil {
+			return
+		}
+		t := time.NewTicker(200 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-progStop:
+				return
+			case <-t.C:
+				w := rxm.written.Load()
+				if w > 0 {
+					fmt.Fprintf(os.Stderr, "[server-progress] written=%d/%d\n", w, hdr.FileSize)
+				}
+			}
+		}
+	}()
 	go func() {
 		defer close(doneCh)
 		// wait until file complete
@@ -371,6 +459,9 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 				continue
 			}
 			rcvDgrams++
+			if rcvDgrams%500 == 0 {
+				fmt.Fprintf(os.Stderr, "[server-progress] dgrams=%d written=%d/%d\n", rcvDgrams, rxm.written.Load(), hdr.FileSize)
+			}
 			var fh fecwire.FECHeader
 			if !fh.UnmarshalBinary(b) || fh.Scheme != fecwire.SchemeRaptorQ {
 				continue
@@ -416,7 +507,7 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 						return
 					}
 					plen := int(fh.PayloadLen)
-					if plen <= 0 || plen > 65536 {
+					if plen <= 0 || plen > 1<<20 {
 						return
 					}
 					buf := make([]byte, plen)
@@ -434,8 +525,10 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 			}(s)
 		}
 	}()
+	// wait for reception to complete
 	<-doneCh
 	cancelRx()
+	close(progStop)
 	finalPath, err := rxm.closeAndFinalize(hdr.SHA256)
 	if err != nil {
 		return "", err
@@ -460,7 +553,11 @@ func ListenAndServe(ctx context.Context, addr, alpn, outDir string, tlsConf *tls
 	if tlsConf == nil {
 		return "", errors.New("tlsConf required")
 	}
+	ecnStats := NewECNStats()
 	ln, err := quic.ListenAddr(addr, tlsConf, &quic.Config{
+		Tracer: func(ctx context.Context, p logging.Perspective, cid logging.ConnectionID) *logging.ConnectionTracer {
+			return NewECNConnTracer(ecnStats)
+		},
 		EnableDatagrams:                true,
 		KeepAlivePeriod:                2 * time.Second,
 		MaxIdleTimeout:                 90 * time.Second,
@@ -471,7 +568,12 @@ func ListenAndServe(ctx context.Context, addr, alpn, outDir string, tlsConf *tls
 		return "", err
 	}
 	defer ln.Close()
-	return ServerRecvFileWithRX(ctx, ln, outDir, RXOptions{})
+	path, err := ServerRecvFileWithRX(ctx, ln, outDir, RXOptions{})
+	if err == nil && ecnStats != nil {
+		tx0, tx1, rx0, rx1, rxce, _ := ecnStats.Snapshot()
+		fmt.Fprintf(os.Stderr, "[server-ecn] rx: CE=%d ECT0=%d ECT1=%d, tx: ECT0=%d ECT1=%d\n", rxce, rx0, rx1, tx0, tx1)
+	}
+	return path, err
 }
 
 // ListenAndServeLoop listens on addr and serves multiple transfers until ctx is done.
@@ -479,7 +581,11 @@ func ListenAndServeLoop(ctx context.Context, addr, alpn, outDir string, tlsConf 
 	if tlsConf == nil {
 		return errors.New("tlsConf required")
 	}
+	ecnStats := NewECNStats()
 	ln, err := quic.ListenAddr(addr, tlsConf, &quic.Config{
+		Tracer: func(ctx context.Context, p logging.Perspective, cid logging.ConnectionID) *logging.ConnectionTracer {
+			return NewECNConnTracer(ecnStats)
+		},
 		EnableDatagrams:                true,
 		KeepAlivePeriod:                2 * time.Second,
 		MaxIdleTimeout:                 90 * time.Second,
@@ -508,6 +614,10 @@ func ListenAndServeLoop(ctx context.Context, addr, alpn, outDir string, tlsConf 
 		if onStored != nil {
 			onStored(path)
 		}
+		if ecnStats != nil {
+			tx0, tx1, rx0, rx1, rxce, _ := ecnStats.Snapshot()
+			fmt.Fprintf(os.Stderr, "[server-ecn] rx: CE=%d ECT0=%d ECT1=%d, tx: ECT0=%d ECT1=%d\n", rxce, rx0, rx1, tx0, tx1)
+		}
 	}
 }
 
@@ -516,7 +626,11 @@ func ListenAndServeLoopWithRX(ctx context.Context, addr, alpn, outDir string, tl
 	if tlsConf == nil {
 		return errors.New("tlsConf required")
 	}
+	ecnStats := NewECNStats()
 	ln, err := quic.ListenAddr(addr, tlsConf, &quic.Config{
+		Tracer: func(ctx context.Context, p logging.Perspective, cid logging.ConnectionID) *logging.ConnectionTracer {
+			return NewECNConnTracer(ecnStats)
+		},
 		EnableDatagrams:                true,
 		KeepAlivePeriod:                2 * time.Second,
 		MaxIdleTimeout:                 90 * time.Second,
@@ -542,6 +656,10 @@ func ListenAndServeLoopWithRX(ctx context.Context, addr, alpn, outDir string, tl
 		}
 		if onStored != nil {
 			onStored(path)
+		}
+		if ecnStats != nil {
+			tx0, tx1, rx0, rx1, rxce, _ := ecnStats.Snapshot()
+			fmt.Fprintf(os.Stderr, "[server-ecn] rx: CE=%d ECT0=%d ECT1=%d, tx: ECT0=%d ECT1=%d\n", rxce, rx0, rx1, tx0, tx1)
 		}
 	}
 }

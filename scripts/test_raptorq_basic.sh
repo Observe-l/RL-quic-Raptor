@@ -29,14 +29,20 @@ sleep 0.3
 echo "[3/5] Running client with RaptorQ (baseline, no sender drop)..."
 START_NS=$(date +%s%N)
 rm -f "$GO_DIR/test_data/$(basename "$FILE").recv"
-"$BIN_DIR/quicfec-client" -addr "127.0.0.1:4242" -file "$FILE" -N 32 -K 26 -L 1100 -loss 0.05 -pace 10us -block-pause 2ms -post-wait 1s -dgram-warn 1400
+"$BIN_DIR/quicfec-client" -addr "127.0.0.1:4242" -file "$FILE" -N 32 -K 26 -L 1100 -loss 0.00 -pace 10us -block-pause 2ms -post-wait 1s -dgram-warn 1400
 END_NS=$(date +%s%N)
 
 echo "[4/5] Verifying output..."
 OUT_FILE="$GO_DIR/test_data/$(basename "$FILE").recv"
+# wait up to 10s for server to finalize rename
+for i in {1..50}; do
+  if [[ -f "$OUT_FILE" ]]; then break; fi
+  sleep 0.2
+done
 if [[ ! -f "$OUT_FILE" ]]; then
-  echo "ERROR: output file not found: $OUT_FILE" >&2
+  echo "ERROR: output file not found after waiting: $OUT_FILE" >&2
   echo "--- server log ---"; tail -n +1 "$SRV_LOG"; echo "-------------------"
+  ls -l "$GO_DIR/test_data" | sed -n '1,120p'
   exit 2
 fi
 
@@ -66,7 +72,13 @@ echo "PASS: Baseline decode success. Goodput ~ ${MBPS} Mbps"
 echo "[extra] Single-block loss test (small.bin at 5% drop)..."
 SM_IN="$GO_DIR/test_data/small.bin"
 rm -f "$GO_DIR/test_data/small.bin.recv"
+# run with some sender drops
 "$BIN_DIR/quicfec-client" -addr "127.0.0.1:4242" -file "$SM_IN" -N 32 -K 26 -L 1100 -loss 0.05 -pace 200us -block-pause 0ms -post-wait 3s -dgram-warn 1400
+# wait for server to finalize
+for i in {1..50}; do
+  [[ -f "$GO_DIR/test_data/small.bin.recv" ]] && break
+  sleep 0.2
+done
 MD5_SA=$(md5sum "$SM_IN" | awk '{print $1}')
 MD5_SB=$(md5sum "$GO_DIR/test_data/small.bin.recv" | awk '{print $1}')
 if [[ "$MD5_SA" != "$MD5_SB" ]]; then
