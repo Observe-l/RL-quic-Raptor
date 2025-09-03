@@ -248,7 +248,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 							if bt == nil {
 								continue
 							}
-							// ignore stale attempts
+							// ignore stale attempts (process each attempt index once)
 							if int(n.AttemptIdx) <= bt.attempt {
 								continue
 							}
@@ -287,10 +287,6 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 							if cand == 0 {
 								// nothing to append
 								continue
-							}
-							for i := 0; i < toSend; i++ {
-								// loop body will be replaced by cand; break out of old loop
-								_ = i
 							}
 							// send cand fresh repairs
 							for i := 0; i < cand; i++ {
@@ -374,7 +370,8 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		if initN < K {
 			initN = K
 		}
-		bt := &blockTx{K: K, L: L, enc: enc, nextESI: K, repairsOut: 0, attempt: 0}
+		// Initialize attempt to -1 so the first NACK with attempt_idx=0 is processed once.
+		bt := &blockTx{K: K, L: L, enc: enc, nextESI: K, repairsOut: 0, attempt: -1}
 		txMu.Lock()
 		active[uint16(blockID)] = bt
 		txMu.Unlock()
@@ -593,6 +590,7 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 	ctrlStr, _ := conn.OpenUniStream()
 	if ctrlStr != nil {
 		rxm.ctrlW = ctrlStr
+		// ctrlOut will be created in rxm.start when ctrlW is set
 	}
 	rxm.start(rx)
 	recvStart := time.Now()

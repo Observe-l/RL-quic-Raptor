@@ -1,6 +1,7 @@
 package fecquic
 
 import (
+	bytespkg "bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -46,6 +47,7 @@ type rxBlock struct {
 	dataSize int // exact bytes for this block (last block may be partial)
 
 	dec     *fec.RaptorQDecoder
+	decMu   sync.Mutex // guards decoder AddSymbol/Decode; decoder is not goroutine-safe
 	queued  bool
 	done    bool
 	attempt int       // ARQ attempt index
@@ -90,8 +92,9 @@ type rxManager struct {
 	dropsRepairs atomic.Int64
 
 	// ARQ control (optional)
-	ctrlW  io.Writer  // if set, send ACK/NACK
-	ctrlMu sync.Mutex // guard ctrlW writes
+	ctrlW   io.Writer   // underlying stream
+	ctrlOut chan []byte // buffered queue to dedicated writer
+	ctrlWG  sync.WaitGroup
 }
 
 func newRXManager(fileSize uint64, K, L int, outDir, baseName string, rx RXOptions) (*rxManager, error) {
@@ -148,6 +151,31 @@ func (m *rxManager) start(rx RXOptions) {
 			}
 		}
 	}()
+	// control writer goroutine (serialize writes; don't block actors)
+	if m.ctrlW != nil {
+		if m.ctrlOut == nil {
+			m.ctrlOut = make(chan []byte, 2048)
+		}
+		m.ctrlWG.Add(1)
+		go func() {
+			defer m.ctrlWG.Done()
+			for buf := range m.ctrlOut {
+				// best-effort full write
+				for off := 0; off < len(buf); {
+					n, err := m.ctrlW.Write(buf[off:])
+					if err != nil {
+						// drop on error; exit to avoid blocking shutdown
+						break
+					}
+					if n <= 0 {
+						break
+					}
+					off += n
+				}
+			}
+		}()
+	}
+
 	// decode workers
 	for i := 0; i < rx.Workers; i++ {
 		m.wgDec.Add(1)
@@ -158,31 +186,14 @@ func (m *rxManager) start(rx RXOptions) {
 					continue
 				}
 				t0 := time.Now()
+				b.decMu.Lock()
 				ok, bytes, err := b.dec.Decode()
+				b.decMu.Unlock()
 				if err != nil || !ok {
-					// decoding failed; likely need more symbols
+					// Decoding failed; unqueue and wait for next DDL tick to decide NACK.
+					m.mu.Lock()
 					b.queued = false
-					// schedule a NACK recommending more symbols if ctrl available
-					if m.ctrlW != nil {
-						// recommend at least 1; if already have >=K, ask for a couple fresh repairs
-						miss := 1
-						if len(b.syms) < b.K {
-							miss = max(1, b.K-len(b.syms))
-						} else {
-							miss = 2
-						}
-						m.ctrlMu.Lock()
-						_ = writeNack(m.ctrlW, NackNeedMore{
-							FileID:         0,
-							ClusterID:      uint32(b.id),
-							AttemptIdx:     uint16(b.attempt),
-							RxUnique:       uint16(len(b.syms)),
-							RecommendExtra: uint16(miss),
-							Reason:         0,
-						})
-						m.ctrlMu.Unlock()
-						fmt.Fprintf(os.Stderr, "[arq] nack block=%d rx_unique=%d rec_extra=%d attempt=%d\n", b.id, len(b.syms), miss, b.attempt)
-					}
+					m.mu.Unlock()
 					continue
 				}
 				m.decTimeTotal.Add(time.Since(t0).Milliseconds())
@@ -203,9 +214,9 @@ func (m *rxManager) start(rx RXOptions) {
 				delete(m.blocks, b.id)
 				m.mu.Unlock()
 				// ACK success to sender if ctrl available
-				if m.ctrlW != nil {
-					m.ctrlMu.Lock()
-					_ = writeAck(m.ctrlW, AckSuccess{
+				if m.ctrlOut != nil {
+					var buf bytespkg.Buffer
+					_ = writeAck(&buf, AckSuccess{
 						FileID:          0,
 						ClusterID:       uint32(b.id),
 						AttemptIdx:      uint16(b.attempt),
@@ -213,7 +224,12 @@ func (m *rxManager) start(rx RXOptions) {
 						UsedRepairs:     uint16(usedRep),
 						DecodeLatencyMs: uint32(time.Since(t0).Milliseconds()),
 					})
-					m.ctrlMu.Unlock()
+					// non-blocking enqueue; drop if full (next events will resend state)
+					select {
+					case m.ctrlOut <- buf.Bytes():
+					default:
+						fmt.Fprintf(os.Stderr, "[arq] ctrl queue full, dropping ACK block=%d\n", b.id)
+					}
 					fmt.Fprintf(os.Stderr, "[arq] ack block=%d rx_unique=%d used_rep=%d attempt=%d\n", b.id, rxUnique, usedRep, b.attempt)
 				}
 			}
@@ -232,6 +248,16 @@ func (m *rxManager) start(rx RXOptions) {
 			case <-t.C:
 			}
 			now := time.Now()
+			// collect work outside the lock
+			type nackMsg struct {
+				blockID uint16
+				attempt int
+				rxu     int
+				rec     int
+				send    bool
+			}
+			var toDecode []*rxBlock
+			var nacks []nackMsg
 			m.mu.Lock()
 			for _, b := range m.blocks {
 				if b.done || b.queued {
@@ -241,10 +267,45 @@ func (m *rxManager) start(rx RXOptions) {
 					b.attempt++
 					b.queued = true
 					b.nextDDL = now.Add(m.ddl)
-					m.decodeQ <- b
+					// calculate NACK recommendation under lock
+					if m.ctrlOut != nil {
+						deficit := b.K - len(b.syms)
+						rec := 0
+						if deficit > 0 {
+							rec = deficit / 2
+							if rec < 4 {
+								rec = 4
+							}
+						} else {
+							rec = 2
+						}
+						nacks = append(nacks, nackMsg{blockID: b.id, attempt: b.attempt, rxu: len(b.syms), rec: rec, send: true})
+					}
+					toDecode = append(toDecode, b)
 				}
 			}
 			m.mu.Unlock()
+			// send control and schedule decodes without holding lock
+			for _, n := range nacks {
+				var buf bytespkg.Buffer
+				_ = writeNack(&buf, NackNeedMore{
+					FileID:         0,
+					ClusterID:      uint32(n.blockID),
+					AttemptIdx:     uint16(n.attempt),
+					RxUnique:       uint16(n.rxu),
+					RecommendExtra: uint16(n.rec),
+					Reason:         0,
+				})
+				select {
+				case m.ctrlOut <- buf.Bytes():
+				default:
+					fmt.Fprintf(os.Stderr, "[arq] ctrl queue full, dropping NACK block=%d\n", n.blockID)
+				}
+				fmt.Fprintf(os.Stderr, "[arq] nack block=%d rx_unique=%d rec_extra=%d attempt=%d\n", n.blockID, n.rxu, n.rec, n.attempt)
+			}
+			for _, b := range toDecode {
+				m.decodeQ <- b
+			}
 		}
 	}()
 }
@@ -293,9 +354,19 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 	m.mu.Unlock()
 
 	// feed decoder; if decoder reports readiness, queue a decode
-	if ready, _ := b.dec.AddSymbol(uint32(esi), p); ready {
-		if !b.queued {
+	b.decMu.Lock()
+	ready, _ := b.dec.AddSymbol(uint32(esi), p)
+	b.decMu.Unlock()
+	if ready {
+		// mark queued under lock, send outside
+		send := false
+		m.mu.Lock()
+		if !b.queued && !b.done {
 			b.queued = true
+			send = true
+		}
+		m.mu.Unlock()
+		if send {
 			m.decodeQ <- b
 		}
 	}
@@ -308,6 +379,11 @@ func (m *rxManager) closeAndFinalize(expectedSHA [32]byte) (string, error) {
 	close(m.decodeQ)
 	// wait for all decoders and scheduler to finish
 	m.wgDec.Wait()
+	// stop ctrl writer after decoders (no more control messages)
+	if m.ctrlOut != nil {
+		close(m.ctrlOut)
+		m.ctrlWG.Wait()
+	}
 	// now it's safe to close writeQ; writer will exit after draining
 	close(m.writeQ)
 	m.wg.Wait()
