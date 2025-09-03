@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"sync"
+
 	quic "github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/fec"
 	"github.com/quic-go/quic-go/internal/fecwire"
@@ -37,6 +39,13 @@ type SendOptions struct {
 	PostWait      time.Duration // linger before closing
 	AckEvery      int           // write 1B on a stream every N datagrams (ack-eliciting); <=0 uses default
 	Transport     string        // "dgram" (default) or "stream"
+	// ARQ options
+	UseARQ         bool    // enable ARQ control plane and on-demand repairs
+	InitialRepairs int     // R0: additional repairs to send initially (defaults to N-K if N provided)
+	WindowW        int     // max unfinished clusters in flight (0=unlimited)
+	RStep          int     // minimum repairs per NACK
+	Alpha          float64 // scaling for deficit in ΔR
+	MaxAttempts    int     // max ARQ attempts per cluster (0=no cap)
 }
 
 // ClientSendFile connects and sends a file using QFEC header + RaptorQ symbols over datagrams.
@@ -157,6 +166,10 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	var dgramsSinceAck int
 	var encTime time.Duration
 	var sendTime time.Duration
+	// ARQ metrics
+	var totalSymbols int64
+	var totalRepairs int64
+	var totalAttempts int64
 	// pacer/inter-send telemetry
 	var lastSend time.Time
 	var interSum time.Duration
@@ -197,6 +210,134 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		}
 		rng = rand.New(rand.NewSource(seed))
 	}
+	// ARQ: map of active block transmitters
+	type blockTx struct {
+		K, L       int
+		enc        *fec.RaptorQEncoder
+		nextESI    int // next repair ESI to send (>=K)
+		repairsOut int // how many repairs sent so far
+		attempt    int // last processed attempt idx
+	}
+	txMu := &sync.Mutex{}
+	active := make(map[uint16]*blockTx)
+	cond := sync.NewCond(txMu)
+
+	// Control reader: accept server control uni stream and react to NACK/ACK
+	if opts.UseARQ {
+		go func() {
+			for {
+				us, err := conn.AcceptUniStream(ctx)
+				if err != nil {
+					return
+				}
+				// one stream carrying a sequence of control messages
+				go func(rs *quic.ReceiveStream) {
+					defer rs.CancelRead(0)
+					for {
+						t, msg, err := readCtrl(rs)
+						if err != nil {
+							return
+						}
+						switch t {
+						case arqMsgNACK:
+							n := msg.(NackNeedMore)
+							bid := uint16(n.ClusterID)
+							txMu.Lock()
+							bt := active[bid]
+							txMu.Unlock()
+							if bt == nil {
+								continue
+							}
+							// ignore stale attempts
+							if int(n.AttemptIdx) <= bt.attempt {
+								continue
+							}
+							toSend := int(n.RecommendExtra)
+							if toSend <= 0 {
+								toSend = 0
+							}
+							// ΔR policy: max(rec_extra, R_step, ceil(alpha * deficit))
+							deficit := 0
+							if bt.K-int(n.RxUnique) > 0 {
+								deficit = bt.K - int(n.RxUnique)
+							}
+							rstep := opts.RStep
+							if rstep <= 0 {
+								rstep = 4
+							}
+							alpha := opts.Alpha
+							if alpha <= 0 {
+								alpha = 0.6
+							}
+							cand := int(alpha*float64(deficit) + 0.9999)
+							if cand < rstep {
+								cand = rstep
+							}
+							if cand < toSend {
+								cand = toSend
+							}
+							if cand <= 0 {
+								cand = 1
+							}
+							// enforce attempts cap
+							if opts.MaxAttempts > 0 && bt.attempt >= opts.MaxAttempts {
+								// give a tiny append once, then stop
+								cand = 0
+							}
+							if cand == 0 {
+								// nothing to append
+								continue
+							}
+							for i := 0; i < toSend; i++ {
+								// loop body will be replaced by cand; break out of old loop
+								_ = i
+							}
+							// send cand fresh repairs
+							for i := 0; i < cand; i++ {
+								esi := bt.nextESI
+								payload := bt.enc.GenSymbol(uint32(esi))
+								h := fecwire.FECHeader{
+									Version:    1,
+									Scheme:     fecwire.SchemeRaptorQ,
+									BlockID:    bid,
+									N:          uint8(minInt(255, bt.K+bt.repairsOut+1)),
+									K:          uint8(bt.K),
+									SymID:      uint8(esi),
+									PayloadLen: uint32(len(payload)),
+								}
+								b := make([]byte, fecwire.HeaderLen+len(payload))
+								copy(b[:fecwire.HeaderLen], h.MarshalBinary(nil))
+								copy(b[fecwire.HeaderLen:], payload)
+								if err := conn.SendDatagram(b); err == nil {
+									sentDgrams++
+									sentBytes += int64(len(b))
+									totalSymbols++
+									totalRepairs++
+								} else {
+									sendErrs++
+								}
+								bt.nextESI++
+								bt.repairsOut++
+								if opts.PaceEach > 0 {
+									time.Sleep(opts.PaceEach)
+								}
+							}
+							bt.attempt = int(n.AttemptIdx)
+							totalAttempts++
+						case arqMsgACK:
+							a := msg.(AckSuccess)
+							bid := uint16(a.ClusterID)
+							txMu.Lock()
+							delete(active, bid)
+							txMu.Unlock()
+							cond.Broadcast()
+						}
+					}
+				}(us)
+			}
+		}()
+	}
+
 	for {
 		n, err := io.ReadFull(f, buf)
 		if err == io.ErrUnexpectedEOF || err == io.EOF { // last partial block
@@ -207,27 +348,51 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		} else if err != nil && err != io.EOF {
 			return err
 		}
-		// Encode block
+		// Enforce ARQ window if enabled
+		if opts.UseARQ && opts.WindowW > 0 {
+			txMu.Lock()
+			for len(active) >= opts.WindowW {
+				cond.Wait()
+			}
+			txMu.Unlock()
+		}
+		// Prepare encoder for this block so we can generate on-demand repairs later
+		blockBytes := make([]byte, len(buf))
+		copy(blockBytes, buf)
 		tEnc := time.Now()
-		pkts, encErr := fec.RaptorQEncodeBlock(buf, N, K, L)
+		enc, encErr := fec.NewRaptorQEncoder(blockBytes, K, L)
 		if encErr != nil {
 			return encErr
 		}
 		encTime += time.Since(tEnc)
-		// Emit symbols per chosen transport
-		for _, p := range pkts {
+		// Decide initial symbols count
+		initRepairs := opts.InitialRepairs
+		if initRepairs <= 0 {
+			initRepairs = maxInt(0, N-K)
+		}
+		initN := K + initRepairs
+		if initN < K {
+			initN = K
+		}
+		bt := &blockTx{K: K, L: L, enc: enc, nextESI: K, repairsOut: 0, attempt: 0}
+		txMu.Lock()
+		active[uint16(blockID)] = bt
+		txMu.Unlock()
+		// Emit initial symbols 0..initN-1
+		for esi := 0; esi < initN; esi++ {
+			payload := enc.GenSymbol(uint32(esi))
 			h := fecwire.FECHeader{
 				Version:    1,
 				Scheme:     fecwire.SchemeRaptorQ,
 				BlockID:    uint16(blockID),
-				N:          uint8(N),
+				N:          uint8(minInt(255, initN)),
 				K:          uint8(K),
-				SymID:      uint8(p.Index),
-				PayloadLen: uint32(len(p.Data)),
+				SymID:      uint8(esi),
+				PayloadLen: uint32(len(payload)),
 			}
-			b := make([]byte, fecwire.HeaderLen+len(p.Data))
+			b := make([]byte, fecwire.HeaderLen+len(payload))
 			copy(b[:fecwire.HeaderLen], h.MarshalBinary(nil))
-			copy(b[fecwire.HeaderLen:], p.Data)
+			copy(b[fecwire.HeaderLen:], payload)
 			if opts.WarnDgramSize > 0 && len(b) > opts.WarnDgramSize {
 				fmt.Printf("warn: datagram size %d exceeds threshold %d; consider reducing L or header size\n", len(b), opts.WarnDgramSize)
 				opts.WarnDgramSize = 0 // warn once
@@ -288,6 +453,10 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 				}
 				lastSend = tSend
 				sendTime += time.Since(tSend)
+				totalSymbols++
+				if esi >= K {
+					totalRepairs++
+				}
 			}
 			// Count towards ack pacing decisions
 			if keepStr != nil {
@@ -295,6 +464,10 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 			}
 			if opts.PaceEach > 0 {
 				time.Sleep(opts.PaceEach)
+			}
+			if esi >= K {
+				bt.nextESI = esi + 1
+				bt.repairsOut = (esi + 1) - K
 			}
 		}
 		blockID++
@@ -326,6 +499,14 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	mbps := (float64(sentBytes) * 8 / 1e6) / dur
 	fmt.Fprintf(os.Stderr, "[client-stats] dgrams=%d bytes=%d dur_s=%.3f mbps=%.2f errs=%d dtle=%d enc_ms=%.1f send_ms=%.1f\n",
 		sentDgrams, sentBytes, dur, mbps, sendErrs, dtleCount, float64(encTime.Milliseconds()), float64(sendTime.Milliseconds()))
+	if opts.UseARQ {
+		overhead := 0.0
+		if totalSymbols > 0 {
+			overhead = float64(totalRepairs) / float64(totalSymbols) * 100.0
+		}
+		fmt.Fprintf(os.Stderr, "[arq-stats] clusters=%d attempts=%d symbols_total=%d repairs=%d overhead_pct=%.1f\n",
+			blockID, totalAttempts, totalSymbols, totalRepairs, overhead)
+	}
 	return nil
 }
 
@@ -407,6 +588,11 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 	rxm, err := newRXManager(hdr.FileSize, 0 /*K*/, int(hdr.ChunkL), outDir, baseName, rx)
 	if err != nil {
 		return "", err
+	}
+	// open a control uni stream to client for ACK/NACK
+	ctrlStr, _ := conn.OpenUniStream()
+	if ctrlStr != nil {
+		rxm.ctrlW = ctrlStr
 	}
 	rxm.start(rx)
 	recvStart := time.Now()
@@ -684,4 +870,18 @@ func GenerateServerTLSConfig(alpn string) (*tls.Config, error) {
 func ResolveUDPAddr(addr string) error {
 	_, err := net.ResolveUDPAddr("udp", addr)
 	return err
+}
+
+// small helpers
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

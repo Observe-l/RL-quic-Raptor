@@ -70,7 +70,7 @@ sleep 0.5
 
 # Run client with CC bypass and pacing
 CLI_LOG=$(mktemp)
-export QUIC_FEC_CC_BYPASS=0
+export QUIC_FEC_CC_BYPASS=1
 # pace per packet using --pace flag
 PACING_ARG="--pace ${us_per_pkt}us"
 ACK_EVERY=${ACK_EVERY:-0}

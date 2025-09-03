@@ -2,6 +2,8 @@ package fecquic
 
 import (
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -43,9 +45,11 @@ type rxBlock struct {
 	K, N, L  int
 	dataSize int // exact bytes for this block (last block may be partial)
 
-	dec    *fec.RaptorQDecoder
-	queued bool
-	done   bool
+	dec     *fec.RaptorQDecoder
+	queued  bool
+	done    bool
+	attempt int       // ARQ attempt index
+	nextDDL time.Time // next DDL fire time
 	// store received symbols by ESI to avoid duplicates and allow release
 	syms map[int][]byte
 }
@@ -77,7 +81,6 @@ type rxManager struct {
 
 	// writer
 	out     *os.File
-	outPath string
 	tmpPath string
 	written atomic.Uint64
 
@@ -85,6 +88,10 @@ type rxManager struct {
 	decBlocks    atomic.Int64
 	decTimeTotal atomic.Int64 // ms
 	dropsRepairs atomic.Int64
+
+	// ARQ control (optional)
+	ctrlW  io.Writer  // if set, send ACK/NACK
+	ctrlMu sync.Mutex // guard ctrlW writes
 }
 
 func newRXManager(fileSize uint64, K, L int, outDir, baseName string, rx RXOptions) (*rxManager, error) {
@@ -155,6 +162,27 @@ func (m *rxManager) start(rx RXOptions) {
 				if err != nil || !ok {
 					// decoding failed; likely need more symbols
 					b.queued = false
+					// schedule a NACK recommending more symbols if ctrl available
+					if m.ctrlW != nil {
+						// recommend at least 1; if already have >=K, ask for a couple fresh repairs
+						miss := 1
+						if len(b.syms) < b.K {
+							miss = max(1, b.K-len(b.syms))
+						} else {
+							miss = 2
+						}
+						m.ctrlMu.Lock()
+						_ = writeNack(m.ctrlW, NackNeedMore{
+							FileID:         0,
+							ClusterID:      uint32(b.id),
+							AttemptIdx:     uint16(b.attempt),
+							RxUnique:       uint16(len(b.syms)),
+							RecommendExtra: uint16(miss),
+							Reason:         0,
+						})
+						m.ctrlMu.Unlock()
+						fmt.Fprintf(os.Stderr, "[arq] nack block=%d rx_unique=%d rec_extra=%d attempt=%d\n", b.id, len(b.syms), miss, b.attempt)
+					}
 					continue
 				}
 				m.decTimeTotal.Add(time.Since(t0).Milliseconds())
@@ -163,6 +191,9 @@ func (m *rxManager) start(rx RXOptions) {
 				m.writeQ <- writeTask{off: off, data: bytes}
 				m.decBlocks.Add(1)
 				// release memory and mark done
+				// capture stats before clearing
+				rxUnique := len(b.syms)
+				usedRep := max(0, rxUnique-b.K)
 				m.mu.Lock()
 				for _, p := range b.syms {
 					m.inUse.Add(int64(-len(p)))
@@ -171,6 +202,20 @@ func (m *rxManager) start(rx RXOptions) {
 				b.done = true
 				delete(m.blocks, b.id)
 				m.mu.Unlock()
+				// ACK success to sender if ctrl available
+				if m.ctrlW != nil {
+					m.ctrlMu.Lock()
+					_ = writeAck(m.ctrlW, AckSuccess{
+						FileID:          0,
+						ClusterID:       uint32(b.id),
+						AttemptIdx:      uint16(b.attempt),
+						RxUnique:        uint16(rxUnique),
+						UsedRepairs:     uint16(usedRep),
+						DecodeLatencyMs: uint32(time.Since(t0).Milliseconds()),
+					})
+					m.ctrlMu.Unlock()
+					fmt.Fprintf(os.Stderr, "[arq] ack block=%d rx_unique=%d used_rep=%d attempt=%d\n", b.id, rxUnique, usedRep, b.attempt)
+				}
 			}
 		}()
 	}
@@ -192,8 +237,10 @@ func (m *rxManager) start(rx RXOptions) {
 				if b.done || b.queued {
 					continue
 				}
-				if now.Sub(b.t0) >= m.ddl {
+				if now.After(b.nextDDL) || now.Equal(b.nextDDL) {
+					b.attempt++
 					b.queued = true
+					b.nextDDL = now.Add(m.ddl)
 					m.decodeQ <- b
 				}
 			}
@@ -221,6 +268,8 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 			N:        N,
 			L:        L,
 			dataSize: dataSize,
+			attempt:  0,
+			nextDDL:  time.Now().Add(m.ddl),
 			syms:     make(map[int][]byte, N),
 		}
 		dec, err := fec.NewRaptorQDecoder(dataSize, L)
@@ -284,4 +333,12 @@ func (m *rxManager) closeAndFinalize(expectedSHA [32]byte) (string, error) {
 		return "", err
 	}
 	return finalPath, nil
+}
+
+// helpers
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
