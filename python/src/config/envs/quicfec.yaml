@@ -3,11 +3,11 @@ runner: "episode"  # single env; our wrapper runs one episode per step
 
 env_args:
   rtt_ms: 100
-  loss_pct: 5
+  loss_pct: 10
   bitrate_mbps: 10
   K: 40
   symbol_bytes: 1200
-  prefer_local: True  # use sudo-free localhost path by default for training sanity checks
+  prefer_local: False  # use shaped netns/tc path (requires sudo)
 
 test_greedy: True
 test_nepisode: 2

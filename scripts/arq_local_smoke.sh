@@ -40,6 +40,15 @@ for run in $(seq 1 "$REPS"); do
   "$BIN_DIR/quicfec-client" -addr 127.0.0.1:$PORT -file "$FILE" -N $((K+R0)) -K "$K" -L "$SYMBOL_BYTES" \
     -post-wait 300ms -ack-every "$ACK_EVERY" -dgram-warn 1400 -arq -R0 "$R0" -W "$W" -Rstep "$RSTEP" -alpha "$ALPHA" -max-attempts 5 \
     >"$CLI_LOG" 2>&1 || true
+  # Wait briefly for server to emit observation (up to 5s) before stopping it
+  tries=0
+  while [[ $tries -lt 50 ]]; do
+    RL_OBS=$(grep -E '^\[rl-observation\]' "$SRV_LOG" | tail -n1 || true)
+    if [[ -n "$RL_OBS" ]]; then
+      break
+    fi
+    sleep 0.1; tries=$((tries+1))
+  done
   sleep 0.2; kill $SP 2>/dev/null || true
 
   RL_OBS=$(grep -E "^\[rl-observation\]" "$SRV_LOG" | tail -n1 || true)

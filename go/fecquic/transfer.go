@@ -89,9 +89,9 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 			return NewECNConnTracer(ecnStats)
 		},
 		EnableDatagrams: true,
-		// Prevent idle timeouts during datagram-heavy transfers by sending frequent PINGs.
-		KeepAlivePeriod:                50 * time.Millisecond,
-		MaxIdleTimeout:                 90 * time.Second,
+		// Prevent idle timeouts; keep small to avoid tail delays on shutdown.
+		KeepAlivePeriod:                20 * time.Millisecond,
+		MaxIdleTimeout:                 6 * time.Second,
 		InitialStreamReceiveWindow:     8 * 1024 * 1024,
 		InitialConnectionReceiveWindow: 16 * 1024 * 1024,
 	}
@@ -621,12 +621,32 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 	}()
 	go func() {
 		defer close(doneCh)
-		// wait until file complete
+		// wait until file complete OR context done OR prolonged inactivity (no dgrams and no writes)
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		lastWritten := rxm.written.Load()
+		var lastDgrams int64 = rcvDgrams
+		lastChange := time.Now()
+		// Be responsive after sender finishes: 3s of no progress triggers finalize
+		inactivity := 3 * time.Second
 		for {
 			if rxm.written.Load() >= hdr.FileSize {
 				return
 			}
-			time.Sleep(5 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				w := rxm.written.Load()
+				dg := rcvDgrams
+				if w != lastWritten || dg != lastDgrams {
+					lastWritten = w
+					lastDgrams = dg
+					lastChange = time.Now()
+				} else if time.Since(lastChange) > inactivity {
+					return
+				}
+			}
 		}
 	}()
 	// DATAGRAM receiver
@@ -715,6 +735,14 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 	close(progStop)
 	finalPath, err := rxm.closeAndFinalize(hdr.SHA256)
 	if err != nil {
+		// On failure (e.g., SHA mismatch / residual erasures), still emit a best-effort observation
+		// so external harnesses don't stall waiting for metrics.
+		if rxm != nil && rxm.met != nil {
+			obs := rxm.met.Snapshot(time.Now())
+			// Mark residual erasures on failure path.
+			obs.ResidualErasures = 1
+			obs.PrintJSON()
+		}
 		return "", err
 	}
 	rdur := time.Since(recvStart).Seconds()

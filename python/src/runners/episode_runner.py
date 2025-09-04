@@ -39,12 +39,21 @@ class EpisodeRunner:
 
         # Log the first run
         self.log_train_stats_t = -1000000
-        # Prepare per-step metrics file
-        self.step_metrics_dir = os.path.join(self.args.local_results_path, "step_metrics")
-        os.makedirs(self.step_metrics_dir, exist_ok=True)
-        self.step_metrics_path = os.path.join(
-            self.step_metrics_dir, f"{self.args.unique_token}.jsonl"
-        )
+        # Prefer saving into the Sacred run directory (alongside config.json, run.json)
+        sacred_dir = self._resolve_sacred_dir()
+        if sacred_dir:
+            self.step_metrics_dir = sacred_dir
+            os.makedirs(self.step_metrics_dir, exist_ok=True)
+            self.step_metrics_path = os.path.join(self.step_metrics_dir, "step_metrics.jsonl")
+            # Also tell the QUIC harness where to write raw [rl-observation] lines
+            os.environ["QUICFEC_OBS_JSONL"] = os.path.join(self.step_metrics_dir, "observations.jsonl")
+        else:
+            # Fallback: legacy location
+            self.step_metrics_dir = os.path.join(self.args.local_results_path, "step_metrics")
+            os.makedirs(self.step_metrics_dir, exist_ok=True)
+            self.step_metrics_path = os.path.join(
+                self.step_metrics_dir, f"{self.args.unique_token}.jsonl"
+            )
 
     def setup(self, scheme, groups, preprocess, mac):
         self.new_batch = partial(
@@ -66,6 +75,28 @@ class EpisodeRunner:
 
     def close_env(self):
         self.env.close()
+
+    def _resolve_sacred_dir(self):
+        """Return the Sacred FileStorageObserver run directory if available, else None."""
+        try:
+            run = getattr(self.logger, "_run_obj", None)
+            if not run:
+                return None
+            # Try to find an attached FileStorageObserver with a 'dir' attribute
+            for obs in getattr(run, "observers", []) or []:
+                d = getattr(obs, "dir", None)
+                if d and isinstance(d, str):
+                    return d
+                # Construct from basedir and run id if possible
+                basedir = getattr(obs, "basedir", None)
+                run_id = getattr(run, "_id", None) or getattr(run, "id", None)
+                if basedir and run_id is not None:
+                    candidate = os.path.join(basedir, str(run_id))
+                    if os.path.isdir(candidate):
+                        return candidate
+        except Exception:
+            return None
+        return None
 
     def reset(self):
         self.batch = self.new_batch()
@@ -119,6 +150,8 @@ class EpisodeRunner:
                         rec["raw_obs"] = env_info["raw_obs"]
                     if "applied_action" in env_info:
                         rec["applied_action"] = env_info["applied_action"]
+                    if "error" in env_info and env_info["error"]:
+                        rec["error"] = env_info["error"]
                 with open(self.step_metrics_path, "a") as _f:
                     _f.write(json.dumps(rec) + "\n")
             except Exception:

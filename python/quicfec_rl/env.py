@@ -3,7 +3,7 @@ import json
 import time
 import subprocess
 from dataclasses import dataclass
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Optional
 
 @dataclass
 class EnvConfig:
@@ -35,14 +35,16 @@ class QuicFecEnv:
     One file transfer == one step. Reset applies loss/bw/RTT via script; Step applies ARQ/FEC params.
     """
 
-    def __init__(self, root: str = None, ns: str = "qns", prefer_local: bool = False):
+    def __init__(self, root: str = None, ns: str = "qns", prefer_local: bool = False, timeout_sec: int = 90):
         self.root = root or os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         self.ns = ns
-        self.script = os.path.join(self.root, "scripts", "arq_sweep_bw_rtt_loss.sh")
+        self.script = os.path.join(self.root, "scripts", "quicfec_run_once.sh")
         self.local_script = os.path.join(self.root, "scripts", "arq_local_smoke.sh")
-        self.obs_jsonl = "/tmp/arq_sweep_10mbps_rl.jsonl"
-        self.last_cfg: EnvConfig | None = None
+        # Default observation sink; can be overridden via QUICFEC_OBS_JSONL
+        self.obs_jsonl = os.environ.get("QUICFEC_OBS_JSONL", "/tmp/quicfec_rl.jsonl")
+        self.last_cfg = None
         self.prefer_local = prefer_local
+        self.timeout_sec = int(timeout_sec)
 
     def reset(self, cfg: EnvConfig) -> Dict[str, Any]:
         """
@@ -54,7 +56,7 @@ class QuicFecEnv:
             self._sudo_check()
         return {"ok": True}
 
-    def step(self, action: Action, rtt_ms: int, loss_pct: int) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
+    def step(self, action: Action, rtt_ms: int, loss_pct: int, bitrate_mbps: Optional[int] = None) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
         """
         Run a single episode with given action and shaping, parse the last [rl-observation] JSONL line.
         Returns (obs, reward, done, info).
@@ -72,31 +74,61 @@ class QuicFecEnv:
         env["DDL_MS"] = str(action.ddl_ms)
         env["RSTEP"] = str(action.R_step)
         env["ALPHA"] = str(action.alpha)
-        env["ACK_EVERY"] = "0"
+        # v3 continuous controls (forward to harness)
+        env["EPSILON"] = str(getattr(action, "epsilon", 0))
+        env["INTERLEAVER_SPAN"] = str(getattr(action, "interleaver_span", 0))
+        env["PACING_GAIN"] = str(getattr(action, "pacing_gain", 1.0))
+        # Use a conservative default ack pacing under loss to avoid idle timeouts
+        env["ACK_EVERY"] = os.environ.get("ACK_EVERY", "8")
+        # Allow raising ARQ cap for robustness under higher losses
+        env["MAX_ATTEMPTS"] = os.environ.get("MAX_ATTEMPTS", "8")
         env["OUT_RAW"] = "/tmp/rl_arq_raw.csv"
         env["OUT_AGG"] = "/tmp/rl_arq_agg.csv"
-        env["OBS_JSONL"] = self.obs_jsonl
+        # Allow overriding observation sink per run (and ensure directory exists)
+        obs_jsonl_path = os.environ.get("QUICFEC_OBS_JSONL", self.obs_jsonl)
+        try:
+            os.makedirs(os.path.dirname(obs_jsonl_path), exist_ok=True)
+        except Exception:
+            pass
+        env["OBS_JSONL"] = obs_jsonl_path
+        if bitrate_mbps is not None:
+            env["BITRATE_MBPS"] = str(int(bitrate_mbps))
 
-        if self.prefer_local:
-            # Localhost path: avoid sudo; rtt/loss shaping not applied here
-            p = subprocess.run([self.local_script], env=env, capture_output=True, text=True)
-        else:
-            env["NS"] = self.ns
-            env["RTTS"] = str(rtt_ms)
-            env["LOSSES"] = str(loss_pct)
-            self._sudo_ensure()
-            p = subprocess.run([self.script], env=env, capture_output=True, text=True)
-        if p.returncode != 0:
-            raise RuntimeError(f"harness failed: code={p.returncode} stderr={p.stderr[-400:]}\nstdout={p.stdout[-400:]}")
-        # Parse last observation
-        obs = self._read_last_obs()
-        reward = self._compute_reward(obs)
-        return obs, reward, True, {}
+        try:
+            if self.prefer_local:
+                # Localhost path: avoid sudo; rtt/loss shaping not applied here
+                p = subprocess.run(["bash", "-lc", f"bash '{self.local_script}'"], env=env, capture_output=True, text=True, timeout=self.timeout_sec)
+            else:
+                env["NS"] = self.ns
+                env["RTT_MS"] = str(rtt_ms)
+                env["LOSS_PCT"] = str(loss_pct)
+                self._sudo_ensure()
+                # Run via bash to ensure env var expansion and PATH usage
+                p = subprocess.run(["bash", "-lc", f"bash '{self.script}'"], env=env, capture_output=True, text=True, timeout=self.timeout_sec)
+            if p.returncode != 0:
+                raise RuntimeError(f"harness failed: code={p.returncode} stderr={p.stderr[-400:]}\nstdout={p.stdout[-400:]}")
+            # Parse last observation
+            obs = self._read_last_obs(obs_jsonl_path)
+            reward = self._compute_reward(obs)
+            return obs, reward, True, {}
+        except subprocess.TimeoutExpired as te:
+            # Timeout: return penalized observation and mark done, include info
+            obs = self._default_obs(timeout=True)
+            reward = self._compute_reward(obs)
+            info = {"error": f"timeout after {self.timeout_sec}s", "stderr_tail": getattr(te, 'stderr', None)}
+            return obs, reward, True, info
+        except Exception as e:
+            # Failure: return penalized observation and mark done, include info
+            obs = self._default_obs(timeout=False)
+            reward = self._compute_reward(obs)
+            info = {"error": str(e)}
+            return obs, reward, True, info
 
-    def _read_last_obs(self) -> Dict[str, Any]:
+    def _read_last_obs(self, file_path: Optional[str] = None) -> Dict[str, Any]:
         last = None
-        if os.path.exists(self.obs_jsonl):
-            with open(self.obs_jsonl, "r", encoding="utf-8") as f:
+        path = file_path or self.obs_jsonl
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
                 for line in f:
                     if line.startswith("[rl-observation] "):
                         try:
@@ -128,6 +160,23 @@ class QuicFecEnv:
         if attempts > 1.0:
             reward -= min(0.3, 0.05 * (attempts - 1.0))
         return reward
+
+    def _default_obs(self, timeout: bool) -> Dict[str, Any]:
+        # Conservative penalized observation when a run fails or times out
+        return {
+            "goodput_decode_mbps": 0.0,
+            "duration_decode_ms": 2000.0 if timeout else 1500.0,
+            "residual_erasures": 1,
+            "fec_overhead_pct_arrival": 0.0,
+            "arq_attempts_mean": 2.0,
+            "arq_attempts_p95": 3.0,
+            "rx_unique_at_ddl_mean": 0.0,
+            "rx_unique_at_ddl_p95": 0.0,
+            "decode_latency_p50_ms": 0.0,
+            "decode_latency_p95_ms": 0.0,
+            "estimated_available_bw_mbps_p95": 0.0,
+            "estimated_available_bw_mbps_peak": 0.0,
+        }
 
     def _sudo_check(self) -> bool:
         try:

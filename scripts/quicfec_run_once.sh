@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Single trial QUIC-FEC run for RL. Configurable via env vars.
+# - Sets up/refreshes a netns and veth pair, configures tc for RTT/loss/rate.
+# - Starts server in the namespace, runs client on host once.
+# - Extracts last [rl-observation] line from server log and appends to OBS_JSONL.
+#
+# Env vars (with defaults):
+#   NS=qns, PORT=45300
+#   BITRATE_MBPS=10, RTT_MS=100, LOSS_PCT=0
+#   LOSS_MODE=  # optional; overrides LOSS_PCT when set. Formats:
+#               #   none
+#               #   iid:5           (5% i.i.d. loss)
+#               #   gemodel:p,r,h,k (Gilbert-Elliott model, percents)
+#   FILE=$ROOT/go/test_data/train_FD001.txt
+#   K=40, SYMBOL_BYTES=1200, R0=6, W=8, DDL_MS=50, RSTEP=4, ALPHA=0.6, ACK_EVERY=8, MAX_ATTEMPTS=8
+#   OBS_JSONL=/tmp/quicfec_rl.jsonl
+#   POST_WAIT=0s (linger after client send; keep at 0s for fastest runs)
+#   SRV_TIMEOUT=10s (server max lifetime; lower keeps runs bounded)
+#   FORCE_BUILD=0 (set to 1 to force rebuilding Go binaries)
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+BIN_DIR="$ROOT/go/bin"
+
+NS=${NS:-qns}
+PORT=${PORT:-45300}
+
+BITRATE_MBPS=${BITRATE_MBPS:-10}
+RTT_MS=${RTT_MS:-100}
+LOSS_PCT=${LOSS_PCT:-0}
+RATE="${BITRATE_MBPS}mbit"
+
+FILE=${FILE:-"$ROOT/go/test_data/train_FD001.txt"}
+OBS_JSONL=${OBS_JSONL:-/tmp/quicfec_rl.jsonl}
+
+K=${K:-40}
+SYMBOL_BYTES=${SYMBOL_BYTES:-1200}
+R0=${R0:-6}
+W=${W:-8}
+DDL_MS=${DDL_MS:-150}
+RSTEP=${RSTEP:-4}
+ALPHA=${ALPHA:-0.6}
+ACK_EVERY=${ACK_EVERY:-8}
+MAX_ATTEMPTS=${MAX_ATTEMPTS:-8}
+POST_WAIT=${POST_WAIT:-0s}
+SRV_TIMEOUT=${SRV_TIMEOUT:-6s}
+
+chmod +x "$ROOT/scripts"/*.sh || true
+mkdir -p "$ROOT/go/test_data"
+# Ensure test file exists (repo ignores test_data). Create a deterministic ~3MB file if missing.
+if [[ ! -f "$FILE" ]]; then
+  head -c $((3*1024*1024)) </dev/urandom >"$FILE"
+fi
+
+# Require cached sudo privileges to avoid interactive prompts under RL.
+if ! sudo -n true 2>/dev/null; then
+  echo "[error] sudo privileges are required. Run 'sudo -v' once (or set SUDO_ASKPASS/SUDO_PASSWORD) and rerun." >&2
+  exit 1
+fi
+
+# Reset netns and (re)build binaries
+"$ROOT/scripts/netns_reset.sh" "$NS"
+# Build only if missing or forced, to avoid rebuild overhead per step
+if [[ "${FORCE_BUILD:-0}" == "1" || ! -x "$BIN_DIR/quicfec-server" || ! -x "$BIN_DIR/quicfec-client" ]]; then
+  (cd "$ROOT/go" && go build -o "$BIN_DIR/quicfec-server" ./cmd/quicfec-server && go build -o "$BIN_DIR/quicfec-client" ./cmd/quicfec-client)
+fi
+
+FILE_SIZE=$(stat -c%s "$FILE")
+
+# Configure qdiscs: half RTT on each direction; loss and rate limiting on host side
+half=$(( RTT_MS / 2 ))
+sudo tc qdisc del dev veth0 root 2>/dev/null || true
+# Support LOSS_MODE (iid / gemodel), fallback to LOSS_PCT as iid
+LOSS_MODE=${LOSS_MODE:-}
+case "$LOSS_MODE" in
+  none)
+    sudo tc qdisc replace dev veth0 root handle 1: netem delay ${half}ms loss 0%% ;;
+  iid:*)
+    pct=${LOSS_MODE#iid:}
+    sudo tc qdisc replace dev veth0 root handle 1: netem delay ${half}ms loss ${pct}% ;;
+  gemodel:*)
+    params=${LOSS_MODE#gemodel:}
+    IFS=',' read -r p r h k <<<"$params"
+    sudo tc qdisc replace dev veth0 root handle 1: netem delay ${half}ms loss gemodel ${p}% ${r}% ${h}% ${k}% ;;
+  ""|*)
+    # default to legacy LOSS_PCT as iid
+    sudo tc qdisc replace dev veth0 root handle 1: netem delay ${half}ms loss ${LOSS_PCT}% ;;
+esac
+sudo tc qdisc replace dev veth0 parent 1:1 handle 10: tbf rate ${RATE} burst 32kb latency 400ms
+sudo ip netns exec "$NS" tc qdisc del dev veth1 root 2>/dev/null || true
+sudo ip netns exec "$NS" tc qdisc replace dev veth1 root netem delay ${half}ms
+
+# JSONL for RL obs
+touch "$OBS_JSONL"
+
+# Run server
+SRV_LOG=$(mktemp -t quicfec_srv.XXXXXX.log)
+sudo ip netns exec "$NS" bash -lc "ulimit -n 1048576; '$BIN_DIR/quicfec-server' -addr 10.10.0.2:$PORT -out '$ROOT/go/test_data' -rx-ddl ${DDL_MS}ms -timeout ${SRV_TIMEOUT}" >"$SRV_LOG" 2>&1 & SP=$!
+sleep 0.1
+
+# Run client
+CLI_LOG=$(mktemp -t quicfec_cli.XXXXXX.log)
+export QUIC_FEC_CC_BYPASS=1
+START=$(date +%s%N)
+"$BIN_DIR/quicfec-client" -addr 10.10.0.2:$PORT -file "$FILE" -N $((K+R0)) -K "$K" -L "$SYMBOL_BYTES" \
+  -post-wait "$POST_WAIT" -ack-every "$ACK_EVERY" -dgram-warn 1400 -arq -R0 "$R0" -W "$W" -Rstep "$RSTEP" -alpha "$ALPHA" -max-attempts "$MAX_ATTEMPTS" \
+  >"$CLI_LOG" 2>&1 || true
+END=$(date +%s%N)
+
+# Wait for server to emit the observation before stopping it (cap ~6s)
+tries=0
+RL_OBS=""
+while [[ $tries -lt 60 ]]; do
+  RL_OBS=$(grep -E "^\[rl-observation\]" "$SRV_LOG" | tail -n1 || true)
+  if [[ -n "$RL_OBS" ]]; then
+    break
+  fi
+  sleep 0.1
+  tries=$((tries+1))
+done
+sleep 0.05; kill $SP 2>/dev/null || true
+sleep 0.05; kill -9 $SP 2>/dev/null || true
+
+# Basic metrics
+IN_MD5=$(md5sum "$FILE" | awk '{print $1}')
+OUT_MD5=$(md5sum "$ROOT/go/test_data/$(basename "$FILE").recv" | awk '{print $1}' || true)
+MD5_OK=0; [[ "$IN_MD5" == "$OUT_MD5" ]] && MD5_OK=1
+
+DUR_MS=$(( (END-START)/1000000 ))
+
+# Extract server observation (preferred)
+if [[ -n "$RL_OBS" ]]; then
+  echo "$RL_OBS" >>"$OBS_JSONL"
+  echo "$RL_OBS" >&2
+else
+  echo "[warn] no [rl-observation] found in server logs" >&2
+  echo "[warn] server log tail:" >&2
+  tail -n 50 "$SRV_LOG" >&2 || true
+  echo "[warn] client log tail:" >&2
+  tail -n 50 "$CLI_LOG" >&2 || true
+fi
+
+# Optional: echo a concise run summary
+S_LINE=$(grep -E "^\[server-stats\]" "$SRV_LOG" | tail -n1 || true)
+if [[ -n "$S_LINE" ]]; then
+  S_DUR=$(echo "$S_LINE" | sed -n 's/.*dur_s=\([0-9.\-]\+\).*/\1/p')
+  if [[ -n "$S_DUR" && "$S_DUR" != "0" ]]; then
+    S_MBPS=$(awk -v sz="$FILE_SIZE" -v ds="$S_DUR" 'BEGIN{printf "%.2f", (sz*8.0/1000000.0)/ds}')
+  else
+    if [[ "$DUR_MS" -gt 0 ]]; then
+      S_MBPS=$(awk -v sz="$FILE_SIZE" -v ms="$DUR_MS" 'BEGIN{printf "%.2f", (sz*8.0/1000000.0)/(ms/1000.0)}')
+    else
+      S_MBPS=0
+    fi
+  fi
+  echo "[run] bitrate=${BITRATE_MBPS}Mbps rtt=${RTT_MS}ms loss=${LOSS_PCT}% dur_ms=${DUR_MS} md5_ok=${MD5_OK} s_mbps=${S_MBPS}" >&2
+fi
+
+# Cleanup temp logs
+# Keep logs when a failure occurs (no RL_OBS); otherwise clean up
+if [[ -n "$RL_OBS" ]]; then
+  rm -f "$CLI_LOG" "$SRV_LOG"
+fi
+
+exit 0
