@@ -56,7 +56,7 @@ class QuicFecEnv:
             self._sudo_check()
         return {"ok": True}
 
-    def step(self, action: Action, rtt_ms: int, loss_pct: int, bitrate_mbps: Optional[int] = None) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
+    def step(self, action: Action, rtt_ms: int, loss_pct: int, bitrate_mbps: Optional[int] = None, loss_mode: Optional[str] = None) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
         """
         Run a single episode with given action and shaping, parse the last [rl-observation] JSONL line.
         Returns (obs, reward, done, info).
@@ -84,6 +84,14 @@ class QuicFecEnv:
         env["MAX_ATTEMPTS"] = os.environ.get("MAX_ATTEMPTS", "8")
         env["OUT_RAW"] = "/tmp/rl_arq_raw.csv"
         env["OUT_AGG"] = "/tmp/rl_arq_agg.csv"
+        # Loss control: allow explicit LOSS_MODE (iid:10, gemodel:...), else fallback to LOSS_PCT
+        lm = loss_mode
+        # If not provided explicitly, try from reset cfg
+        if not lm and getattr(self, "last_cfg", None) and hasattr(self.last_cfg, "loss_profile"):
+            lm = self.last_cfg.loss_profile
+        if lm and isinstance(lm, str) and lm.strip():
+            env["LOSS_MODE"] = lm.strip()
+        env["LOSS_PCT"] = str(int(loss_pct))
         # Allow overriding observation sink per run (and ensure directory exists)
         obs_jsonl_path = os.environ.get("QUICFEC_OBS_JSONL", self.obs_jsonl)
         try:

@@ -44,7 +44,7 @@ ALPHA=${ALPHA:-0.6}
 ACK_EVERY=${ACK_EVERY:-8}
 MAX_ATTEMPTS=${MAX_ATTEMPTS:-8}
 POST_WAIT=${POST_WAIT:-0s}
-SRV_TIMEOUT=${SRV_TIMEOUT:-6s}
+SRV_TIMEOUT=${SRV_TIMEOUT:-8s}
 
 chmod +x "$ROOT/scripts"/*.sh || true
 mkdir -p "$ROOT/go/test_data"

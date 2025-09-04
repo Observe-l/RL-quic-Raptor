@@ -4,6 +4,9 @@ runner: "episode"  # single env; our wrapper runs one episode per step
 env_args:
   rtt_ms: 100
   loss_pct: 10
+  # Select loss model; overrides loss_pct when set.
+  # Examples: "iid:10" or "gemodel:0.5,20,80,0.1"
+  loss_mode: "iid:10"
   bitrate_mbps: 10
   K: 40
   symbol_bytes: 1200

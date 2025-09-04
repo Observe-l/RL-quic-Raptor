@@ -35,6 +35,7 @@ class QuicFecWrapper(MultiAgentEnv):
         self,
         rtt_ms: int = 100,
         loss_pct: int = 5,
+        loss_mode: str | None = None,
         bitrate_mbps: int = 10,
         K: int = 40,
         symbol_bytes: int = 1200,
@@ -46,6 +47,7 @@ class QuicFecWrapper(MultiAgentEnv):
     ) -> None:
         self._rtt_ms = int(rtt_ms)
         self._loss_pct = int(loss_pct)
+        self._loss_mode = loss_mode
         self._bitrate = int(bitrate_mbps) * 1_000_000
 
         # Underlying single-episode environment; prefer local smoke script to avoid sudo
@@ -57,7 +59,7 @@ class QuicFecWrapper(MultiAgentEnv):
                 num_connections=1,
                 cc_mode="bypass",
                 target_bitrate_bps=self._bitrate,
-                loss_profile=f"iid:{self._loss_pct}",
+                loss_profile=(self._loss_mode if self._loss_mode else f"iid:{self._loss_pct}"),
                 K=K,
                 symbol_bytes=symbol_bytes,
             )
@@ -148,6 +150,7 @@ class QuicFecWrapper(MultiAgentEnv):
             rtt_ms=self._rtt_ms,
             loss_pct=self._loss_pct,
             bitrate_mbps=int(self._bitrate / 1_000_000),
+            loss_mode=self._loss_mode,
         )
         self._last_obs_vec = self._obs_to_vec(obs_dict)
         terminated = bool(done)
