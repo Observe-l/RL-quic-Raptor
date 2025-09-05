@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"sync"
@@ -50,6 +51,11 @@ type SendOptions struct {
 
 // ClientSendFile connects and sends a file using QFEC header + RaptorQ symbols over datagrams.
 func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptions) error {
+	// Shared pacer across all sends (initial + ARQ repairs) for accurate pacing
+	var pc *pacer
+	if opts.PaceEach > 0 {
+		pc = newPacer(opts.PaceEach)
+	}
 	ecnStats := NewECNStats()
 	K := opts.K
 	if K <= 0 {
@@ -314,8 +320,8 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 								}
 								bt.nextESI++
 								bt.repairsOut++
-								if opts.PaceEach > 0 {
-									time.Sleep(opts.PaceEach)
+								if pc != nil {
+									pc.Wait()
 								}
 							}
 							bt.attempt = int(n.AttemptIdx)
@@ -459,8 +465,8 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 			if keepStr != nil {
 				dgramsSinceAck++
 			}
-			if opts.PaceEach > 0 {
-				time.Sleep(opts.PaceEach)
+			if pc != nil {
+				pc.Wait()
 			}
 			if esi >= K {
 				bt.nextESI = esi + 1
@@ -743,6 +749,8 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 			obs.ResidualErasures = 1
 			obs.PrintJSON()
 		}
+		// Log the error reason for diagnostics
+		fmt.Fprintf(os.Stderr, "[server-error] finalize: %v\n", err)
 		return "", err
 	}
 	rdur := time.Since(recvStart).Seconds()
@@ -833,6 +841,60 @@ func ListenAndServeLoop(ctx context.Context, addr, alpn, outDir string, tlsConf 
 		if ecnStats != nil {
 			tx0, tx1, rx0, rx1, rxce, _ := ecnStats.Snapshot()
 			fmt.Fprintf(os.Stderr, "[server-ecn] rx: CE=%d ECT0=%d ECT1=%d, tx: ECT0=%d ECT1=%d\n", rxce, rx0, rx1, tx0, tx1)
+		}
+	}
+}
+
+// pacer ensures inter-send spacing with microsecond-level precision shared across goroutines.
+// It maintains a target schedule and sleeps/yields to hit deadlines without accumulating drift.
+type pacer struct {
+	mu       sync.Mutex
+	nextDue  time.Time
+	interval time.Duration
+}
+
+func newPacer(interval time.Duration) *pacer {
+	if interval <= 0 {
+		return nil
+	}
+	return &pacer{interval: interval}
+}
+
+// Wait blocks until the next scheduled time, then advances the schedule by interval.
+// It is safe for concurrent use; calls are serialized to maintain spacing across senders.
+func (p *pacer) Wait() {
+	if p == nil {
+		return
+	}
+	// Reserve the next slot and compute its due time.
+	p.mu.Lock()
+	due := p.nextDue
+	now := time.Now()
+	if due.IsZero() || now.After(due) {
+		// If we're behind or uninitialized, schedule from now.
+		due = now.Add(p.interval)
+	} else {
+		// Otherwise, move to the next slot.
+		due = due.Add(p.interval)
+	}
+	p.nextDue = due
+	p.mu.Unlock()
+
+	// Sleep until due. Use a coarse sleep, then fine-yield to improve precision.
+	for {
+		rem := time.Until(due)
+		if rem <= 0 {
+			return
+		}
+		if rem > 150*time.Microsecond {
+			time.Sleep(rem - 100*time.Microsecond)
+			continue
+		}
+		// Sub-150us: yield in small chunks to avoid burning CPU while improving accuracy.
+		if rem > 50*time.Microsecond {
+			time.Sleep(50 * time.Microsecond)
+		} else {
+			runtime.Gosched()
 		}
 	}
 }

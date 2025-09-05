@@ -134,7 +134,7 @@ class EpisodeRunner:
                 self.env.render()
             episode_return += reward
 
-            # Record per-step observation metrics and reward
+            # Record per-step observation metrics, reward, and network settings
             try:
                 rec = {
                     "t_env": int(self.t_env),
@@ -150,6 +150,12 @@ class EpisodeRunner:
                         rec["raw_obs"] = env_info["raw_obs"]
                     if "applied_action" in env_info:
                         rec["applied_action"] = env_info["applied_action"]
+                    # Include active network settings for this step
+                    if "net_params" in env_info and isinstance(env_info["net_params"], dict):
+                        rec["net_params"] = env_info["net_params"]
+                    for k in ("net_rtt_ms", "net_bitrate_mbps", "net_loss_mode", "net_loss_rate_pct", "net_loss_params"):
+                        if k in env_info:
+                            rec[k] = env_info[k]
                     if "error" in env_info and env_info["error"]:
                         rec["error"] = env_info["error"]
                 with open(self.step_metrics_path, "a") as _f:

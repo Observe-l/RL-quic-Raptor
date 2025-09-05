@@ -17,6 +17,7 @@ RSTEP=${RSTEP:-4}
 ALPHA=${ALPHA:-0.6}
 ACK_EVERY=${ACK_EVERY:-0}
 SYMBOL_BYTES=${SYMBOL_BYTES:-1200}
+PACE_US=${PACE_US:-0}
 
 OBS_JSONL=${OBS_JSONL:-/tmp/arq_local_smoke_rl.jsonl}
 echo -n >"$OBS_JSONL"
@@ -37,8 +38,12 @@ for run in $(seq 1 "$REPS"); do
   sleep 0.3
   # Client with CC bypass for determinism
   export QUIC_FEC_CC_BYPASS=1
+  pace_arg=""
+  if [[ "$PACE_US" -gt 0 ]]; then
+    pace_arg="-pace ${PACE_US}us"
+  fi
   "$BIN_DIR/quicfec-client" -addr 127.0.0.1:$PORT -file "$FILE" -N $((K+R0)) -K "$K" -L "$SYMBOL_BYTES" \
-    -post-wait 300ms -ack-every "$ACK_EVERY" -dgram-warn 1400 -arq -R0 "$R0" -W "$W" -Rstep "$RSTEP" -alpha "$ALPHA" -max-attempts 5 \
+    -post-wait 300ms -ack-every "$ACK_EVERY" -dgram-warn 1400 -arq -R0 "$R0" -W "$W" -Rstep "$RSTEP" -alpha "$ALPHA" -max-attempts 5 $pace_arg \
     >"$CLI_LOG" 2>&1 || true
   # Wait briefly for server to emit observation (up to 5s) before stopping it
   tries=0

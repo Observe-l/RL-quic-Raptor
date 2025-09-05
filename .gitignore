@@ -23,3 +23,6 @@ tables/
 bin/
 docs/reports
 docs
+__pycache__/
+*.pyc
+wandb/

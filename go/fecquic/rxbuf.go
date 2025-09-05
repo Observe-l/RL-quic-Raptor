@@ -171,10 +171,10 @@ func (m *rxManager) start(rx RXOptions) {
 					n, err := m.ctrlW.Write(buf[off:])
 					if err != nil {
 						// drop on error; exit to avoid blocking shutdown
-						break
+						return
 					}
 					if n <= 0 {
-						break
+						return
 					}
 					off += n
 				}
@@ -274,22 +274,20 @@ func (m *rxManager) start(rx RXOptions) {
 					continue
 				}
 				if now.After(b.nextDDL) || now.Equal(b.nextDDL) {
-					b.attempt++
 					b.queued = true
 					b.nextDDL = now.Add(m.ddl)
 					// calculate NACK recommendation under lock
 					if m.ctrlOut != nil {
 						deficit := b.K - len(b.syms)
-						rec := 0
 						if deficit > 0 {
-							rec = deficit / 2
+							// Only count ARQ attempts when we actually need more symbols
+							b.attempt++
+							rec := deficit / 2
 							if rec < 4 {
 								rec = 4
 							}
-						} else {
-							rec = 2
+							nacks = append(nacks, nackMsg{blockID: b.id, attempt: b.attempt, rxu: len(b.syms), rec: rec, send: true})
 						}
-						nacks = append(nacks, nackMsg{blockID: b.id, attempt: b.attempt, rxu: len(b.syms), rec: rec, send: true})
 					}
 					toDecode = append(toDecode, b)
 				}
@@ -303,6 +301,11 @@ func (m *rxManager) start(rx RXOptions) {
 			}
 			// send control and schedule decodes without holding lock
 			for _, n := range nacks {
+				select {
+				case <-m.stopCh:
+					return
+				default:
+				}
 				var buf bytespkg.Buffer
 				_ = writeNack(&buf, NackNeedMore{
 					FileID:         0,
@@ -312,10 +315,13 @@ func (m *rxManager) start(rx RXOptions) {
 					RecommendExtra: uint16(n.rec),
 					Reason:         0,
 				})
+				// non-blocking send; if closed or full, skip
 				select {
+				case <-m.stopCh:
+					return
 				case m.ctrlOut <- buf.Bytes():
 				default:
-					fmt.Fprintf(os.Stderr, "[arq] ctrl queue full, dropping NACK block=%d\n", n.blockID)
+					// best-effort: drop if queue full
 				}
 				fmt.Fprintf(os.Stderr, "[arq] nack block=%d rx_unique=%d rec_extra=%d attempt=%d\n", n.blockID, n.rxu, n.rec, n.attempt)
 			}
@@ -430,6 +436,23 @@ func (m *rxManager) closeAndFinalize(expectedSHA [32]byte) (string, error) {
 		return "", err
 	}
 	if sum != expectedSHA {
+		// Diagnostics: report number of pending (unfinished) blocks and their rx_unique
+		func() {
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			pending := len(m.blocks)
+			if pending > 0 {
+				fmt.Fprintf(os.Stderr, "[rx-finalize] pending_blocks=%d\n", pending)
+				i := 0
+				for _, b := range m.blocks {
+					fmt.Fprintf(os.Stderr, "[rx-finalize] block=%d rx_unique=%d K=%d attempts=%d\n", b.id, len(b.syms), b.K, b.attempt)
+					i++
+					if i >= 8 {
+						break
+					}
+				}
+			}
+		}()
 		return "", errors.New("sha256 mismatch")
 	}
 	if err := os.Rename(m.tmpPath, finalPath); err != nil {

@@ -11,6 +11,9 @@ env_args:
   K: 40
   symbol_bytes: 1200
   prefer_local: False  # use shaped netns/tc path (requires sudo)
+  episode_steps: 100   # steps per episode per experiment design
+  phase: "train"      # one of {train, val, test}
+  scenario_family: "auto"  # A, B, C, or auto
 
 test_greedy: True
 test_nepisode: 2

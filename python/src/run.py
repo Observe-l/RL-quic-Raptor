@@ -261,6 +261,26 @@ def run_sequential(args, logger):
             logger.print_recent_stats()
             last_log_T = runner.t_env
 
+    # Final checkpoint at training end
+    if args.save_model:
+        save_path = os.path.join(
+            args.local_results_path, "models", args.unique_token, str(runner.t_env)
+        )
+        os.makedirs(save_path, exist_ok=True)
+        logger.console_logger.info(
+            "Saving final models to {}".format(save_path)
+        )
+        learner.save_models(save_path)
+    if args.use_wandb and args.wandb_save_model:
+            wandb_save_dir = os.path.join(
+                logger.wandb.dir, "models", args.unique_token, str(runner.t_env)
+            )
+            os.makedirs(wandb_save_dir, exist_ok=True)
+            for f in os.listdir(save_path):
+                shutil.copyfile(
+                    os.path.join(save_path, f), os.path.join(wandb_save_dir, f)
+                )
+
     runner.close_env()
     logger.console_logger.info("Finished Training")
 

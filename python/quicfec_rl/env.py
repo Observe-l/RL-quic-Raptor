@@ -99,8 +99,25 @@ class QuicFecEnv:
         except Exception:
             pass
         env["OBS_JSONL"] = obs_jsonl_path
-        if bitrate_mbps is not None:
-            env["BITRATE_MBPS"] = str(int(bitrate_mbps))
+        # Always set BITRATE_MBPS to avoid falling back to default values inside the harness
+        if bitrate_mbps is None:
+            if getattr(self, "last_cfg", None) and hasattr(self.last_cfg, "target_bitrate_bps"):
+                bitrate_mbps = int(self.last_cfg.target_bitrate_bps // 1_000_000)
+            else:
+                bitrate_mbps = 10
+        env["BITRATE_MBPS"] = str(int(bitrate_mbps))
+        # Optional client-side pacing for prefer_local mode to approximate bandwidth cap without tc
+        if self.prefer_local:
+            try:
+                # rough per-datagram size: symbol payload plus small header
+                sb = int(env.get("SYMBOL_BYTES", "1200"))
+                dgram_bytes = sb + 48  # add minimal header fudge factor
+                # pace interval seconds per datagram
+                pace_s = (dgram_bytes * 8.0) / (max(1, int(bitrate_mbps)) * 1_000_000.0)
+                pace_us = max(0, int(pace_s * 1_000_000.0))
+                env["PACE_US"] = str(pace_us)
+            except Exception:
+                env.pop("PACE_US", None)
 
         try:
             if self.prefer_local:

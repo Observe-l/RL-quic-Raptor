@@ -43,8 +43,17 @@ RSTEP=${RSTEP:-4}
 ALPHA=${ALPHA:-0.6}
 ACK_EVERY=${ACK_EVERY:-8}
 MAX_ATTEMPTS=${MAX_ATTEMPTS:-8}
-POST_WAIT=${POST_WAIT:-0s}
+if [[ -z "${POST_WAIT+x}" || -z "${POST_WAIT}" ]]; then
+  # Default linger: ~3*RTT, clamped to [200ms, 800ms] to let tail datagrams/ARQ settle
+  WAIT_MS=$(( RTT_MS * 3 ))
+  if [[ $WAIT_MS -lt 200 ]]; then WAIT_MS=200; fi
+  if [[ $WAIT_MS -gt 800 ]]; then WAIT_MS=800; fi
+  POST_WAIT="${WAIT_MS}ms"
+fi
 SRV_TIMEOUT=${SRV_TIMEOUT:-8s}
+
+# Allow overriding DDL via env; default aligns with DDL_MS used elsewhere
+DDL_MS=${DDL_MS:-150}
 
 chmod +x "$ROOT/scripts"/*.sh || true
 mkdir -p "$ROOT/go/test_data"
@@ -68,26 +77,30 @@ fi
 
 FILE_SIZE=$(stat -c%s "$FILE")
 
-# Configure qdiscs: half RTT on each direction; loss and rate limiting on host side
+# Configure qdiscs: half RTT on each direction; apply TBF at root and NETEM as child on host side
 half=$(( RTT_MS / 2 ))
 sudo tc qdisc del dev veth0 root 2>/dev/null || true
-# Support LOSS_MODE (iid / gemodel), fallback to LOSS_PCT as iid
+
+# Build NETEM args for loss model
 LOSS_MODE=${LOSS_MODE:-}
+NETEM_ARGS=(delay ${half}ms)
 case "$LOSS_MODE" in
   none)
-    sudo tc qdisc replace dev veth0 root handle 1: netem delay ${half}ms loss 0%% ;;
+    NETEM_ARGS+=(loss 0%) ;;
   iid:*)
     pct=${LOSS_MODE#iid:}
-    sudo tc qdisc replace dev veth0 root handle 1: netem delay ${half}ms loss ${pct}% ;;
+    NETEM_ARGS+=(loss ${pct}%) ;;
   gemodel:*)
     params=${LOSS_MODE#gemodel:}
     IFS=',' read -r p r h k <<<"$params"
-    sudo tc qdisc replace dev veth0 root handle 1: netem delay ${half}ms loss gemodel ${p}% ${r}% ${h}% ${k}% ;;
+    NETEM_ARGS+=(loss gemodel ${p}% ${r}% ${h}% ${k}%) ;;
   ""|*)
-    # default to legacy LOSS_PCT as iid
-    sudo tc qdisc replace dev veth0 root handle 1: netem delay ${half}ms loss ${LOSS_PCT}% ;;
+    NETEM_ARGS+=(loss ${LOSS_PCT}%) ;;
 esac
-sudo tc qdisc replace dev veth0 parent 1:1 handle 10: tbf rate ${RATE} burst 32kb latency 400ms
+
+# Apply TBF at root to enforce rate, then NETEM as child for delay/loss
+sudo tc qdisc replace dev veth0 root handle 1: tbf rate ${RATE} burst 32kb latency 400ms
+sudo tc qdisc replace dev veth0 parent 1:1 handle 10: netem "${NETEM_ARGS[@]}"
 sudo ip netns exec "$NS" tc qdisc del dev veth1 root 2>/dev/null || true
 sudo ip netns exec "$NS" tc qdisc replace dev veth1 root netem delay ${half}ms
 
@@ -104,7 +117,7 @@ CLI_LOG=$(mktemp -t quicfec_cli.XXXXXX.log)
 export QUIC_FEC_CC_BYPASS=1
 START=$(date +%s%N)
 "$BIN_DIR/quicfec-client" -addr 10.10.0.2:$PORT -file "$FILE" -N $((K+R0)) -K "$K" -L "$SYMBOL_BYTES" \
-  -post-wait "$POST_WAIT" -ack-every "$ACK_EVERY" -dgram-warn 1400 -arq -R0 "$R0" -W "$W" -Rstep "$RSTEP" -alpha "$ALPHA" -max-attempts "$MAX_ATTEMPTS" \
+  -post-wait "$POST_WAIT" -ack-every "$ACK_EVERY" -dgram-warn 1400 -arq -R0 "$R0" -W "$W" -Rstep "$RSTEP" -alpha "$ALPHA" -max-attempts "$MAX_ATTEMPTS" -loss 0 \
   >"$CLI_LOG" 2>&1 || true
 END=$(date +%s%N)
 
@@ -130,9 +143,21 @@ MD5_OK=0; [[ "$IN_MD5" == "$OUT_MD5" ]] && MD5_OK=1
 DUR_MS=$(( (END-START)/1000000 ))
 
 # Extract server observation (preferred)
+KEEP_LOGS=0
 if [[ -n "$RL_OBS" ]]; then
   echo "$RL_OBS" >>"$OBS_JSONL"
   echo "$RL_OBS" >&2
+  # If residual_erasures reported, keep logs for diagnosis and print tails
+  if echo "$RL_OBS" | grep -q '"residual_erasures"[[:space:]]*:[[:space:]]*1'; then
+    KEEP_LOGS=1
+    echo "[diag] residual_erasures=1 detected; preserving logs:" >&2
+    echo "[diag] server log: $SRV_LOG" >&2
+    echo "[diag] client log: $CLI_LOG" >&2
+    echo "[diag] ---- server log tail ----" >&2
+    tail -n 120 "$SRV_LOG" >&2 || true
+    echo "[diag] ---- client log tail ----" >&2
+    tail -n 120 "$CLI_LOG" >&2 || true
+  fi
 else
   echo "[warn] no [rl-observation] found in server logs" >&2
   echo "[warn] server log tail:" >&2
@@ -154,12 +179,16 @@ if [[ -n "$S_LINE" ]]; then
       S_MBPS=0
     fi
   fi
-  echo "[run] bitrate=${BITRATE_MBPS}Mbps rtt=${RTT_MS}ms loss=${LOSS_PCT}% dur_ms=${DUR_MS} md5_ok=${MD5_OK} s_mbps=${S_MBPS}" >&2
+  LOSS_DESC="${LOSS_PCT}%"
+  if [[ -n "${LOSS_MODE:-}" ]]; then
+    LOSS_DESC="${LOSS_MODE}"
+  fi
+  echo "[run] bitrate=${BITRATE_MBPS}Mbps rtt=${RTT_MS}ms loss=${LOSS_DESC} dur_ms=${DUR_MS} md5_ok=${MD5_OK} s_mbps=${S_MBPS}" >&2
 fi
 
 # Cleanup temp logs
-# Keep logs when a failure occurs (no RL_OBS); otherwise clean up
-if [[ -n "$RL_OBS" ]]; then
+# Keep logs when a failure occurs (no RL_OBS) or residual_erasures=1; otherwise clean up
+if [[ -n "$RL_OBS" && "$KEEP_LOGS" == "0" ]]; then
   rm -f "$CLI_LOG" "$SRV_LOG"
 fi
 
