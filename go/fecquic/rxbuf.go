@@ -23,7 +23,7 @@ type RXOptions struct {
 
 func (o *RXOptions) setDefaults() {
 	if o.BudgetBytes <= 0 {
-		o.BudgetBytes = 10 * 1024 * 1024
+		o.BudgetBytes = 64 * 1024 * 1024
 	}
 	if o.DDL <= 0 {
 		o.DDL = 50 * time.Millisecond
@@ -74,6 +74,9 @@ type rxManager struct {
 	mu     sync.Mutex
 	inUse  atomic.Int64
 	blocks map[uint16]*rxBlock
+	// completed remembers blocks that have already been fully decoded and written,
+	// so late-arriving symbols for those blocks are ignored instead of recreating state.
+	completed map[uint16]struct{}
 
 	// queues
 	decodeQ chan *rxBlock
@@ -104,17 +107,18 @@ type rxManager struct {
 func newRXManager(fileSize uint64, K, L int, outDir, baseName string, rx RXOptions) (*rxManager, error) {
 	rx.setDefaults()
 	m := &rxManager{
-		budget:   rx.BudgetBytes,
-		ddl:      rx.DDL,
-		fileSize: fileSize,
-		K:        K,
-		L:        L,
-		outDir:   outDir,
-		baseName: baseName,
-		blocks:   make(map[uint16]*rxBlock),
-		decodeQ:  make(chan *rxBlock, 1024),
-		writeQ:   make(chan writeTask, 8192),
-		stopCh:   make(chan struct{}),
+		budget:    rx.BudgetBytes,
+		ddl:       rx.DDL,
+		fileSize:  fileSize,
+		K:         K,
+		L:         L,
+		outDir:    outDir,
+		baseName:  baseName,
+		blocks:    make(map[uint16]*rxBlock),
+		completed: make(map[uint16]struct{}),
+		decodeQ:   make(chan *rxBlock, 1024),
+		writeQ:    make(chan writeTask, 8192),
+		stopCh:    make(chan struct{}),
 	}
 	finalBase := baseName
 	if finalBase == "" {
@@ -165,9 +169,15 @@ func (m *rxManager) start(rx RXOptions) {
 		m.ctrlWG.Add(1)
 		go func() {
 			defer m.ctrlWG.Done()
+			// If the underlying writer supports SetWriteDeadline, use it to avoid indefinite blocks.
+			type deadlineWriter interface{ SetWriteDeadline(time.Time) error }
+			dw, _ := m.ctrlW.(deadlineWriter)
 			for buf := range m.ctrlOut {
 				// best-effort full write
 				for off := 0; off < len(buf); {
+					if dw != nil {
+						_ = dw.SetWriteDeadline(time.Now().Add(300 * time.Millisecond))
+					}
 					n, err := m.ctrlW.Write(buf[off:])
 					if err != nil {
 						// drop on error; exit to avoid blocking shutdown
@@ -187,60 +197,70 @@ func (m *rxManager) start(rx RXOptions) {
 		m.wgDec.Add(1)
 		go func() {
 			defer m.wgDec.Done()
-			for b := range m.decodeQ {
-				if b.done {
-					continue
-				}
-				t0 := time.Now()
-				b.decMu.Lock()
-				ok, bytes, err := b.dec.Decode()
-				b.decMu.Unlock()
-				if err != nil || !ok {
-					// Decoding failed; unqueue and wait for next DDL tick to decide NACK.
-					m.mu.Lock()
-					b.queued = false
-					m.mu.Unlock()
-					continue
-				}
-				m.decTimeTotal.Add(time.Since(t0).Milliseconds())
-				// schedule a single contiguous write for this block
-				off := int64(int(b.id) * b.K * b.L)
-				m.writeQ <- writeTask{off: off, data: bytes}
-				m.decBlocks.Add(1)
-				// release memory and mark done
-				// capture stats before clearing
-				rxUnique := len(b.syms)
-				usedRep := max(0, rxUnique-b.K)
-				m.mu.Lock()
-				for _, p := range b.syms {
-					m.inUse.Add(int64(-len(p)))
-				}
-				b.syms = nil
-				b.done = true
-				delete(m.blocks, b.id)
-				m.mu.Unlock()
-				// metrics: per-cluster decode event
-				if m.met != nil {
-					m.met.OnClusterDecoded(b.firstSeen, time.Now(), b.attempt, usedRep)
-				}
-				// ACK success to sender if ctrl available
-				if m.ctrlOut != nil {
-					var buf bytespkg.Buffer
-					_ = writeAck(&buf, AckSuccess{
-						FileID:          0,
-						ClusterID:       uint32(b.id),
-						AttemptIdx:      uint16(b.attempt),
-						RxUnique:        uint16(rxUnique),
-						UsedRepairs:     uint16(usedRep),
-						DecodeLatencyMs: uint32(time.Since(t0).Milliseconds()),
-					})
-					// non-blocking enqueue; drop if full (next events will resend state)
-					select {
-					case m.ctrlOut <- buf.Bytes():
-					default:
-						fmt.Fprintf(os.Stderr, "[arq] ctrl queue full, dropping ACK block=%d\n", b.id)
+			for {
+				select {
+				case <-m.stopCh:
+					return
+				case b, ok := <-m.decodeQ:
+					if !ok {
+						return
 					}
-					fmt.Fprintf(os.Stderr, "[arq] ack block=%d rx_unique=%d used_rep=%d attempt=%d\n", b.id, rxUnique, usedRep, b.attempt)
+					if b == nil || b.done {
+						continue
+					}
+					t0 := time.Now()
+					b.decMu.Lock()
+					ok, bytes, err := b.dec.Decode()
+					b.decMu.Unlock()
+					if err != nil || !ok {
+						// Decoding failed; unqueue and wait for next DDL tick to decide NACK.
+						m.mu.Lock()
+						b.queued = false
+						m.mu.Unlock()
+						continue
+					}
+					m.decTimeTotal.Add(time.Since(t0).Milliseconds())
+					// schedule a single contiguous write for this block
+					off := int64(int(b.id) * b.K * b.L)
+					m.writeQ <- writeTask{off: off, data: bytes}
+					m.decBlocks.Add(1)
+					// release memory and mark done
+					// capture stats before clearing
+					rxUnique := len(b.syms)
+					usedRep := max(0, rxUnique-b.K)
+					m.mu.Lock()
+					for _, p := range b.syms {
+						m.inUse.Add(int64(-len(p)))
+					}
+					b.syms = nil
+					b.done = true
+					delete(m.blocks, b.id)
+					// remember completion to ignore late arrivals for this block
+					m.completed[b.id] = struct{}{}
+					m.mu.Unlock()
+					// metrics: per-cluster decode event
+					if m.met != nil {
+						m.met.OnClusterDecoded(b.firstSeen, time.Now(), b.attempt, usedRep)
+					}
+					// ACK success to sender if ctrl available
+					if m.ctrlOut != nil {
+						var buf bytespkg.Buffer
+						_ = writeAck(&buf, AckSuccess{
+							FileID:          0,
+							ClusterID:       uint32(b.id),
+							AttemptIdx:      uint16(b.attempt),
+							RxUnique:        uint16(rxUnique),
+							UsedRepairs:     uint16(usedRep),
+							DecodeLatencyMs: uint32(time.Since(t0).Milliseconds()),
+						})
+						// non-blocking enqueue; drop if full (next events will resend state)
+						select {
+						case m.ctrlOut <- buf.Bytes():
+						default:
+							fmt.Fprintf(os.Stderr, "[arq] ctrl queue full, dropping ACK block=%d\n", b.id)
+						}
+						fmt.Fprintf(os.Stderr, "[arq] ack block=%d rx_unique=%d used_rep=%d attempt=%d\n", b.id, rxUnique, usedRep, b.attempt)
+					}
 				}
 			}
 		}()
@@ -249,7 +269,8 @@ func (m *rxManager) start(rx RXOptions) {
 	m.wgDec.Add(1)
 	go func() {
 		defer m.wgDec.Done()
-		t := time.NewTicker(10 * time.Millisecond)
+		// Faster scheduler tick for more responsive ARQ without large sleeps.
+		t := time.NewTicker(1 * time.Millisecond)
 		defer t.Stop()
 		for {
 			select {
@@ -282,7 +303,8 @@ func (m *rxManager) start(rx RXOptions) {
 						if deficit > 0 {
 							// Only count ARQ attempts when we actually need more symbols
 							b.attempt++
-							rec := deficit / 2
+							// Be more aggressive: ask for at least the deficit (min 4)
+							rec := deficit
 							if rec < 4 {
 								rec = 4
 							}
@@ -326,7 +348,17 @@ func (m *rxManager) start(rx RXOptions) {
 				fmt.Fprintf(os.Stderr, "[arq] nack block=%d rx_unique=%d rec_extra=%d attempt=%d\n", n.blockID, n.rxu, n.rec, n.attempt)
 			}
 			for _, b := range toDecode {
-				m.decodeQ <- b
+				// during shutdown, avoid blocking or panicking on closed decodeQ
+				select {
+				case <-m.stopCh:
+					return
+				default:
+				}
+				select {
+				case m.decodeQ <- b:
+				default:
+					// drop if queue is full; next tick will retry
+				}
 			}
 		}
 	}()
@@ -342,6 +374,11 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 		return false
 	}
 	m.mu.Lock()
+	// Drop any late symbols for blocks that were already completed.
+	if _, ok := m.completed[blockID]; ok {
+		m.mu.Unlock()
+		return false
+	}
 	b := m.blocks[blockID]
 	if b == nil {
 		b = &rxBlock{
@@ -367,6 +404,21 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 	if _, ok := b.syms[esi]; ok {
 		m.mu.Unlock()
 		return false
+	}
+	// prevent pathological growth: cap stored repairs per block to 4*K
+	if isRepair && len(b.syms) > 0 {
+		// count repairs-only
+		repOnly := 0
+		for e := range b.syms {
+			if e >= K {
+				repOnly++
+			}
+		}
+		if repOnly >= 4*K {
+			m.mu.Unlock()
+			m.dropsRepairs.Add(1)
+			return false
+		}
 	}
 	// store symbol
 	p := make([]byte, len(data))
@@ -400,7 +452,17 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 		}
 		m.mu.Unlock()
 		if send {
-			m.decodeQ <- b
+			// avoid blocking/panic if shutting down
+			select {
+			case <-m.stopCh:
+				// skip
+			default:
+				select {
+				case m.decodeQ <- b:
+				default:
+					// drop if full; next DDL tick will schedule
+				}
+			}
 		}
 	}
 	return true
@@ -409,8 +471,7 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 func (m *rxManager) closeAndFinalize(expectedSHA [32]byte) (string, error) {
 	// stop scheduling, finish decoders, then drain writer
 	close(m.stopCh)
-	close(m.decodeQ)
-	// wait for all decoders and scheduler to finish
+	// wait for all decoders and scheduler to finish (they observe stopCh)
 	m.wgDec.Wait()
 	// stop ctrl writer after decoders (no more control messages)
 	if m.ctrlOut != nil {

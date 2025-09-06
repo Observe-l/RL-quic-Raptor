@@ -51,6 +51,7 @@ class QuicFecRunner:
         self.obs_jsonl = os.environ.get("QUICFEC_OBS_JSONL", "/tmp/quicfec_rl.jsonl")
         self.last_cfg = None
         self.timeout_sec = int(timeout_sec)
+        self.pace_us = 200
 
     def reset(self, cfg: EnvConfig) -> Dict[str, Any]:
         self.last_cfg = cfg
@@ -73,6 +74,7 @@ class QuicFecRunner:
         env["EPSILON"] = str(int(action.epsilon))
         env["INTERLEAVER_SPAN"] = str(int(action.interleaver_span))
         env["PACING_GAIN"] = str(float(action.pacing_gain))
+        env["PACING_US"] = str(np.round(float(action.pacing_gain * self.pace_us)))
         env["ACK_EVERY"] = os.environ.get("ACK_EVERY", "8")
         env["MAX_ATTEMPTS"] = os.environ.get("MAX_ATTEMPTS", "8")
         env["OUT_RAW"] = "/tmp/rl_arq_raw.csv"
@@ -102,18 +104,16 @@ class QuicFecRunner:
             if p.returncode != 0:
                 raise RuntimeError(f"harness failed: code={p.returncode} stderr={p.stderr[-400:]}\nstdout={p.stdout[-400:]}")
             obs = self._read_last_obs(obs_jsonl_path)
-            reward = self._compute_reward(obs)
-            return obs, reward, True, {}
+        # Reward is computed at the Env level; return 0.0 placeholder here.
+            return obs, 0.0, True, {}
         except subprocess.TimeoutExpired as te:
             obs = self._default_obs(timeout=True)
-            reward = self._compute_reward(obs)
             info = {"error": f"timeout after {self.timeout_sec}s", "stderr_tail": getattr(te, 'stderr', None)}
-            return obs, reward, True, info
+            return obs, 0.0, True, info
         except Exception as e:
             obs = self._default_obs(timeout=False)
-            reward = self._compute_reward(obs)
             info = {"error": str(e)}
-            return obs, reward, True, info
+            return obs, 0.0, True, info
 
     def _read_last_obs(self, file_path: Optional[str] = None) -> Dict[str, Any]:
         last = None
@@ -130,23 +130,10 @@ class QuicFecRunner:
             raise RuntimeError("no observation found; check server logs")
         return last
 
-    def _compute_reward(self, obs: Dict[str, Any]) -> float:
+    # Reward is computed in FecEnv.step based on the improvement plan.
+    def _compute_reward(self, obs: Dict[str, Any]) -> float:  # Deprecated
         g = float(obs.get("goodput_decode_mbps", 0.0))
-        dur_ms = float(obs.get("duration_decode_ms", 1.0))
-        residual = int(obs.get("residual_erasures", 0))
-        overhead = float(obs.get("fec_overhead_pct_arrival", 0.0))
-        attempts = float(obs.get("arq_attempts_mean", 0.0))
-        g_norm = min(1.0, g / 10.0)
-        reward = g_norm
-        if residual:
-            reward -= 1.0
-        if dur_ms > 1350.0:
-            reward -= 0.2
-        if overhead > 30.0:
-            reward -= (overhead - 30.0) / 100.0
-        if attempts > 1.0:
-            reward -= min(0.3, 0.05 * (attempts - 1.0))
-        return reward
+        return min(1.0, g / 10.0)
 
     def _default_obs(self, timeout: bool) -> Dict[str, Any]:
         return {
@@ -160,8 +147,8 @@ class QuicFecRunner:
             "rx_unique_at_ddl_p95": 0.0,
             "decode_latency_p50_ms": 0.0,
             "decode_latency_p95_ms": 0.0,
-            "estimated_available_bw_mbps_p95": 0.0,
-            "estimated_available_bw_mbps_peak": 0.0,
+            "estimated_available_bw_mbps": 0.0,
+            # peak removed; only robust estimate is used
         }
 
     def _sudo_check(self) -> bool:
@@ -197,7 +184,9 @@ class FecEnv(gym.Env):
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         cfg = config or {}
-        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(10,), dtype=np.float32)
+        # 8-D action in [-1, 1]^8 (tanh-squashed typical); mapped to actual config ranges.
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(8,), dtype=np.float32)
+        # Base observation keys coming from server
         self._obs_keys: List[str] = [
             "goodput_decode_mbps",
             "duration_decode_ms",
@@ -209,10 +198,13 @@ class FecEnv(gym.Env):
             "rx_unique_at_ddl_p95",
             "decode_latency_p50_ms",
             "decode_latency_p95_ms",
-            "estimated_available_bw_mbps_p95",
-            "estimated_available_bw_mbps_peak",
+            "estimated_available_bw_mbps",
         ]
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(len(self._obs_keys),), dtype=np.float32)
+        # We append normalized network features (4) and previous action (8)
+        self._obs_extra_dim = 4 + 8
+        self.observation_space = spaces.Box(
+            low=-5.0, high=+np.inf, shape=(len(self._obs_keys) + self._obs_extra_dim,), dtype=np.float32
+        )
 
         # Episode length control
         self._episode_steps = int(cfg.get("episode_step", 100))
@@ -222,12 +214,15 @@ class FecEnv(gym.Env):
         self._rtt_ms = int(cfg.get("rtt_ms", 100))
         self._loss_pct = int(cfg.get("loss_pct", 5))
         self._loss_mode = str(cfg.get("loss_mode", f"iid:{self._loss_pct}"))
-        self._bitrate_mbps = int(cfg.get("bitrate_mbps", 10))
+        # Fix physical capacity to 10 Mbps
+        self._bitrate_mbps = 10
+        self._capacity_mbps = 10.0
         self._result_dir_hint = cfg.get("result_dir")
 
-        # Action bounds mapping
-        self._act_low = np.array([16, 400, 0.12, 2, 6, 160, 0.4, 0, 0, 0.85], dtype=np.float32)
-        self._act_high = np.array([64, 1200, 0.28, 8, 18, 340, 1.1, 3, 6, 1.15], dtype=np.float32)
+        # Action mapping ranges from [-1,1] → [low, high]
+        # Action order: K, symbol_bytes, R0_pct, R_step, W, ddl_ms, alpha, pacing_gain
+        self._low = np.array([10, 768, 0.10, 1, 5, 300, 0.4, 0.3], dtype=np.float32)
+        self._high = np.array([64, 1188, 1.00, 20, 20, 600, 1.1, 5], dtype=np.float32)
 
         # Runner
         self._runner = QuicFecRunner(timeout_sec=int(cfg.get("timeout_sec", 30)))
@@ -236,20 +231,26 @@ class FecEnv(gym.Env):
                 datagrams_enabled=True,
                 num_connections=1,
                 cc_mode="bypass",
-                target_bitrate_bps=self._bitrate_mbps * 1_000_000,
+                target_bitrate_bps=int(self._capacity_mbps * 1_000_000),
                 loss_profile=self._loss_mode,
                 K=40,
                 symbol_bytes=1200,
             )
         )
 
-        self._last_obs_vec = np.zeros((len(self._obs_keys),), dtype=np.float32)
+        self._last_obs_vec = np.zeros((len(self._obs_keys) + self._obs_extra_dim,), dtype=np.float32)
+        self._prev_action = np.zeros((8,), dtype=np.float32)
+        self._cap_hits = 0
+        self._last_est_bw_mbps = float(self._capacity_mbps)
+        self._norm = _RunningNorm(dim=self.observation_space.shape[0])
         self._global_step = 0
+        self.epi = -1
         self._rng = np.random.RandomState()
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
         self._last_obs_vec[:] = 0.0
         self._t_in_ep = 0
+        self.epi += 1
         if seed is not None:
             try:
                 self._rng.seed(int(seed))
@@ -260,11 +261,13 @@ class FecEnv(gym.Env):
 
     def step(self, action: np.ndarray):
         a = np.asarray(action, dtype=np.float32).reshape(-1)
-        if a.size < 10:
-            raise ValueError("Action must be length-10 array")
-        vec01 = np.clip(a[:10], 0.0, 1.0)
-        a_scaled = self._act_low + vec01 * (self._act_high - self._act_low)
-        int_idx = [0, 1, 3, 4, 5, 7, 8]
+        if a.size < 8:
+            raise ValueError("Action must be length-8 array")
+        a = np.clip(a[:8], -1.0, 1.0)
+        # Map from [-1,1] → [low, high]
+        a_scaled = self._low + (a + 1.0) * 0.5 * (self._high - self._low)
+        # Round discrete fields
+        int_idx = [0, 1, 3, 4]
         a_scaled[int_idx] = np.round(a_scaled[int_idx])
 
         K = int(a_scaled[0])
@@ -274,44 +277,57 @@ class FecEnv(gym.Env):
         W = int(a_scaled[4])
         ddl_ms = int(a_scaled[5])
         alpha = float(a_scaled[6])
-        epsilon = int(a_scaled[7])
-        interleaver_span = int(a_scaled[8])
-        pacing_gain = float(a_scaled[9])
+        pacing_gain = float(a_scaled[7])
 
+        # Payload alignment and safety margin
         safety = 12
-        align = 4
+        align = 8
         max_payload = 1200 - safety
         symbol_bytes = min(symbol_bytes, max_payload)
         symbol_bytes = symbol_bytes - (symbol_bytes % align)
 
-        R0 = max(2, int(round(K * R0_pct)))
-        R_step = max(1, min(R_step, 12))
-        W = max(6, min(W, 24))
-        ddl_floor = max(150, int(2.2 * self._rtt_ms))
-        ddl_ms = int(min(max(ddl_ms, ddl_floor), 500))
+        # Dynamic ddl lower bound for satellite
+        ddl_floor = max(300, int(2 * self._rtt_ms))
+        ddl_ms = int(min(max(ddl_ms, ddl_floor), 900))
+
+        # Desired parity and safety clamp by link budget
+        R0_desired = max(0, int(round(K * R0_pct)))
+        # avail = float(min(self._capacity_mbps, self._last_est_bw_mbps))
+        # R0_capped = cap_parity_by_budget(K, symbol_bytes, R0_desired, ddl_ms, avail)
+        # cap_hit = int(R0_capped < R0_desired)
+        # if cap_hit:
+        #     self._cap_hits += 1
 
         act = Action(
-            R0=R0,
-            R_step=R_step,
-            window_W=W,
+            R0=R0_desired,
+            R_step=max(2, min(R_step, 8)),
+            window_W=max(10, min(W, 18)),
             ddl_ms=ddl_ms,
-            alpha=alpha,
-            epsilon=epsilon,
-            interleaver_span=interleaver_span,
-            pacing_gain=pacing_gain,
+            alpha=float(alpha),
+            epsilon=1,  # fixed
+            interleaver_span=0,  # fixed
+            pacing_gain=float(pacing_gain),
             K=K,
             symbol_bytes=symbol_bytes,
         )
 
-        obs_dict, reward, _done_transfer, info = self._runner.step(
+        obs_dict, _reward_unused, _done_transfer, info = self._runner.step(
             act,
             rtt_ms=self._rtt_ms,
             loss_pct=self._loss_pct,
             bitrate_mbps=self._bitrate_mbps,
             loss_mode=self._loss_mode,
         )
-        obs_vec = self._obs_to_vec(obs_dict)
+        # Update last estimated bandwidth for next safety clamp
+        self._last_est_bw_mbps = float(obs_dict.get("estimated_available_bw_mbps", self._capacity_mbps))
+        # Compute reward per improvement plan
+        reward, r_terms = self._compute_reward_satellite(obs_dict, ddl_ms)
+        # Build observation vector: base obs + normalized net features + prev action
+        obs_vec_raw = self._obs_to_vec(obs_dict)
+        obs_vec = self._augment_obs(obs_vec_raw, ddl_ms)
+        obs_vec = self._norm.transform(self._norm.update(obs_vec))
         self._last_obs_vec = obs_vec
+        self._prev_action = a.copy()
 
         info = {
             **(info or {}),
@@ -320,18 +336,25 @@ class FecEnv(gym.Env):
                 "bitrate_mbps": self._bitrate_mbps,
                 "loss_mode": self._loss_mode,
             },
-            "applied_action": {
+            "fec_cfg": {
                 "K": K,
                 "symbol_bytes": symbol_bytes,
-                "R0": R0,
-                "R_step": R_step,
-                "W": W,
+                "R0_desired": R0_desired,
+                # "R0_capped": R0_capped,
+                "R_step": int(act.R_step),
+                "W": int(act.window_W),
                 "ddl_ms": ddl_ms,
-                "alpha": alpha,
-                "epsilon": epsilon,
-                "interleaver_span": interleaver_span,
-                "pacing_gain": pacing_gain,
+                "alpha": float(alpha),
+                "pacing_gain": float(pacing_gain),
             },
+            "bw_cap_mbps": float(self._capacity_mbps),
+            "est_bw_mbps": float(self._last_est_bw_mbps),
+            "goodput_mbps": float(obs_dict.get("goodput_decode_mbps", 0.0)),
+            "reward_terms": r_terms,
+            # "cap_hit": cap_hit,
+            "cap_hits_cum": self._cap_hits,
+            "zero_residual_flag": int(obs_dict.get("residual_erasures", 0) == 0),
+            "on_time_flag": int(float(obs_dict.get("decode_latency_p95_ms", 0.0)) <= float(ddl_ms)),
         }
 
         # Resolve trial/log dir: prefer Ray trial dir/env override
@@ -347,7 +370,7 @@ class FecEnv(gym.Env):
             log_path = os.path.join(dest_dir, "step_metrics.jsonl")
             rec = {
                 "t": int(self._global_step),
-                "ts": time.time(),
+                "epi": self.epi,
                 "reward": float(reward),
                 "obs_vec": [float(x) for x in obs_vec.tolist()],
                 "raw_obs": obs_dict,
@@ -357,7 +380,6 @@ class FecEnv(gym.Env):
                 f.write(json.dumps(rec) + "\n")
         except Exception:
             pass
-
         self._global_step += 1
         self._t_in_ep += 1
         terminated = bool(self._t_in_ep >= self._episode_steps)
@@ -374,44 +396,105 @@ class FecEnv(gym.Env):
                 vals.append(0.0)
         return np.asarray(vals, dtype=np.float32)
 
+    def _augment_obs(self, base: np.ndarray, ddl_ms: int) -> np.ndarray:
+        # Normalized network features
+        rtt_feat = float(self._rtt_ms) / 800.0
+        cap_feat = 1.0  # 10/10
+        estbw_feat = float(self._last_est_bw_mbps) / 10.0
+        ddl_feat = float(ddl_ms) / 1200.0
+        extras = np.array([
+            np.clip(rtt_feat, 0.0, 1.0),
+            np.clip(cap_feat, 0.0, 1.0),
+            np.clip(estbw_feat, 0.0, 1.0),
+            np.clip(ddl_feat, 0.0, 1.0),
+        ], dtype=np.float32)
+        return np.concatenate([base.astype(np.float32), extras, self._prev_action.astype(np.float32)], axis=0)
+
     def _randomize_net_params(self) -> None:
         rng = self._rng
         def pick(xs):
             return xs[int(rng.randint(0, len(xs)))]
-        u = rng.rand()
-        if u < 0.4:
-            p = pick([0, 1, 3, 5, 10, 15])
-            rtt = pick([20, 50, 100, 200])
-            sigma = pick([2, 5, 10, 20])
-            bw = pick([5, 10, 20, 50])
-            drift = 0.8 + 0.4 * rng.rand()
-            rtt_t = max(1, int(round(rtt + rng.randn() * sigma)))
-            self._rtt_ms = rtt_t
-            self._bitrate_mbps = max(1, int(round(bw * drift)))
+        # Fixed capacity 10 Mbps
+        self._bitrate_mbps = int(self._capacity_mbps)
+        # RTT regimes: LEO/MEO/GEO
+        rtt_choice = pick([30, 60, 120, 180, 550, 650])
+        self._rtt_ms = int(rtt_choice)
+        # Loss models: IID and GE burst
+        if rng.rand() < 0.5:
+            p = pick([1, 3, 5, 10])
             self._loss_mode = f"iid:{p}"
-        elif u < 0.8:
-            def ge_from_lengths(pG, pB, LB, LG):
-                r = max(0.0, min(100.0, 100.0 * (1.0 - 1.0 / max(1, LG))))
-                h = max(0.0, min(100.0, 100.0 * (1.0 - 1.0 / max(1, LB))))
-                return pG, r, h, pB
+        else:
+            # GE params: overall ≈ 3–15%
             pG = pick([0.5, 1.0, 2.0])
             pB = pick([10.0, 20.0, 30.0])
-            LB = pick([3, 5, 10, 20])
-            LG = pick([20, 50, 100])
-            p, r, h, k = ge_from_lengths(pG, pB, LB, LG)
-            self._rtt_ms = pick([50, 100, 200])
-            self._bitrate_mbps = pick([5, 10, 20, 50])
-            self._loss_mode = f"gemodel:{p},{r},{h},{k}"
-        else:
-            p = pick([1, 3, 5])
-            base_rtt = pick([50, 100])
-            sigma = pick([5, 10])
-            bw = pick([10, 20, 50])
-            rtt_t = max(1, int(round(base_rtt + rng.randn() * sigma)))
-            if rng.rand() < 0.5:
-                bw = max(1, int(round(bw * (0.3 + 0.3 * rng.rand()))))
-            if rng.rand() < 0.5:
-                rtt_t += int(100 + 200 * rng.rand())
-            self._rtt_ms = rtt_t
-            self._bitrate_mbps = bw
-            self._loss_mode = f"iid:{p}"
+            LB = pick([10, 30, 60, 100])
+            LG = pick([20, 50, 80])
+            r = max(0.0, min(100.0, 100.0 * (1.0 - 1.0 / max(1, LG))))
+            h = max(0.0, min(100.0, 100.0 * (1.0 - 1.0 / max(1, LB))))
+            self._loss_mode = f"gemodel:{pG},{r},{h},{pB}"
+
+    def _compute_reward_satellite(self, obs: Dict[str, Any], ddl_ms: int) -> Tuple[float, Dict[str, float]]:
+        g = float(obs.get("goodput_decode_mbps", 0.0))
+        est = float(obs.get("estimated_available_bw_mbps", self._capacity_mbps))
+        c = max(1.0, float(min(self._capacity_mbps, est)))
+        e = float(obs.get("residual_erasures", 0.0))
+        d95 = float(obs.get("decode_latency_p95_ms", 0.0))
+        d = float(max(1, int(ddl_ms)))
+        oh = float(obs.get("fec_overhead_pct_arrival", 0.0))
+        a95 = float(obs.get("arq_attempts_p95", 0.0))
+
+        # Terms
+        tp_term = float(np.clip(g / c, 0.0, 1.0))
+        lam_e = 0.75
+        resid_term = -lam_e * (e / (1.0 + e))
+        lam_d = 0.3
+        lat_term = -lam_d * max(0.0, (d95 - d) / max(d, 1.0))
+        lam_o = 0.3
+        oh_term = -lam_o * max(0.0, (oh - 40.0) / 60.0)
+        arq_term = -min(0.3, 0.08 * a95)
+        r = tp_term + resid_term + lat_term + oh_term + arq_term
+        return float(r), {
+            "tp_term": float(tp_term),
+            "resid_term": float(resid_term),
+            "lat_term": float(lat_term),
+            "oh_term": float(oh_term),
+            "arq_term": float(arq_term),
+        }
+
+
+# def cap_parity_by_budget(K: int, sym_bytes: int, desired_R0: int, ddl_ms: int, avail_mbps: float) -> int:
+#     bytes_budget = (avail_mbps * 1e6 / 8.0) * (float(ddl_ms) / 1000.0)
+#     data_bytes = int(K) * int(sym_bytes)
+#     if bytes_budget <= data_bytes:
+#         return 0
+#     max_parity_symbols = int((bytes_budget - data_bytes) // max(1, int(sym_bytes)))
+#     return max(0, min(int(desired_R0), int(max_parity_symbols)))
+
+
+class _RunningNorm:
+    def __init__(self, dim: int, eps: float = 1e-5, clip: float = 5.0):
+        self.dim = dim
+        self.eps = eps
+        self.clip = float(clip)
+        self.n = 0
+        self.mean = np.zeros((dim,), dtype=np.float64)
+        self.M2 = np.zeros((dim,), dtype=np.float64)
+
+    def update(self, x: np.ndarray) -> np.ndarray:
+        x = x.astype(np.float64).reshape(-1)
+        if x.size != self.dim:
+            raise ValueError("Normalizer input dim mismatch")
+        self.n += 1
+        delta = x - self.mean
+        self.mean += delta / self.n
+        delta2 = x - self.mean
+        self.M2 += delta * delta2
+        return x.astype(np.float32)
+
+    def transform(self, x: np.ndarray) -> np.ndarray:
+        if self.n < 2:
+            return np.clip(x.astype(np.float32), -self.clip, self.clip)
+        var = self.M2 / max(1, self.n - 1)
+        std = np.sqrt(np.maximum(var, self.eps))
+        z = (x.astype(np.float64) - self.mean) / std
+        return np.clip(z, -self.clip, self.clip).astype(np.float32)

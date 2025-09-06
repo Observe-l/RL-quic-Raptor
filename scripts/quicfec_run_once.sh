@@ -43,7 +43,7 @@ RSTEP=${RSTEP:-4}
 ALPHA=${ALPHA:-0.6}
 ACK_EVERY=${ACK_EVERY:-8}
 MAX_ATTEMPTS=${MAX_ATTEMPTS:-8}
-PACE_US=${PACE_US:-30}
+PACE_US=${PACE_US:-0}
 if [[ -z "${POST_WAIT+x}" || -z "${POST_WAIT}" ]]; then
   # Default linger: ~3*RTT, clamped to [200ms, 800ms] to let tail datagrams/ARQ settle
   WAIT_MS=$(( RTT_MS * 3 ))
@@ -52,6 +52,14 @@ if [[ -z "${POST_WAIT+x}" || -z "${POST_WAIT}" ]]; then
   POST_WAIT="${WAIT_MS}ms"
 fi
 SRV_TIMEOUT=${SRV_TIMEOUT:-15s}
+# Observation wait budget in seconds (default: derived from SRV_TIMEOUT if of the form \d+s, else 30s)
+if [[ -z "${OBS_WAIT_SECS:-}" ]]; then
+  if [[ "$SRV_TIMEOUT" =~ ^([0-9]+)s$ ]]; then
+    OBS_WAIT_SECS=${BASH_REMATCH[1]}
+  else
+    OBS_WAIT_SECS=30
+  fi
+fi
 
 # Allow overriding DDL via env; default aligns with DDL_MS used elsewhere
 DDL_MS=${DDL_MS:-150}
@@ -71,8 +79,17 @@ fi
 
 # Reset netns and (re)build binaries
 "$ROOT/scripts/netns_reset.sh" "$NS"
-# Build only if missing or forced, to avoid rebuild overhead per step
+# Rebuild if forced, binaries missing, or any Go source is newer than the binaries
+NEED_BUILD=0
 if [[ "${FORCE_BUILD:-0}" == "1" || ! -x "$BIN_DIR/quicfec-server" || ! -x "$BIN_DIR/quicfec-client" ]]; then
+  NEED_BUILD=1
+else
+  # If any Go file is newer than either binary, trigger rebuild
+  if find "$ROOT/go" -type f -name '*.go' -newer "$BIN_DIR/quicfec-server" -print -quit | grep -q .; then NEED_BUILD=1; fi
+  if find "$ROOT/go" -type f -name '*.go' -newer "$BIN_DIR/quicfec-client" -print -quit | grep -q .; then NEED_BUILD=1; fi
+fi
+if [[ "$NEED_BUILD" == "1" ]]; then
+  mkdir -p "$BIN_DIR"
   (cd "$ROOT/go" && go build -o "$BIN_DIR/quicfec-server" ./cmd/quicfec-server && go build -o "$BIN_DIR/quicfec-client" ./cmd/quicfec-client)
 fi
 
@@ -108,17 +125,31 @@ sudo ip netns exec "$NS" tc qdisc replace dev veth1 root netem delay ${half}ms
 # JSONL for RL obs
 touch "$OBS_JSONL"
 
-# Run server
-SRV_LOG=$(mktemp -t quicfec_srv.XXXXXX.log)
+# Run server (logs in /tmp/quic_fec_srv.* for easy tailing)
+SRV_LOG=$(mktemp -t quic_fec_srv.XXXXXX.log)
 sudo ip netns exec "$NS" bash -lc "ulimit -n 1048576; '$BIN_DIR/quicfec-server' -addr 10.10.0.2:$PORT -out '$ROOT/go/test_data' -rx-ddl ${DDL_MS}ms -timeout ${SRV_TIMEOUT}" >"$SRV_LOG" 2>&1 & SP=$!
 sleep 0.1
 
-# Run client
-CLI_LOG=$(mktemp -t quicfec_cli.XXXXXX.log)
+# Run client (logs in /tmp/quic_fec_cli.*)
+CLI_LOG=$(mktemp -t quic_fec_cli.XXXXXX.log)
 export QUIC_FEC_CC_BYPASS=1
 START=$(date +%s%N)
 pace_arg=""
-if [[ "${PACE_US:-0}" -gt 0 ]]; then
+if [[ "${PACE_US:-0}" -le 0 ]]; then
+  # Auto pace: approximate dgram size (symbol + FEC header + QUIC/UDP/IP overhead)
+  # Use a conservative +64B overhead fudge.
+  local_sz=$(( SYMBOL_BYTES + 64 ))
+  # Inter-packet gap microseconds at the target rate: us = (bytes*8 / (Mbps*1e6)) * 1e6
+  # Simplifies to us = (bytes*8) / (Mbps)
+  if [[ ${BITRATE_MBPS} -gt 0 && ${local_sz} -gt 0 ]]; then
+    PACE_US=$(( (local_sz * 8 + BITRATE_MBPS - 1) / BITRATE_MBPS ))
+    # Clamp to a minimum of 200us to avoid tight spinning on very high rates
+    if [[ ${PACE_US} -lt 200 ]]; then PACE_US=200; fi
+  else
+    PACE_US=0
+  fi
+fi
+if [[ "${PACE_US}" -gt 0 ]]; then
   pace_arg="-pace ${PACE_US}us"
 fi
 "$BIN_DIR/quicfec-client" -addr 10.10.0.2:$PORT -file "$FILE" -N $((K+R0)) -K "$K" -L "$SYMBOL_BYTES" \
@@ -126,10 +157,11 @@ fi
   >"$CLI_LOG" 2>&1 || true
 END=$(date +%s%N)
 
-# Wait for server to emit the observation before stopping it (cap ~30s)
+# Wait for server to emit the observation before stopping it (cap by OBS_WAIT_SECS)
 tries=0
 RL_OBS=""
-while [[ $tries -lt 150 ]]; do
+max_tries=$(( OBS_WAIT_SECS * 10 ))
+while [[ $tries -lt $max_tries ]]; do
   RL_OBS=$(grep -E "^\[rl-observation\]" "$SRV_LOG" | tail -n1 || true)
   if [[ -n "$RL_OBS" ]]; then
     break
@@ -195,6 +227,12 @@ fi
 # Keep logs when a failure occurs (no RL_OBS) or residual_erasures=1; otherwise clean up
 if [[ -n "$RL_OBS" && "$KEEP_LOGS" == "0" ]]; then
   rm -f "$CLI_LOG" "$SRV_LOG"
+fi
+
+# If BG=1, print log locations and return immediately so caller can tail /tmp/quic_fec*
+if [[ "${BG:-0}" == "1" ]]; then
+  echo "[bg] server log: $SRV_LOG" >&2
+  echo "[bg] client log: $CLI_LOG" >&2
 fi
 
 exit 0

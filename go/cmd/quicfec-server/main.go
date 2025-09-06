@@ -16,7 +16,7 @@ func main() {
 		alpn      = flag.String("alpn", "quic-fec", "ALPN protocol")
 		out       = flag.String("out", ".", "output directory")
 		limit     = flag.Duration("timeout", 120*time.Second, "server timeout")
-		rxBudget  = flag.Int("rx-budget-bytes", 10*1024*1024, "receiver buffer budget in bytes")
+		rxBudget  = flag.Int("rx-budget-bytes", 64*1024*1024, "receiver buffer budget in bytes")
 		rxDDL     = flag.Duration("rx-ddl", 50*time.Millisecond, "receiver decode deadline per block")
 		rxWorkers = flag.Int("rx-workers", 2, "receiver decode workers")
 	)

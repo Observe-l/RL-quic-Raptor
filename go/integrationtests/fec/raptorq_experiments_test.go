@@ -106,9 +106,9 @@ func TestRaptorQ_ExperimentB_Scaled(t *testing.T) {
 	// t.Skip("skip by default; enable when running FEC experiments")
 
 	const (
-		K = 5
+		K = 20
 		L = 1100
-		N = 8
+		N = 55
 	)
 	// 3 MB object
 	obj := make([]byte, 5<<20)
@@ -116,7 +116,7 @@ func TestRaptorQ_ExperimentB_Scaled(t *testing.T) {
 		t.Fatalf("rand: %v", err)
 	}
 	rng := mrand.New(mrand.NewSource(1337))
-	ps := []float64{0.0, 0.001, 0.005, 0.010, 0.05}
+	ps := []float64{0.0, 0.001, 0.005, 0.010, 0.05, 0.1, 0.2}
 	trials := 1 // scale up to 10k for full bake-off
 
 	schemes := []string{"raptorq", "rs", "rlc"}

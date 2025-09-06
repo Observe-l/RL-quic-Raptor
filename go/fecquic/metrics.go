@@ -22,8 +22,7 @@ type Observation struct {
 	DecodeLatencyP50Ms           float64 `json:"decode_latency_p50_ms"`
 	DecodeLatencyP95Ms           float64 `json:"decode_latency_p95_ms"`
 	ArrivalSymbolRateKppsP95     float64 `json:"arrival_symbol_rate_kpps_p95"`
-	EstimatedAvailableBwMbpsP95  float64 `json:"estimated_available_bw_mbps_p95"`
-	EstimatedAvailableBwMbpsPeak float64 `json:"estimated_available_bw_mbps_peak"`
+	EstimatedAvailableBwMbps     float64 `json:"estimated_available_bw_mbps"`
 }
 
 // serverMetrics collects metrics on the server.
@@ -35,9 +34,10 @@ type serverMetrics struct {
 	gotFirst  bool
 
 	// arrival windows (200ms buckets, 10 buckets => 2s horizon)
-	bucketDur time.Duration
-	buckets   []arrBucket
-	startTick time.Time
+	bucketDur  time.Duration
+	buckets    []arrBucket
+	startTick  time.Time
+	lastBucket int // last bucket index we've written to; -1 if none yet
 
 	// distributions
 	ddlSamples      []int   // rx_unique at DDL
@@ -56,9 +56,10 @@ type arrBucket struct {
 
 func newServerMetrics(fileBytes int) *serverMetrics {
 	return &serverMetrics{
-		fileBytes: fileBytes,
-		bucketDur: 200 * time.Millisecond,
-		buckets:   make([]arrBucket, 10),
+		fileBytes:  fileBytes,
+		bucketDur:  200 * time.Millisecond,
+		buckets:    make([]arrBucket, 10),
+		lastBucket: -1,
 	}
 }
 
@@ -89,9 +90,21 @@ func (m *serverMetrics) OnUniqueSymbol(nBytes int, when time.Time, isRepair bool
 		if delta < 0 {
 			delta = 0
 		}
-		idx := int((delta / m.bucketDur) % time.Duration(len(m.buckets)))
-		// rough window: overwrite oldest bucket when wrapped by resetting it
-		// to zero when moving into it the first time in a long while; we skip freshness tracking for simplicity
+		n := len(m.buckets)
+		idx := int((delta / m.bucketDur) % time.Duration(n))
+		// Clear intermediate buckets when advancing to avoid stale accumulation.
+		if m.lastBucket == -1 {
+			m.lastBucket = idx
+		} else if idx != m.lastBucket {
+			// steps ahead (modulo n)
+			steps := (idx - m.lastBucket + n) % n
+			for s := 1; s <= steps; s++ {
+				bidx := (m.lastBucket + s) % n
+				// zero this bucket before writing new values into it
+				m.buckets[bidx] = arrBucket{}
+			}
+			m.lastBucket = idx
+		}
 		m.buckets[idx].bytes += int64(nBytes)
 		m.buckets[idx].symbols++
 	}
@@ -140,21 +153,46 @@ func (m *serverMetrics) Snapshot(now time.Time) Observation {
 	meanDDL, p95DDL := meanAndP(intsToFloat(m.ddlSamples), 0.95)
 	// decode latency p50/p95
 	p50Dec, p95Dec := percentiles(int64sToFloat(m.decodeLatencyMs), []float64{0.50, 0.95})
-	// arrival rates
+	// arrival rates per bucket and robust BW estimate
 	bytesSum := int64(0)
 	symSum := int64(0)
+	n := len(m.buckets)
+	rates := make([]float64, 0, n)
+	bucketSec := float64(m.bucketDur) / float64(time.Second)
 	for _, b := range m.buckets {
 		bytesSum += b.bytes
 		symSum += b.symbols
+		rate := (float64(b.bytes) * 8.0 / 1e6)
+		if bucketSec > 0 {
+			rate = rate / bucketSec
+		} else {
+			rate = 0
+		}
+		rates = append(rates, rate)
 	}
-	horizonSec := float64(len(m.buckets)) * (float64(m.bucketDur) / float64(time.Second))
-	bwPeak := 0.0
-	// estimate peak as total over horizon (approx); better is track per-bucket windowed sums, which we omit
-	if horizonSec > 0 {
-		bw := (float64(bytesSum) * 8.0 / 1e6) / horizonSec
-		bwPeak = bw
+	// Trimmed mean (20%) as robust available bandwidth estimate
+	estBW := 0.0
+	if len(rates) > 0 {
+		srates := append([]float64(nil), rates...)
+		sort.Float64s(srates)
+		trim := int(math.Floor(0.2 * float64(len(srates))))
+		lo := trim
+		hi := len(srates) - trim
+		if hi <= lo {
+			// fallback to simple mean
+			sum := 0.0
+			for _, r := range srates {
+				sum += r
+			}
+			estBW = sum / float64(len(srates))
+		} else {
+			sum := 0.0
+			for _, r := range srates[lo:hi] {
+				sum += r
+			}
+			estBW = sum / float64(hi-lo)
+		}
 	}
-	// p95 same as peak here (simplified)
 	return Observation{
 		GoodputDecodeMbps:            goodput,
 		DurationDecodeMs:             durMs,
@@ -166,9 +204,8 @@ func (m *serverMetrics) Snapshot(now time.Time) Observation {
 		RxUniqueAtDDLP95:             p95DDL,
 		DecodeLatencyP50Ms:           p50Dec,
 		DecodeLatencyP95Ms:           p95Dec,
-		ArrivalSymbolRateKppsP95:     (float64(symSum) / horizonSec) / 1000.0,
-		EstimatedAvailableBwMbpsP95:  bwPeak,
-		EstimatedAvailableBwMbpsPeak: bwPeak,
+		ArrivalSymbolRateKppsP95:     (float64(symSum) / (float64(n) * bucketSec)) / 1000.0,
+		EstimatedAvailableBwMbps:     estBW,
 	}
 }
 

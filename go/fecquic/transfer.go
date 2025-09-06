@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"time"
 
 	"sync"
@@ -51,7 +52,8 @@ type SendOptions struct {
 
 // ClientSendFile connects and sends a file using QFEC header + RaptorQ symbols over datagrams.
 func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptions) error {
-	// Shared pacer across all sends (initial + ARQ repairs) for accurate pacing
+	// Optional pacing; respect QUIC_FEC_CC_BYPASS to eliminate sleeps/waits entirely
+	bypass := os.Getenv("QUIC_FEC_CC_BYPASS") == "1"
 	var pc *pacer
 	if opts.PaceEach > 0 {
 		pc = newPacer(opts.PaceEach)
@@ -208,6 +210,8 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	// Send symbols per block
 	buf := make([]byte, K*L)
 	blockID := 0
+	// If ARQ window enforcement times out once, disable it for the remainder to avoid per-block 5s stalls
+	var arqWindowDisabled bool
 	var rng *rand.Rand
 	if opts.DropProb > 0 {
 		seed := opts.Seed
@@ -258,6 +262,15 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 							if int(n.AttemptIdx) <= bt.attempt {
 								continue
 							}
+							// If we've reached the maximum number of ARQ attempts for this block, give up and free a window slot.
+							if opts.MaxAttempts > 0 && int(n.AttemptIdx) >= opts.MaxAttempts {
+								txMu.Lock()
+								delete(active, bid)
+								txMu.Unlock()
+								cond.Broadcast()
+								fmt.Fprintf(os.Stderr, "[arq] giveup block=%d at attempt=%d (max=%d)\n", bid, n.AttemptIdx, opts.MaxAttempts)
+								continue
+							}
 							toSend := int(n.RecommendExtra)
 							if toSend <= 0 {
 								toSend = 0
@@ -285,11 +298,6 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 							if cand <= 0 {
 								cand = 1
 							}
-							// enforce attempts cap
-							if opts.MaxAttempts > 0 && bt.attempt >= opts.MaxAttempts {
-								// give a tiny append once, then stop
-								cand = 0
-							}
 							if cand == 0 {
 								// nothing to append
 								continue
@@ -298,11 +306,13 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 							for i := 0; i < cand; i++ {
 								esi := bt.nextESI
 								payload := bt.enc.GenSymbol(uint32(esi))
+								// Guard N to avoid overflow and unrealistic growth
+								advN := minInt(255, bt.K+bt.repairsOut+1)
 								h := fecwire.FECHeader{
 									Version:    1,
 									Scheme:     fecwire.SchemeRaptorQ,
 									BlockID:    bid,
-									N:          uint8(minInt(255, bt.K+bt.repairsOut+1)),
+									N:          uint8(advN),
 									K:          uint8(bt.K),
 									SymID:      uint8(esi),
 									PayloadLen: uint32(len(payload)),
@@ -350,13 +360,24 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		} else if err != nil && err != io.EOF {
 			return err
 		}
-		// Enforce ARQ window if enabled
-		if opts.UseARQ && opts.WindowW > 0 {
-			txMu.Lock()
-			for len(active) >= opts.WindowW {
-				cond.Wait()
+		// Enforce ARQ window to limit unfinished clusters, unless bypassing waits entirely.
+		// If a timeout is hit once, disable further gating to avoid cumulative stalls.
+		if opts.UseARQ && opts.WindowW > 0 && !arqWindowDisabled && !bypass {
+			deadline := time.Now().Add(1 * time.Second)
+			for {
+				txMu.Lock()
+				n := len(active)
+				txMu.Unlock()
+				if n < opts.WindowW {
+					break
+				}
+				if time.Now().After(deadline) {
+					fmt.Fprintf(os.Stderr, "[arq] window wait timeout; proceeding n=%d W=%d; disabling window gating\n", n, opts.WindowW)
+					arqWindowDisabled = true
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
 			}
-			txMu.Unlock()
 		}
 		// Prepare encoder for this block so we can generate on-demand repairs later
 		blockBytes := make([]byte, len(buf))
@@ -372,6 +393,11 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		if initRepairs <= 0 {
 			initRepairs = maxInt(0, N-K)
 		}
+		// Safety cap: avoid pathological initial bursts when R0 >> K
+		// Keep initial N <= 2*K
+		if initRepairs > K {
+			initRepairs = K
+		}
 		initN := K + initRepairs
 		if initN < K {
 			initN = K
@@ -384,11 +410,13 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		// Emit initial symbols 0..initN-1
 		for esi := 0; esi < initN; esi++ {
 			payload := enc.GenSymbol(uint32(esi))
+			// Advertise a stable N that doesn't explode with many appends; cap to 255.
+			advN := minInt(255, initN)
 			h := fecwire.FECHeader{
 				Version:    1,
 				Scheme:     fecwire.SchemeRaptorQ,
 				BlockID:    uint16(blockID),
-				N:          uint8(minInt(255, initN)),
+				N:          uint8(advN),
 				K:          uint8(K),
 				SymID:      uint8(esi),
 				PayloadLen: uint32(len(payload)),
@@ -487,10 +515,44 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 			buf = buf[:K*L]
 		}
 	}
-	if opts.PostWait > 0 {
+	// If ARQ is enabled, optionally drain outstanding blocks before closing unless bypassing waits.
+	// This ensures NACK/ACK rounds can complete on high RTT/DDL links.
+	if opts.UseARQ && !bypass {
+		// Wait until all active blocks have been ACKed or until a cap.
+		// Base cap defaults to max(PostWait, 3s). If RTT_MS env is present, ensure at least ~10 RTTs (capped at 10s).
+		drainCap := 3 * time.Second
+		if opts.PostWait > drainCap {
+			drainCap = opts.PostWait
+		}
+		if rttStr := os.Getenv("RTT_MS"); rttStr != "" {
+			if ms, err := strconv.Atoi(rttStr); err == nil && ms > 0 {
+				rttDur := time.Duration(ms) * time.Millisecond
+				minDrain := 10 * rttDur
+				if minDrain > 10*time.Second {
+					minDrain = 10 * time.Second
+				}
+				if minDrain > drainCap {
+					drainCap = minDrain
+				}
+			}
+		}
+		deadline := time.Now().Add(drainCap)
+		// Poll with short sleeps to avoid indefinite waits on missing broadcasts.
+		for time.Now().Before(deadline) {
+			txMu.Lock()
+			n := len(active)
+			txMu.Unlock()
+			if n == 0 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	// Optional tail wait after ARQ drain; skip when bypassing waits
+	if opts.PostWait > 0 && !bypass {
 		time.Sleep(opts.PostWait)
 	}
-	// stop live printer and keepalive goroutine
+	// stop live printer and keepalive goroutine after ARQ drain
 	close(liveStop)
 	close(kaStop)
 	<-keepDone
@@ -627,14 +689,23 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 	}()
 	go func() {
 		defer close(doneCh)
-		// wait until file complete OR context done OR prolonged inactivity (no dgrams and no writes)
+		// Wait until file complete OR context done OR prolonged inactivity in writes.
+		// We intentionally do NOT treat continued datagram arrivals as progress;
+		// if no bytes are being written, finalize to emit an observation.
 		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
 		lastWritten := rxm.written.Load()
-		var lastDgrams int64 = rcvDgrams
-		lastChange := time.Now()
-		// Be responsive after sender finishes: 3s of no progress triggers finalize
+		lastWriteChange := time.Now()
+		// Make inactivity more tolerant for high-RTT/high-redundancy runs.
 		inactivity := 3 * time.Second
+		if rx.DDL > 0 {
+			if d := 2 * rx.DDL; d > inactivity {
+				inactivity = d
+			}
+		}
+		if inactivity < 6*time.Second {
+			inactivity = 6 * time.Second
+		}
 		for {
 			if rxm.written.Load() >= hdr.FileSize {
 				return
@@ -644,12 +715,10 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 				return
 			case <-ticker.C:
 				w := rxm.written.Load()
-				dg := rcvDgrams
-				if w != lastWritten || dg != lastDgrams {
+				if w != lastWritten {
 					lastWritten = w
-					lastDgrams = dg
-					lastChange = time.Now()
-				} else if time.Since(lastChange) > inactivity {
+					lastWriteChange = time.Now()
+				} else if time.Since(lastWriteChange) > inactivity {
 					return
 				}
 			}
