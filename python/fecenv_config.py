@@ -31,8 +31,8 @@ def build_ppo_config(env_name: str = "FECEnv-v0", env_config: Dict[str, Any] | N
     train_batch_size = int(os.environ.get("TRAIN_BATCH_SIZE", str(env_config.get("train_batch_size", env_config["episode_step"]))))
     minibatch_size = int(os.environ.get("MINIBATCH_SIZE", str(env_config.get("minibatch_size", env_config["episode_step"]))))
     num_epochs = int(os.environ.get("NUM_EPOCHS", str(env_config.get("num_epochs", 1))))
-    num_env_runners = int(os.environ.get("NUM_ENV_RUNNERS", str(env_config.get("num_env_runners", 0))))
-    rollout_fragment_length = int(os.environ.get("ROLLOUT_FRAGMENT_LENGTH", str(env_config.get("rollout_fragment_length", 1))))
+    num_env_runners = int(os.environ.get("NUM_ENV_RUNNERS", str(env_config.get("num_env_runners", 1))))
+    rollout_fragment_length = int(os.environ.get("ROLLOUT_FRAGMENT_LENGTH", str(env_config.get("rollout_fragment_length", env_config["episode_step"]))))
 
     # Make Ray/Tune honor our results directory (root)
     os.environ.setdefault("RAY_RESULTS_DIR", results_dir)
@@ -41,9 +41,9 @@ def build_ppo_config(env_name: str = "FECEnv-v0", env_config: Dict[str, Any] | N
         PPOConfig()
         .environment(env=env_name, env_config=env_config)
         .framework("torch")
-        .env_runners(num_env_runners=num_env_runners, rollout_fragment_length=rollout_fragment_length, batch_mode="truncate_episodes")
+        .env_runners(num_env_runners=num_env_runners, rollout_fragment_length=rollout_fragment_length, batch_mode="complete_episodes")
         .training(train_batch_size=train_batch_size, minibatch_size=minibatch_size, num_epochs=num_epochs, lr=lr)
         .resources(num_gpus=0)
-        .evaluation(evaluation_interval=1, evaluation_duration=10, evaluation_duration_unit="episodes")
+        .reporting(min_sample_timesteps_per_iteration=0, min_time_s_per_iteration=0)
     )
     return cfg, env_config

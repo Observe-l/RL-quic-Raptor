@@ -53,6 +53,13 @@ def main():
     last_result: Optional[dict] = None
     for ep in range(1, total_episodes + 1):
         result = algo.train()
+        # Optional assert: when multiple env runners exist, ensure at least one ep ended.
+        # result["episodes_this_iter"] counts completed episodes in this iteration.
+        # if int(result.get("episodes_this_iter", 0)) < 1:
+        #     # As a fallback, run another iteration until an episode completes.
+        #     # This can occur if external settings override batch sizes.
+        #     while int(result.get("episodes_this_iter", 0)) < 1:
+        #         result = algo.train()
         last_result = result
         # Write/overwrite the latest training summary
         try:
@@ -86,14 +93,14 @@ def main():
             "episode": ep,
             "episode_reward_mean": score,
             "checkpoint": ckpt_path,
-        })
+        }, flush=True)
 
     # Final status
     print({
         "results_dir": run_dir,
         "episodes": total_episodes,
         "best_checkpoints": [p for _, p in sorted(best_k, key=lambda x: -x[0])],
-    })
+    }, flush=True)
     algo.stop()
     ray.shutdown()
 
