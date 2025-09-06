@@ -43,6 +43,7 @@ RSTEP=${RSTEP:-4}
 ALPHA=${ALPHA:-0.6}
 ACK_EVERY=${ACK_EVERY:-8}
 MAX_ATTEMPTS=${MAX_ATTEMPTS:-8}
+PACE_US=${PACE_US:-30}
 if [[ -z "${POST_WAIT+x}" || -z "${POST_WAIT}" ]]; then
   # Default linger: ~3*RTT, clamped to [200ms, 800ms] to let tail datagrams/ARQ settle
   WAIT_MS=$(( RTT_MS * 3 ))
@@ -50,7 +51,7 @@ if [[ -z "${POST_WAIT+x}" || -z "${POST_WAIT}" ]]; then
   if [[ $WAIT_MS -gt 800 ]]; then WAIT_MS=800; fi
   POST_WAIT="${WAIT_MS}ms"
 fi
-SRV_TIMEOUT=${SRV_TIMEOUT:-8s}
+SRV_TIMEOUT=${SRV_TIMEOUT:-15s}
 
 # Allow overriding DDL via env; default aligns with DDL_MS used elsewhere
 DDL_MS=${DDL_MS:-150}
@@ -116,15 +117,19 @@ sleep 0.1
 CLI_LOG=$(mktemp -t quicfec_cli.XXXXXX.log)
 export QUIC_FEC_CC_BYPASS=1
 START=$(date +%s%N)
+pace_arg=""
+if [[ "${PACE_US:-0}" -gt 0 ]]; then
+  pace_arg="-pace ${PACE_US}us"
+fi
 "$BIN_DIR/quicfec-client" -addr 10.10.0.2:$PORT -file "$FILE" -N $((K+R0)) -K "$K" -L "$SYMBOL_BYTES" \
-  -post-wait "$POST_WAIT" -ack-every "$ACK_EVERY" -dgram-warn 1400 -arq -R0 "$R0" -W "$W" -Rstep "$RSTEP" -alpha "$ALPHA" -max-attempts "$MAX_ATTEMPTS" -loss 0 \
+  -post-wait "$POST_WAIT" -ack-every "$ACK_EVERY" -dgram-warn 1400 -arq -R0 "$R0" -W "$W" -Rstep "$RSTEP" -alpha "$ALPHA" -max-attempts "$MAX_ATTEMPTS" -loss 0 $pace_arg \
   >"$CLI_LOG" 2>&1 || true
 END=$(date +%s%N)
 
-# Wait for server to emit the observation before stopping it (cap ~6s)
+# Wait for server to emit the observation before stopping it (cap ~30s)
 tries=0
 RL_OBS=""
-while [[ $tries -lt 60 ]]; do
+while [[ $tries -lt 150 ]]; do
   RL_OBS=$(grep -E "^\[rl-observation\]" "$SRV_LOG" | tail -n1 || true)
   if [[ -n "$RL_OBS" ]]; then
     break
