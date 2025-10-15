@@ -27,22 +27,22 @@ NS=${NS:-qns}
 PORT=${PORT:-45300}
 
 BITRATE_MBPS=${BITRATE_MBPS:-10}
-RTT_MS=${RTT_MS:-100}
+RTT_MS=${RTT_MS:-550}
 LOSS_PCT=${LOSS_PCT:-0}
 RATE="${BITRATE_MBPS}mbit"
 
 FILE=${FILE:-"$ROOT/go/test_data/train_FD001.txt"}
 OBS_JSONL=${OBS_JSONL:-/tmp/quicfec_rl.jsonl}
 
-K=${K:-40}
-SYMBOL_BYTES=${SYMBOL_BYTES:-1200}
-R0=${R0:-6}
-W=${W:-8}
-DDL_MS=${DDL_MS:-150}
-RSTEP=${RSTEP:-4}
-ALPHA=${ALPHA:-0.6}
+K=${K:-30}
+SYMBOL_BYTES=${SYMBOL_BYTES:-1032}
+R0=${R0:-60}
+W=${W:-18}
+DDL_MS=${DDL_MS:-900}
+RSTEP=${RSTEP:-8}
+ALPHA=${ALPHA:-0.4}
 ACK_EVERY=${ACK_EVERY:-8}
-MAX_ATTEMPTS=${MAX_ATTEMPTS:-8}
+MAX_ATTEMPTS=${MAX_ATTEMPTS:-0}
 PACE_US=${PACE_US:-0}
 if [[ -z "${POST_WAIT+x}" || -z "${POST_WAIT}" ]]; then
   # Default linger: ~3*RTT, clamped to [200ms, 800ms] to let tail datagrams/ARQ settle
@@ -51,7 +51,7 @@ if [[ -z "${POST_WAIT+x}" || -z "${POST_WAIT}" ]]; then
   if [[ $WAIT_MS -gt 800 ]]; then WAIT_MS=800; fi
   POST_WAIT="${WAIT_MS}ms"
 fi
-SRV_TIMEOUT=${SRV_TIMEOUT:-15s}
+SRV_TIMEOUT=${SRV_TIMEOUT:-45s}
 # Observation wait budget in seconds (default: derived from SRV_TIMEOUT if of the form \d+s, else 30s)
 if [[ -z "${OBS_WAIT_SECS:-}" ]]; then
   if [[ "$SRV_TIMEOUT" =~ ^([0-9]+)s$ ]]; then

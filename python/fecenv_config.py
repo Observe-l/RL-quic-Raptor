@@ -22,7 +22,7 @@ def build_ppo_config(env_name: str = "FECEnv-v0", env_config: Dict[str, Any] | N
     env_config.setdefault("loss_mode", os.environ.get("LOSS_MODE", f"iid:{env_config['loss_pct']}"))
     env_config.setdefault("bitrate_mbps", int(os.environ.get("BITRATE_MBPS", "10")))
     env_config.setdefault("episode_step", int(os.environ.get("EPISODE_STEP", "100")))
-    env_config.setdefault("timeout_sec", int(os.environ.get("TIMEOUT_SEC", "15")))
+    env_config.setdefault("timeout_sec", int(os.environ.get("TIMEOUT_SEC", "30")))
     env_config.setdefault("train_episodes", int(os.environ.get("TRAIN_EPISODES", "300")))
     env_config["result_dir"] = results_dir
 

@@ -221,8 +221,8 @@ class FecEnv(gym.Env):
 
         # Action mapping ranges from [-1,1] → [low, high]
         # Action order: K, symbol_bytes, R0_pct, R_step, W, ddl_ms, alpha, pacing_gain
-        self._low = np.array([10, 768, 0.10, 1, 5, 300, 0.4, 0.3], dtype=np.float32)
-        self._high = np.array([64, 1188, 1.00, 20, 20, 600, 1.1, 5], dtype=np.float32)
+        self._low = np.array([10, 768, 0.10, 1, 5, 300, 0.4, 0.85], dtype=np.float32)
+        self._high = np.array([64, 1188, 1.00, 20, 20, 600, 1.1, 2], dtype=np.float32)
 
         # Runner
         self._runner = QuicFecRunner(timeout_sec=int(cfg.get("timeout_sec", 30)))
@@ -287,8 +287,8 @@ class FecEnv(gym.Env):
         symbol_bytes = symbol_bytes - (symbol_bytes % align)
 
         # Dynamic ddl lower bound for satellite
-        ddl_floor = max(300, int(2 * self._rtt_ms))
-        ddl_ms = int(min(max(ddl_ms, ddl_floor), 900))
+        # ddl_floor = max(300, int(2 * self._rtt_ms))
+        # ddl_ms = int(min(max(ddl_ms, ddl_floor), 900))
 
         # Desired parity and safety clamp by link budget
         R0_desired = max(0, int(round(K * R0_pct)))
@@ -300,8 +300,8 @@ class FecEnv(gym.Env):
 
         act = Action(
             R0=R0_desired,
-            R_step=max(2, min(R_step, 8)),
-            window_W=max(10, min(W, 18)),
+            R_step=R_step,
+            window_W=W,
             ddl_ms=ddl_ms,
             alpha=float(alpha),
             epsilon=1,  # fixed

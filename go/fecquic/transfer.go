@@ -360,9 +360,9 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		} else if err != nil && err != io.EOF {
 			return err
 		}
-		// Enforce ARQ window to limit unfinished clusters, unless bypassing waits entirely.
+		// Enforce ARQ window to limit unfinished clusters.
 		// If a timeout is hit once, disable further gating to avoid cumulative stalls.
-		if opts.UseARQ && opts.WindowW > 0 && !arqWindowDisabled && !bypass {
+		if opts.UseARQ && opts.WindowW > 0 && !arqWindowDisabled {
 			deadline := time.Now().Add(1 * time.Second)
 			for {
 				txMu.Lock()
@@ -393,11 +393,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		if initRepairs <= 0 {
 			initRepairs = maxInt(0, N-K)
 		}
-		// Safety cap: avoid pathological initial bursts when R0 >> K
-		// Keep initial N <= 2*K
-		if initRepairs > K {
-			initRepairs = K
-		}
+		// Allow large initial parity: header N will still be clamped to 255 and pacing/rate control will shape traffic.
 		initN := K + initRepairs
 		if initN < K {
 			initN = K
@@ -690,12 +686,14 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 	go func() {
 		defer close(doneCh)
 		// Wait until file complete OR context done OR prolonged inactivity in writes.
-		// We intentionally do NOT treat continued datagram arrivals as progress;
-		// if no bytes are being written, finalize to emit an observation.
+		// Treat either write progress or datagram arrivals as activity to avoid premature finalize
+		// on high-loss/high-parity runs where writes can stall while arrivals continue.
 		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
 		lastWritten := rxm.written.Load()
 		lastWriteChange := time.Now()
+		lastDgrams := rcvDgrams
+		lastDgramChange := time.Now()
 		// Make inactivity more tolerant for high-RTT/high-redundancy runs.
 		inactivity := 3 * time.Second
 		if rx.DDL > 0 {
@@ -718,7 +716,12 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 				if w != lastWritten {
 					lastWritten = w
 					lastWriteChange = time.Now()
-				} else if time.Since(lastWriteChange) > inactivity {
+				}
+				if rcvDgrams != lastDgrams {
+					lastDgrams = rcvDgrams
+					lastDgramChange = time.Now()
+				}
+				if time.Since(lastWriteChange) > inactivity && time.Since(lastDgramChange) > inactivity {
 					return
 				}
 			}

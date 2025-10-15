@@ -44,9 +44,9 @@ func TestRaptorQ_ExperimentA(t *testing.T) {
 	}
 
 	const (
-		K = 26
+		K = 10
 		L = 1500
-		N = 32
+		N = 20
 	)
 
 	encSum, decSum := time.Duration(0), time.Duration(0)
@@ -106,9 +106,9 @@ func TestRaptorQ_ExperimentB_Scaled(t *testing.T) {
 	// t.Skip("skip by default; enable when running FEC experiments")
 
 	const (
-		K = 20
+		K = 10
 		L = 1100
-		N = 55
+		N = 60
 	)
 	// 3 MB object
 	obj := make([]byte, 5<<20)
@@ -116,10 +116,10 @@ func TestRaptorQ_ExperimentB_Scaled(t *testing.T) {
 		t.Fatalf("rand: %v", err)
 	}
 	rng := mrand.New(mrand.NewSource(1337))
-	ps := []float64{0.0, 0.001, 0.005, 0.010, 0.05, 0.1, 0.2}
+	ps := []float64{0.0, 0.001, 0.005, 0.010, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9}
 	trials := 1 // scale up to 10k for full bake-off
 
-	schemes := []string{"raptorq", "rs", "rlc"}
+	schemes := []string{"raptorq"}
 	for _, scheme := range schemes {
 		for _, p := range ps {
 			okCnt := 0

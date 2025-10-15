@@ -69,6 +69,8 @@ type rxManager struct {
 	K, L     int
 	outDir   string
 	baseName string
+	// totalBlocks is computed once K is known: ceil(fileSize / (K*L))
+	totalBlocks int
 
 	// state
 	mu     sync.Mutex
@@ -102,6 +104,11 @@ type rxManager struct {
 	ctrlWG  sync.WaitGroup
 	// server metrics aggregator
 	met *serverMetrics
+
+	// tracking for missing blocks to NACK
+	minSeen int  // first seen block id
+	maxSeen int  // max seen block id
+	seeded  bool // placeholders pre-created for all blocks when K known
 }
 
 func newRXManager(fileSize uint64, K, L int, outDir, baseName string, rx RXOptions) (*rxManager, error) {
@@ -119,6 +126,8 @@ func newRXManager(fileSize uint64, K, L int, outDir, baseName string, rx RXOptio
 		decodeQ:   make(chan *rxBlock, 1024),
 		writeQ:    make(chan writeTask, 8192),
 		stopCh:    make(chan struct{}),
+		minSeen:   -1,
+		maxSeen:   -1,
 	}
 	finalBase := baseName
 	if finalBase == "" {
@@ -295,9 +304,7 @@ func (m *rxManager) start(rx RXOptions) {
 					continue
 				}
 				if now.After(b.nextDDL) || now.Equal(b.nextDDL) {
-					b.queued = true
-					b.nextDDL = now.Add(m.ddl)
-					// calculate NACK recommendation under lock
+					// Calculate NACK recommendation under lock for deficit cases.
 					if m.ctrlOut != nil {
 						deficit := b.K - len(b.syms)
 						if deficit > 0 {
@@ -311,7 +318,15 @@ func (m *rxManager) start(rx RXOptions) {
 							nacks = append(nacks, nackMsg{blockID: b.id, attempt: b.attempt, rxu: len(b.syms), rec: rec, send: true})
 						}
 					}
-					toDecode = append(toDecode, b)
+					// Only queue for decode when we have at least K uniques (decoder likely to succeed).
+					// IMPORTANT: Do not mark b.queued unless we actually enqueue for decode; otherwise
+					// blocks with syms<K would be stuck as 'queued' and stop receiving NACKs.
+					if len(b.syms) >= b.K {
+						b.queued = true
+						toDecode = append(toDecode, b)
+					}
+					// Always advance nextDDL so we retry after the interval.
+					b.nextDDL = now.Add(m.ddl)
 				}
 			}
 			m.mu.Unlock()
@@ -367,13 +382,35 @@ func (m *rxManager) start(rx RXOptions) {
 // ingest one symbol; returns whether accepted.
 func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, dataSize int) bool {
 	isRepair := esi >= K
-	// admission: drop repairs if over budget
-	cur := m.inUse.Load()
-	if int(cur)+len(data) > m.budget && isRepair {
-		m.dropsRepairs.Add(1)
-		return false
-	}
 	m.mu.Lock()
+	// On first observed symbol, record global K and compute total blocks.
+	if m.K == 0 && K > 0 {
+		m.K = K
+		m.L = L
+		if K > 0 && L > 0 {
+			blk := uint64(K * L)
+			m.totalBlocks = int((m.fileSize + blk - 1) / blk)
+		}
+		// Pre-create placeholders for all expected blocks to enable early ARQ on missing ones.
+		if !m.seeded && m.totalBlocks > 0 && m.ctrlOut != nil {
+			for i := 0; i < m.totalBlocks; i++ {
+				bid := uint16(i)
+				if _, ok := m.blocks[bid]; !ok {
+					m.blocks[bid] = &rxBlock{
+						id:       bid,
+						K:        m.K,
+						N:        m.K,
+						L:        m.L,
+						dataSize: m.K * m.L,
+						attempt:  0,
+						nextDDL:  time.Now().Add(m.ddl),
+						syms:     make(map[int][]byte, m.K),
+					}
+				}
+			}
+			m.seeded = true
+		}
+	}
 	// Drop any late symbols for blocks that were already completed.
 	if _, ok := m.completed[blockID]; ok {
 		m.mu.Unlock()
@@ -392,20 +429,62 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 			nextDDL:  time.Now().Add(m.ddl),
 			syms:     make(map[int][]byte, N),
 		}
-		dec, err := fec.NewRaptorQDecoder(dataSize, L)
-		if err != nil {
-			m.mu.Unlock()
-			return false
-		}
-		b.dec = dec
 		m.blocks[blockID] = b
+	}
+	// If this is the first time we observe any block (minSeen==-1), backfill placeholders for [0..blockID-1].
+	if m.minSeen == -1 {
+		m.minSeen = int(blockID)
+		m.maxSeen = int(blockID)
+		if blockID > 0 && m.ctrlOut != nil && m.K > 0 && m.L > 0 {
+			for i := 0; i < int(blockID); i++ {
+				bid := uint16(i)
+				if _, ok := m.blocks[bid]; !ok {
+					m.blocks[bid] = &rxBlock{
+						id:       bid,
+						K:        m.K,
+						N:        m.K, // unknown yet; doesn't matter for NACK
+						L:        m.L,
+						dataSize: m.K * m.L,
+						attempt:  0,
+						nextDDL:  time.Now().Add(m.ddl),
+						syms:     make(map[int][]byte, m.K),
+					}
+				}
+			}
+		}
+	} else {
+		// Update seen range and create placeholders for forward gaps
+		if int(blockID) > m.maxSeen {
+			prev := m.maxSeen
+			m.maxSeen = int(blockID)
+			if prev >= 0 && m.ctrlOut != nil && m.K > 0 && m.L > 0 {
+				for i := prev + 1; i < int(blockID); i++ {
+					bid := uint16(i)
+					if _, ok := m.blocks[bid]; !ok {
+						m.blocks[bid] = &rxBlock{
+							id:       bid,
+							K:        m.K,
+							N:        m.K,
+							L:        m.L,
+							dataSize: m.K * m.L,
+							attempt:  0,
+							nextDDL:  time.Now().Add(m.ddl),
+							syms:     make(map[int][]byte, m.K),
+						}
+					}
+				}
+			}
+		}
+		if m.minSeen == -1 || int(blockID) < m.minSeen {
+			m.minSeen = int(blockID)
+		}
 	}
 	// drop duplicates
 	if _, ok := b.syms[esi]; ok {
 		m.mu.Unlock()
 		return false
 	}
-	// prevent pathological growth: cap stored repairs per block to 4*K
+	// prevent pathological growth: cap stored repairs per block (e.g., 8*K) for small-K scenarios
 	if isRepair && len(b.syms) > 0 {
 		// count repairs-only
 		repOnly := 0
@@ -414,17 +493,55 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 				repOnly++
 			}
 		}
-		if repOnly >= 4*K {
+		if repOnly >= 8*K {
 			m.mu.Unlock()
 			m.dropsRepairs.Add(1)
 			return false
 		}
+	}
+	// Memory admission decision (post-dup check, with block context):
+	cur := m.inUse.Load()
+	admit := true
+	if isRepair {
+		// Repairs: allow if within budget, or up to 2x budget; always allow bootstrap
+		// for blocks with very few symbols so empty blocks can progress.
+		if int(cur)+len(data) > m.budget {
+			// Bootstrap priority: if this block has < 2 uniques, admit regardless.
+			if len(b.syms) < 2 {
+				admit = true
+			} else if int(cur)+len(data) <= 2*m.budget {
+				admit = true
+			} else {
+				admit = false
+			}
+		}
+	} else {
+		// Data symbols: always admit; these directly improve decode probability.
+		admit = true
+	}
+	if !admit {
+		m.mu.Unlock()
+		m.dropsRepairs.Add(1)
+		return false
 	}
 	// store symbol
 	p := make([]byte, len(data))
 	copy(p, data)
 	b.syms[esi] = p
 	m.inUse.Add(int64(len(p)))
+	// Update block meta from header for placeholders or unknowns.
+	if b.K != K || b.L != L || b.dataSize != dataSize {
+		b.K = K
+		b.L = L
+		b.dataSize = dataSize
+	}
+	// Lazily create decoder for placeholder blocks when the first symbol arrives (with correct size).
+	if b.dec == nil {
+		dec, err := fec.NewRaptorQDecoder(b.dataSize, b.L)
+		if err == nil {
+			b.dec = dec
+		}
+	}
 	// metrics: mark first unique for this block and file + arrival counts
 	if b.firstSeen.IsZero() {
 		b.firstSeen = time.Now()
@@ -510,6 +627,19 @@ func (m *rxManager) closeAndFinalize(expectedSHA [32]byte) (string, error) {
 					i++
 					if i >= 8 {
 						break
+					}
+				}
+			}
+			// Also, if we know totalBlocks, list a few missing block IDs with zero symbols.
+			if m.totalBlocks > 0 {
+				missing := 0
+				for i := 0; i < m.totalBlocks && missing < 8; i++ {
+					bid := uint16(i)
+					if _, ok := m.blocks[bid]; !ok {
+						if _, done := m.completed[bid]; !done {
+							fmt.Fprintf(os.Stderr, "[rx-finalize] missing_block=%d rx_unique=0\n", bid)
+							missing++
+						}
 					}
 				}
 			}
