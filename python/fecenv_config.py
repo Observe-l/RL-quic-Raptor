@@ -24,13 +24,34 @@ def build_ppo_config(env_name: str = "FECEnv-v0", env_config: Dict[str, Any] | N
     env_config.setdefault("episode_step", int(os.environ.get("EPISODE_STEP", "100")))
     env_config.setdefault("timeout_sec", int(os.environ.get("TIMEOUT_SEC", "30")))
     env_config.setdefault("train_episodes", int(os.environ.get("TRAIN_EPISODES", "300")))
+
+    # Curriculum / randomization (helps stabilize PPO on highly non-stationary channels)
+    env_config.setdefault("randomize_net_params", os.environ.get("RANDOMIZE_NET_PARAMS", "1") not in ("0", "false", "False"))
+    env_config.setdefault("curriculum_warmup_episodes", int(os.environ.get("CURRICULUM_WARMUP_EPISODES", "50")))
+
+    # Reward shaping (defaults closer to docs/main.pdf Eq. (25))
+    env_config.setdefault("reward_variant", os.environ.get("REWARD_VARIANT", "qarc_v1"))
+    env_config.setdefault("reward_w_goodput", float(os.environ.get("REWARD_W_GOODPUT", "1.0")))
+    env_config.setdefault("reward_w_delay", float(os.environ.get("REWARD_W_DELAY", "0.5")))
+    env_config.setdefault("reward_w_residual", float(os.environ.get("REWARD_W_RESIDUAL", "1.0")))
+    env_config.setdefault("reward_w_overhead", float(os.environ.get("REWARD_W_OVERHEAD", "0.5")))
+    env_config.setdefault("reward_w_arq", float(os.environ.get("REWARD_W_ARQ", "0.0")))
+    env_config.setdefault("reward_delay_binary", os.environ.get("REWARD_DELAY_BINARY", "1") not in ("0", "false", "False"))
+    env_config.setdefault("reward_residual_binary", os.environ.get("REWARD_RESIDUAL_BINARY", "1") not in ("0", "false", "False"))
+
     env_config["result_dir"] = results_dir
 
     # PPO hyperparameters
     lr = float(os.environ.get("LR", str(env_config.get("lr", 5e-4))))
-    train_batch_size = int(os.environ.get("TRAIN_BATCH_SIZE", str(env_config.get("train_batch_size", env_config["episode_step"]))))
-    minibatch_size = int(os.environ.get("MINIBATCH_SIZE", str(env_config.get("minibatch_size", env_config["episode_step"]))))
-    num_epochs = int(os.environ.get("NUM_EPOCHS", str(env_config.get("num_epochs", 1))))
+    train_batch_size = int(
+        os.environ.get("TRAIN_BATCH_SIZE", str(env_config.get("train_batch_size", env_config["episode_step"])))
+    )
+    # RLlib PPO (ray>=2.x) expects sgd_minibatch_size + num_sgd_iter.
+    # Keep env var names stable for your scripts, but map them to RLlib's API.
+    sgd_minibatch_size = int(
+        os.environ.get("MINIBATCH_SIZE", str(env_config.get("sgd_minibatch_size", env_config["episode_step"])))
+    )
+    num_sgd_iter = int(os.environ.get("NUM_EPOCHS", str(env_config.get("num_sgd_iter", 1))))
     num_env_runners = int(os.environ.get("NUM_ENV_RUNNERS", str(env_config.get("num_env_runners", 1))))
     rollout_fragment_length = int(os.environ.get("ROLLOUT_FRAGMENT_LENGTH", str(env_config.get("rollout_fragment_length", env_config["episode_step"]))))
 
@@ -42,7 +63,7 @@ def build_ppo_config(env_name: str = "FECEnv-v0", env_config: Dict[str, Any] | N
         .environment(env=env_name, env_config=env_config)
         .framework("torch")
         .env_runners(num_env_runners=num_env_runners, rollout_fragment_length=rollout_fragment_length, batch_mode="complete_episodes")
-        .training(train_batch_size=train_batch_size, minibatch_size=minibatch_size, num_epochs=num_epochs, lr=lr)
+        .training(train_batch_size=train_batch_size, sgd_minibatch_size=sgd_minibatch_size, num_sgd_iter=num_sgd_iter, lr=lr)
         .resources(num_gpus=0)
         .reporting(min_sample_timesteps_per_iteration=0, min_time_s_per_iteration=0)
     )

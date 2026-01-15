@@ -5,6 +5,8 @@ import json
 import time
 import shutil
 import heapq
+import subprocess
+import sys
 from typing import List, Tuple, Optional
 import ray
 from ray.tune.registry import register_env
@@ -15,7 +17,56 @@ from fecenv_env import FecEnv
 from fecenv_config import build_ppo_config
 
 
+def _ensure_sudo_privileges() -> None:
+    """Preflight the sudo requirement used by the QUIC shaping runner.
+
+    Without this, Ray may start and then fail inside a worker when the env is
+    constructed, which is harder to diagnose and can look like the training
+    process is hung.
+    """
+
+    def _sudo_noninteractive_ok() -> bool:
+        try:
+            subprocess.run(["sudo", "-n", "true"], check=True, capture_output=True)
+            return True
+        except Exception:
+            return False
+
+    if _sudo_noninteractive_ok():
+        return
+
+    askpass = os.environ.get("SUDO_ASKPASS")
+    if askpass:
+        try:
+            subprocess.run(["sudo", "-A", "-v"], check=True)
+        except Exception:
+            pass
+        if _sudo_noninteractive_ok():
+            return
+
+    pw = os.environ.get("SUDO_PASSWORD")
+    if pw:
+        try:
+            subprocess.run(["sudo", "-S", "-v"], input=(pw + "\n").encode(), check=True, capture_output=True)
+        except Exception:
+            pass
+        if _sudo_noninteractive_ok():
+            return
+
+    raise RuntimeError(
+        "sudo privileges are required for the QUIC shaping runner. "
+        "Run 'sudo -v' once in a terminal, or set SUDO_ASKPASS or SUDO_PASSWORD."
+    )
+
+
 def main():
+    # Fail fast before Ray starts if we don't have shaping privileges.
+    try:
+        _ensure_sudo_privileges()
+    except Exception as e:
+        print(f"[FATAL] {e}", file=sys.stderr)
+        raise
+
     # Register env
     register_env("FECEnv-v0", lambda cfg: FecEnv(cfg))
 

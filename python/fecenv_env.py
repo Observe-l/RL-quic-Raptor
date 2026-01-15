@@ -55,12 +55,21 @@ class QuicFecRunner:
 
     def reset(self, cfg: EnvConfig) -> Dict[str, Any]:
         self.last_cfg = cfg
-        # Ensure sudo is available for shaping runs
-        self._sudo_check()
+        # Ensure sudo is available for shaping runs.
+        # If we don't fail fast here, training will continue with default observations
+        # (and constant negative rewards), which looks like "training runs" but is meaningless.
+        self._sudo_ensure()
         return {"ok": True}
 
     def step(self, action: Action, rtt_ms: int, loss_pct: int, bitrate_mbps: Optional[int] = None, loss_mode: Optional[str] = None) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
         env = os.environ.copy()
+        # Ray worker processes may run with a restricted PATH. The harness
+        # requires common tools (e.g., go) to be discoverable.
+        path = env.get("PATH", "")
+        for p in ("/usr/local/go/bin", "/usr/local/bin", "/usr/bin", "/bin", "/sbin"):
+            if p not in path.split(":"):
+                path = (path + ":" + p) if path else p
+        env["PATH"] = path
         env["REPS"] = "1"
         k_val = action.K if (action.K is not None) else (self.last_cfg.K if self.last_cfg else 40)
         sb_val = action.symbol_bytes if (action.symbol_bytes is not None) else (self.last_cfg.symbol_bytes if self.last_cfg else 1200)
@@ -100,7 +109,9 @@ class QuicFecRunner:
             env["NS"] = self.ns
             env["RTT_MS"] = str(int(rtt_ms))
             self._sudo_ensure()
-            p = subprocess.run(["bash", "-lc", f"bash '{self.script}'"], env=env, capture_output=True, text=True, timeout=self.timeout_sec)
+            # Avoid running as a login shell ("-l"), which can override PATH and
+            # break tool discovery in non-interactive Ray workers.
+            p = subprocess.run(["bash", "-c", f"bash '{self.script}'"], env=env, capture_output=True, text=True, timeout=self.timeout_sec)
             if p.returncode != 0:
                 raise RuntimeError(f"harness failed: code={p.returncode} stderr={p.stderr[-400:]}\nstdout={p.stdout[-400:]}")
             obs = self._read_last_obs(obs_jsonl_path)
@@ -210,10 +221,37 @@ class FecEnv(gym.Env):
         self._episode_steps = int(cfg.get("episode_step", 100))
         self._t_in_ep = 0
 
+        # If the external harness fails (missing deps, netns issues, etc.), it's usually
+        # better to fail fast than to keep training on default observations.
+        # Timeouts are treated as a valid (bad) outcome by default.
+        self._ignore_runner_errors = bool(cfg.get("ignore_runner_errors", False))
+
+        # Curriculum / randomization
+        self._randomize_net_params_enabled = bool(cfg.get("randomize_net_params", True))
+        self._curriculum_warmup_episodes = int(cfg.get("curriculum_warmup_episodes", 0))
+
+        # Reward shaping (default matches docs/main.pdf Eq. (25) more closely)
+        # reward_variant:
+        # - "qarc_v1": soft penalties, non-saturating signals for throughput/overhead
+        # - "legacy": previous clipped/thresholded reward
+        self._reward_variant = str(cfg.get("reward_variant", "qarc_v1"))
+        self._reward_w_goodput = float(cfg.get("reward_w_goodput", 1.0))
+        self._reward_w_delay = float(cfg.get("reward_w_delay", 0.5))
+        self._reward_w_residual = float(cfg.get("reward_w_residual", 1.0))
+        self._reward_w_overhead = float(cfg.get("reward_w_overhead", 0.5))
+        self._reward_w_arq = float(cfg.get("reward_w_arq", 0.0))
+        self._reward_delay_binary = bool(cfg.get("reward_delay_binary", True))
+        self._reward_residual_binary = bool(cfg.get("reward_residual_binary", True))
+
         # Network defaults
         self._rtt_ms = int(cfg.get("rtt_ms", 100))
         self._loss_pct = int(cfg.get("loss_pct", 5))
         self._loss_mode = str(cfg.get("loss_mode", f"iid:{self._loss_pct}"))
+
+        # Remember the non-randomized baseline for curriculum warmup
+        self._base_rtt_ms = int(self._rtt_ms)
+        self._base_loss_pct = int(self._loss_pct)
+        self._base_loss_mode = str(self._loss_mode)
         # Fix physical capacity to 10 Mbps
         self._bitrate_mbps = 10
         self._capacity_mbps = 10.0
@@ -247,16 +285,29 @@ class FecEnv(gym.Env):
         self.epi = -1
         self._rng = np.random.RandomState()
 
+        # Episode-level diagnostics
+        self._ep_return = 0.0
+        self._ep_term_sums: Dict[str, float] = {}
+
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
         self._last_obs_vec[:] = 0.0
         self._t_in_ep = 0
         self.epi += 1
+        self._ep_return = 0.0
+        self._ep_term_sums = {}
         if seed is not None:
             try:
                 self._rng.seed(int(seed))
             except Exception:
                 pass
-        self._randomize_net_params()
+
+        # Curriculum: keep network fixed for a few warmup episodes, then randomize.
+        if self._randomize_net_params_enabled and self.epi >= self._curriculum_warmup_episodes:
+            self._randomize_net_params()
+        else:
+            self._rtt_ms = int(self._base_rtt_ms)
+            self._loss_pct = int(self._base_loss_pct)
+            self._loss_mode = str(self._base_loss_mode)
         return self._last_obs_vec.copy(), {}
 
     def step(self, action: np.ndarray):
@@ -318,9 +369,14 @@ class FecEnv(gym.Env):
             bitrate_mbps=self._bitrate_mbps,
             loss_mode=self._loss_mode,
         )
+
+        if not self._ignore_runner_errors and info and isinstance(info, dict) and info.get("error"):
+            err = str(info.get("error"))
+            if not err.lower().startswith("timeout"):
+                raise RuntimeError(f"QUIC-FEC harness failed: {err}")
         # Update last estimated bandwidth for next safety clamp
         self._last_est_bw_mbps = float(obs_dict.get("estimated_available_bw_mbps", self._capacity_mbps))
-        # Compute reward per improvement plan
+        # Compute reward (variant selectable via env_config)
         reward, r_terms = self._compute_reward_satellite(obs_dict, ddl_ms)
         # Build observation vector: base obs + normalized net features + prev action
         obs_vec_raw = self._obs_to_vec(obs_dict)
@@ -380,10 +436,44 @@ class FecEnv(gym.Env):
                 f.write(json.dumps(rec) + "\n")
         except Exception:
             pass
+
+        # Episode-level aggregates
+        self._ep_return += float(reward)
+        for k, v in (r_terms or {}).items():
+            try:
+                self._ep_term_sums[k] = float(self._ep_term_sums.get(k, 0.0) + float(v))
+            except Exception:
+                continue
+
         self._global_step += 1
         self._t_in_ep += 1
         terminated = bool(self._t_in_ep >= self._episode_steps)
         truncated = False
+
+        if terminated:
+            # Write episode summary to help diagnose learning signal and non-stationarity.
+            try:
+                epi_path = os.path.join(dest_dir, "episode_metrics.jsonl")
+                denom = max(1, int(self._t_in_ep))
+                avg_terms = {k: float(v) / float(denom) for k, v in self._ep_term_sums.items()}
+                epi_rec = {
+                    "epi": int(self.epi),
+                    "t_end": int(self._global_step),
+                    "episode_steps": int(self._t_in_ep),
+                    "episode_return": float(self._ep_return),
+                    "avg_reward_terms": avg_terms,
+                    "net_params": {
+                        "rtt_ms": int(self._rtt_ms),
+                        "loss_mode": str(self._loss_mode),
+                        "bitrate_mbps": int(self._bitrate_mbps),
+                    },
+                    "reward_variant": str(self._reward_variant),
+                }
+                with open(epi_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(epi_rec) + "\n")
+            except Exception:
+                pass
+
         return obs_vec, float(reward), terminated, truncated, info
 
     def _obs_to_vec(self, obs: Dict[str, Any]) -> np.ndarray:
@@ -436,29 +526,72 @@ class FecEnv(gym.Env):
     def _compute_reward_satellite(self, obs: Dict[str, Any], ddl_ms: int) -> Tuple[float, Dict[str, float]]:
         g = float(obs.get("goodput_decode_mbps", 0.0))
         est = float(obs.get("estimated_available_bw_mbps", self._capacity_mbps))
-        c = max(1.0, float(min(self._capacity_mbps, est)))
         e = float(obs.get("residual_erasures", 0.0))
         d95 = float(obs.get("decode_latency_p95_ms", 0.0))
         d = float(max(1, int(ddl_ms)))
         oh = float(obs.get("fec_overhead_pct_arrival", 0.0))
         a95 = float(obs.get("arq_attempts_p95", 0.0))
 
-        # Terms
-        tp_term = float(np.clip(g / c, 0.0, 1.0))
-        lam_e = 0.75
-        resid_term = -lam_e * (e / (1.0 + e))
-        lam_d = 0.3
-        lat_term = -lam_d * max(0.0, (d95 - d) / max(d, 1.0))
-        lam_o = 0.3
-        oh_term = -lam_o * max(0.0, (oh - 40.0) / 60.0)
-        arq_term = -min(0.3, 0.08 * a95)
-        r = tp_term + resid_term + lat_term + oh_term + arq_term
-        return float(r), {
+        if self._reward_variant == "legacy":
+            # Previous shaping (kept for reproducibility)
+            c = max(1.0, float(min(self._capacity_mbps, est)))
+            tp_term = float(np.clip(g / c, 0.0, 1.0))
+            lam_e = 0.75
+            resid_term = -lam_e * (e / (1.0 + e))
+            lam_d = 0.3
+            lat_term = -lam_d * max(0.0, (d95 - d) / max(d, 1.0))
+            lam_o = 0.3
+            oh_term = -lam_o * max(0.0, (oh - 40.0) / 60.0)
+            arq_term = -min(0.3, 0.08 * a95)
+            r = tp_term + resid_term + lat_term + oh_term + arq_term
+            return float(r), {
+                "tp_term": float(tp_term),
+                "resid_term": float(resid_term),
+                "lat_term": float(lat_term),
+                "oh_term": float(oh_term),
+                "arq_term": float(arq_term),
+            }
+
+        # Q-ARC-like shaping (docs/main.pdf Eq. (25))
+        # g_tilde: normalize by physical capacity (avoid early saturation from est_bw)
+        g_tilde = float(np.clip(g / max(1e-6, float(self._capacity_mbps)), 0.0, 1.0))
+
+        # d_tilde: delay penalty (binary by default, as suggested in the doc)
+        if self._reward_delay_binary:
+            d_tilde = float(d95 > d)
+        else:
+            d_tilde = float(np.clip(max(0.0, (d95 - d) / max(d, 1.0)), 0.0, 1.0))
+
+        # l_tilde: residual loss surrogate
+        if self._reward_residual_binary:
+            l_tilde = float(e > 0.0)
+        else:
+            l_tilde = float(e / (1.0 + max(0.0, e)))
+
+        # r_tilde: overhead ratio surrogate (pct -> [0,1])
+        r_tilde = float(np.clip(oh / 100.0, 0.0, 1.0))
+
+        # Optional ARQ penalty (scaled, non-saturating by default)
+        arq_tilde = float(np.clip(a95 / 30.0, 0.0, 1.0))
+
+        tp_term = self._reward_w_goodput * g_tilde
+        lat_term = -self._reward_w_delay * d_tilde
+        resid_term = -self._reward_w_residual * l_tilde
+        oh_term = -self._reward_w_overhead * r_tilde
+        arq_term = -self._reward_w_arq * arq_tilde
+        r = float(tp_term + lat_term + resid_term + oh_term + arq_term)
+        return r, {
             "tp_term": float(tp_term),
-            "resid_term": float(resid_term),
             "lat_term": float(lat_term),
+            "resid_term": float(resid_term),
             "oh_term": float(oh_term),
             "arq_term": float(arq_term),
+            "g_tilde": float(g_tilde),
+            "d_tilde": float(d_tilde),
+            "l_tilde": float(l_tilde),
+            "r_tilde": float(r_tilde),
+            "arq_tilde": float(arq_tilde),
+            "est_bw_mbps": float(est),
         }
 
 

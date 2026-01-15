@@ -48,3 +48,11 @@ Notes:
 - If permission errors, run `sudo -v` to cache credentials.
 - First run after edits may rebuild binaries and take longer.
 - To force rebuild: `FORCE_BUILD=1` in environment before runs.
+
+## NS3 Simulator
+
+```bash
+sudo ./ns3 run "scratch/quic_tap_bridge_dual.cc --errorMode=random --randomLossRate=0.02 --dataRate=50Mbps --rtt=40ms --stopSeconds=100"
+
+sudo ./ns3 run "scratch/quic_tap_bridge_dual.cc --errorMode=ge --geP=0.01 --geQ=0.1 --dataRate=50Mbps --rtt=40ms --stopSeconds=100"
+```
