@@ -10,11 +10,9 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
-	"time"
-
 	"sync"
+	"time"
 
 	quic "github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/fec"
@@ -52,8 +50,7 @@ type SendOptions struct {
 
 // ClientSendFile connects and sends a file using QFEC header + RaptorQ symbols over datagrams.
 func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptions) error {
-	// Optional pacing; respect QUIC_FEC_CC_BYPASS to eliminate sleeps/waits entirely
-	bypass := os.Getenv("QUIC_FEC_CC_BYPASS") == "1"
+	// Optional pacing (set via -pace / PACE_US)
 	var pc *pacer
 	if opts.PaceEach > 0 {
 		pc = newPacer(opts.PaceEach)
@@ -168,6 +165,19 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		}
 	}()
 
+	// Symbol transport (stream mode): send all symbols on a single uni stream.
+	// This avoids the heavy per-symbol stream creation overhead.
+	var symStream *quic.SendStream
+	var symMu sync.Mutex
+	if opts.Transport == "stream" {
+		s, err := conn.OpenUniStreamSync(ctx)
+		if err != nil {
+			return err
+		}
+		symStream = s
+		defer func() { _ = symStream.Close() }()
+	}
+
 	// Metrics counters
 	start := time.Now()
 	var sentDgrams, sentBytes, sendErrs, dtleCount int64
@@ -182,6 +192,33 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	var lastSend time.Time
 	var interSum time.Duration
 	var interCount int
+
+	sendSymbol := func(b []byte) error {
+		if opts.Transport == "stream" {
+			symMu.Lock()
+			defer symMu.Unlock()
+			_, err := symStream.Write(b)
+			return err
+		}
+		// Default: datagrams
+		if keepStr != nil {
+			if ackEvery <= 1 || dgramsSinceAck+1 >= ackEvery {
+				select {
+				case ackReq <- struct{}{}:
+				default:
+				}
+				dgramsSinceAck = 0
+			}
+		}
+		if err := conn.SendDatagram(b); err != nil {
+			var dtle *quic.DatagramTooLargeError
+			if errors.As(err, &dtle) {
+				dtleCount++
+			}
+			return err
+		}
+		return nil
+	}
 
 	// Live goodput printer
 	liveStop := make(chan struct{})
@@ -306,6 +343,16 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 							for i := 0; i < cand; i++ {
 								esi := bt.nextESI
 								payload := bt.enc.GenSymbol(uint32(esi))
+								// Avoid per-packet allocation: reuse a fixed-size buffer.
+								// SendDatagram copies the slice before returning, so reuse is safe.
+								b := make([]byte, fecwire.HeaderLen+bt.L)
+								pay := b[fecwire.HeaderLen:]
+								if len(payload) == bt.L {
+									copy(pay, payload)
+								} else {
+									clear(pay)
+									copy(pay, payload)
+								}
 								// Guard N to avoid overflow and unrealistic growth
 								advN := minInt(255, bt.K+bt.repairsOut+1)
 								h := fecwire.FECHeader{
@@ -315,12 +362,10 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 									N:          uint8(advN),
 									K:          uint8(bt.K),
 									SymID:      uint8(esi),
-									PayloadLen: uint32(len(payload)),
+									PayloadLen: uint32(bt.L),
 								}
-								b := make([]byte, fecwire.HeaderLen+len(payload))
-								copy(b[:fecwire.HeaderLen], h.MarshalBinary(nil))
-								copy(b[fecwire.HeaderLen:], payload)
-								if err := conn.SendDatagram(b); err == nil {
+								h.MarshalBinary(b[:fecwire.HeaderLen])
+								if err := sendSymbol(b); err == nil {
 									sentDgrams++
 									sentBytes += int64(len(b))
 									totalSymbols++
@@ -405,7 +450,38 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		txMu.Unlock()
 		// Emit initial symbols 0..initN-1
 		for esi := 0; esi < initN; esi++ {
-			payload := enc.GenSymbol(uint32(esi))
+			// Avoid per-symbol allocation: build packet in a reusable fixed-size buffer.
+			b := make([]byte, fecwire.HeaderLen+L)
+			pay := b[fecwire.HeaderLen:]
+			// Fast path: for systematic source symbols, avoid the RaptorQ library call.
+			// At high bitrates (e.g., 100 Mbps), per-symbol overhead can dominate and
+			// cap throughput well below the shaped rate. The RaptorQ systematic symbols
+			// are exactly the original data partitioned into L-byte chunks, with the
+			// final symbol padded with zeros if needed.
+			if esi < K {
+				start := esi * L
+				if start < len(blockBytes) {
+					end := start + L
+					if end <= len(blockBytes) {
+						copy(pay, blockBytes[start:end])
+					} else {
+						// Last partial symbol: zero-pad to L bytes.
+						clear(pay)
+						copy(pay, blockBytes[start:])
+					}
+				} else {
+					// Beyond the end of the last partial block: pure padding.
+					clear(pay)
+				}
+			} else {
+				payload := enc.GenSymbol(uint32(esi))
+				if len(payload) == L {
+					copy(pay, payload)
+				} else {
+					clear(pay)
+					copy(pay, payload)
+				}
+			}
 			// Advertise a stable N that doesn't explode with many appends; cap to 255.
 			advN := minInt(255, initN)
 			h := fecwire.FECHeader{
@@ -415,11 +491,9 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 				N:          uint8(advN),
 				K:          uint8(K),
 				SymID:      uint8(esi),
-				PayloadLen: uint32(len(payload)),
+				PayloadLen: uint32(L),
 			}
-			b := make([]byte, fecwire.HeaderLen+len(payload))
-			copy(b[:fecwire.HeaderLen], h.MarshalBinary(nil))
-			copy(b[fecwire.HeaderLen:], payload)
+			h.MarshalBinary(b[:fecwire.HeaderLen])
 			if opts.WarnDgramSize > 0 && len(b) > opts.WarnDgramSize {
 				fmt.Printf("warn: datagram size %d exceeds threshold %d; consider reducing L or header size\n", len(b), opts.WarnDgramSize)
 				opts.WarnDgramSize = 0 // warn once
@@ -428,43 +502,19 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 				// simulate sender drop
 			} else {
 				tSend := time.Now()
-				if opts.Transport == "stream" {
-					// Send on a dedicated uni stream for symbols
-					s, err := conn.OpenUniStream()
-					if err != nil {
+				if err := sendSymbol(b); err != nil {
+					sendErrs++
+					if opts.Transport == "stream" {
 						return err
 					}
-					if _, err := s.Write(b); err != nil {
-						return err
-					}
-					_ = s.Close()
-					sentDgrams++
-					sentBytes += int64(len(b))
-				} else {
-					// Default: datagrams
-					if keepStr != nil {
-						if ackEvery <= 1 || dgramsSinceAck+1 >= ackEvery {
-							select {
-							case ackReq <- struct{}{}:
-							default:
-							}
-							dgramsSinceAck = 0
-						}
-					}
-					if err := conn.SendDatagram(b); err != nil {
-						var dtle *quic.DatagramTooLargeError
-						if errors.As(err, &dtle) {
-							dtleCount++
-						}
-						sendErrs++
-						if err2 := conn.SendDatagram(b); err2 == nil {
-							sentDgrams++
-							sentBytes += int64(len(b))
-						}
-					} else {
+					// For datagrams, attempt a single retry since packet size can shrink temporarily.
+					if err2 := sendSymbol(b); err2 == nil {
 						sentDgrams++
 						sentBytes += int64(len(b))
 					}
+				} else {
+					sentDgrams++
+					sentBytes += int64(len(b))
 				}
 				// pacer: inter-send delta logging (avg every ~200 packets)
 				if !lastSend.IsZero() {
@@ -511,9 +561,11 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 			buf = buf[:K*L]
 		}
 	}
-	// If ARQ is enabled, optionally drain outstanding blocks before closing unless bypassing waits.
-	// This ensures NACK/ACK rounds can complete on high RTT/DDL links.
-	if opts.UseARQ && !bypass {
+	// If ARQ is enabled, drain outstanding blocks before closing.
+	// NOTE: Do not tie reliability to congestion control mode. Skipping this drain can
+	// cause sha256 mismatch / residual erasures when the client exits before ARQ completes.
+	skipDrain := os.Getenv("QUIC_FEC_SKIP_ARQ_DRAIN") == "1"
+	if opts.UseARQ && !skipDrain {
 		// Wait until all active blocks have been ACKed or until a cap.
 		// Base cap defaults to max(PostWait, 3s). If RTT_MS env is present, ensure at least ~10 RTTs (capped at 10s).
 		drainCap := 3 * time.Second
@@ -544,8 +596,8 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
-	// Optional tail wait after ARQ drain; skip when bypassing waits
-	if opts.PostWait > 0 && !bypass {
+	// Optional tail wait after ARQ drain
+	if opts.PostWait > 0 && !skipDrain {
 		time.Sleep(opts.PostWait)
 	}
 	// stop live printer and keepalive goroutine after ARQ drain
@@ -952,22 +1004,31 @@ func (p *pacer) Wait() {
 	p.nextDue = due
 	p.mu.Unlock()
 
-	// Sleep until due. Use a coarse sleep, then fine-yield to improve precision.
+	// Wait until due.
+	// For high-rate pacing (interval < ~2ms), Go's time.Sleep jitter / scheduler granularity
+	// can easily overshoot by hundreds of microseconds, significantly lowering throughput.
+	// In that regime, busy-waiting is the most stable option for experiments.
+	if p.interval < 2*time.Millisecond {
+		for time.Now().Before(due) {
+		}
+		return
+	}
 	for {
 		rem := time.Until(due)
 		if rem <= 0 {
 			return
 		}
-		if rem > 150*time.Microsecond {
-			time.Sleep(rem - 100*time.Microsecond)
+		if rem > 5*time.Millisecond {
+			time.Sleep(rem - 1*time.Millisecond)
 			continue
 		}
-		// Sub-150us: yield in small chunks to avoid burning CPU while improving accuracy.
-		if rem > 50*time.Microsecond {
-			time.Sleep(50 * time.Microsecond)
-		} else {
-			runtime.Gosched()
+		if rem > 800*time.Microsecond {
+			time.Sleep(rem - 400*time.Microsecond)
+			continue
 		}
+		break
+	}
+	for time.Now().Before(due) {
 	}
 }
 

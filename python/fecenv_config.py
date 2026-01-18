@@ -25,6 +25,10 @@ def build_ppo_config(env_name: str = "FECEnv-v0", env_config: Dict[str, Any] | N
     env_config.setdefault("timeout_sec", int(os.environ.get("TIMEOUT_SEC", "30")))
     env_config.setdefault("train_episodes", int(os.environ.get("TRAIN_EPISODES", "300")))
 
+    # Training speed: per-step payload size (bytes). Default is 1 MiB to reduce wall time
+    # while keeping measurements meaningful even at higher RTT.
+    env_config.setdefault("train_file_bytes", int(os.environ.get("TRAIN_FILE_BYTES", str(1 * 1024 * 1024))))
+
     # Curriculum / randomization (helps stabilize PPO on highly non-stationary channels)
     env_config.setdefault("randomize_net_params", os.environ.get("RANDOMIZE_NET_PARAMS", "1") not in ("0", "false", "False"))
     env_config.setdefault("curriculum_warmup_episodes", int(os.environ.get("CURRICULUM_WARMUP_EPISODES", "50")))

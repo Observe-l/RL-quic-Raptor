@@ -85,7 +85,7 @@ def main() -> None:
         "--input",
         type=Path,
         default=Path("python/results/run-20250907-232947/step_metrics.jsonl"),
-        help="Path to step_metrics.jsonl",
+        help="Path to step_metrics.json or step_metrics.jsonl (JSON Lines)",
     )
     parser.add_argument(
         "--out",

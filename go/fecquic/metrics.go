@@ -11,18 +11,41 @@ import (
 
 // Observation mirrors the doc (subset implemented now).
 type Observation struct {
-	GoodputDecodeMbps            float64 `json:"goodput_decode_mbps"`
-	DurationDecodeMs             int64   `json:"duration_decode_ms"`
-	ResidualErasures             int32   `json:"residual_erasures"`
-	FECOverheadPctArrival        float64 `json:"fec_overhead_pct_arrival"`
-	ARQAttemptsMean              float64 `json:"arq_attempts_mean"`
-	ARQAttemptsP95               float64 `json:"arq_attempts_p95"`
-	RxUniqueAtDDLMean            float64 `json:"rx_unique_at_ddl_mean"`
-	RxUniqueAtDDLP95             float64 `json:"rx_unique_at_ddl_p95"`
-	DecodeLatencyP50Ms           float64 `json:"decode_latency_p50_ms"`
-	DecodeLatencyP95Ms           float64 `json:"decode_latency_p95_ms"`
-	ArrivalSymbolRateKppsP95     float64 `json:"arrival_symbol_rate_kpps_p95"`
-	EstimatedAvailableBwMbps     float64 `json:"estimated_available_bw_mbps"`
+	GoodputDecodeMbps float64 `json:"goodput_decode_mbps"`
+	// GoodputArrivalMbps estimates link throughput based on arrival of the last unique
+	// symbol, excluding decoder compute and finalization.
+	GoodputArrivalMbps float64 `json:"goodput_arrival_mbps"`
+	// DurationTransferMs is the wall-clock time from the first unique symbol arrival
+	// to completion (used for goodput estimation).
+	DurationTransferMs int64 `json:"duration_transfer_ms"`
+	// DurationArrivalMs is the wall-clock time from first unique symbol arrival to
+	// last unique symbol arrival.
+	DurationArrivalMs int64 `json:"duration_arrival_ms"`
+	// DurationDecodeMs is the decoder compute time (sum over blocks), in milliseconds.
+	// This matches the common expectation of "raptorq decode time".
+	DurationDecodeMs      int64   `json:"duration_decode_ms"`
+	ResidualErasures      int32   `json:"residual_erasures"`
+	FECOverheadPctArrival float64 `json:"fec_overhead_pct_arrival"`
+	// Arrival-side accounting (unique symbols at receiver)
+	RxTotalSymbols      int64 `json:"rx_total_symbols"`
+	RxRepairSymbols     int64 `json:"rx_repair_symbols"`
+	RxSourceSymbols     int64 `json:"rx_source_symbols"`
+	RxTotalSymbolBytes  int64 `json:"rx_total_symbol_bytes"`
+	RxRepairSymbolBytes int64 `json:"rx_repair_symbol_bytes"`
+	RxSourceSymbolBytes int64 `json:"rx_source_symbol_bytes"`
+	// Control-plane accounting (server->client ARQ messages)
+	CtrlTxBytes              int64   `json:"ctrl_tx_bytes"`
+	CtrlTxAckMsgs            int64   `json:"ctrl_tx_ack_msgs"`
+	CtrlTxNackMsgs           int64   `json:"ctrl_tx_nack_msgs"`
+	CtrlTxDroppedMsgs        int64   `json:"ctrl_tx_dropped_msgs"`
+	ARQAttemptsMean          float64 `json:"arq_attempts_mean"`
+	ARQAttemptsP95           float64 `json:"arq_attempts_p95"`
+	RxUniqueAtDDLMean        float64 `json:"rx_unique_at_ddl_mean"`
+	RxUniqueAtDDLP95         float64 `json:"rx_unique_at_ddl_p95"`
+	DecodeLatencyP50Ms       float64 `json:"decode_latency_p50_ms"`
+	DecodeLatencyP95Ms       float64 `json:"decode_latency_p95_ms"`
+	ArrivalSymbolRateKppsP95 float64 `json:"arrival_symbol_rate_kpps_p95"`
+	EstimatedAvailableBwMbps float64 `json:"estimated_available_bw_mbps"`
 }
 
 // serverMetrics collects metrics on the server.
@@ -31,6 +54,7 @@ type serverMetrics struct {
 
 	fileBytes int
 	t0First   time.Time
+	tLastUniq time.Time
 	gotFirst  bool
 
 	// arrival windows (200ms buckets, 10 buckets => 2s horizon)
@@ -44,9 +68,20 @@ type serverMetrics struct {
 	decodeLatencyMs []int64 // per-cluster latency ms
 	attempts        []int   // attempts at success
 
+	// decoder compute time (sum over blocks)
+	decodeComputeTotalNs int64
+
 	// totals for arrival-side overhead
-	totalSymbols  int64
-	repairSymbols int64
+	totalSymbols      int64
+	repairSymbols     int64
+	totalSymbolBytes  int64
+	repairSymbolBytes int64
+
+	// control-plane accounting (server -> client)
+	ctrlTxBytes       int64
+	ctrlTxAckMsgs     int64
+	ctrlTxNackMsgs    int64
+	ctrlTxDroppedMsgs int64
 }
 
 type arrBucket struct {
@@ -82,8 +117,11 @@ func (m *serverMetrics) OnUniqueSymbol(nBytes int, when time.Time, isRepair bool
 	}
 	if isRepair {
 		m.repairSymbols++
+		m.repairSymbolBytes += int64(nBytes)
 	}
 	m.totalSymbols++
+	m.totalSymbolBytes += int64(nBytes)
+	m.tLastUniq = when
 	if !m.startTick.IsZero() {
 		// compute bucket index
 		delta := when.Sub(m.startTick)
@@ -111,6 +149,25 @@ func (m *serverMetrics) OnUniqueSymbol(nBytes int, when time.Time, isRepair bool
 	m.mu.Unlock()
 }
 
+func (m *serverMetrics) OnCtrlTx(nBytes int, msgType string, dropped bool) {
+	m.mu.Lock()
+	if nBytes > 0 {
+		m.ctrlTxBytes += int64(nBytes)
+	}
+	if dropped {
+		m.ctrlTxDroppedMsgs++
+		m.mu.Unlock()
+		return
+	}
+	switch msgType {
+	case "ack":
+		m.ctrlTxAckMsgs++
+	case "nack":
+		m.ctrlTxNackMsgs++
+	}
+	m.mu.Unlock()
+}
+
 func (m *serverMetrics) OnDDLTick(rxUnique int) {
 	m.mu.Lock()
 	m.ddlSamples = append(m.ddlSamples, rxUnique)
@@ -130,22 +187,48 @@ func (m *serverMetrics) OnClusterDecoded(firstSeen time.Time, when time.Time, at
 	m.mu.Unlock()
 }
 
+// OnDecodeComputeNs records decoder compute time for a successfully decoded block.
+func (m *serverMetrics) OnDecodeComputeNs(ns int64) {
+	m.mu.Lock()
+	if ns > 0 {
+		m.decodeComputeTotalNs += ns
+	}
+	m.mu.Unlock()
+}
+
 func (m *serverMetrics) Snapshot(now time.Time) Observation {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	var durMs int64
+	var durTransferMs int64
 	var goodput float64
+	var durArrivalMs int64
+	var goodputArrival float64
 	if m.gotFirst {
-		durMs = now.Sub(m.t0First).Milliseconds()
-		durSec := float64(durMs) / 1000.0
+		durTransferMs = now.Sub(m.t0First).Milliseconds()
+		durSec := float64(durTransferMs) / 1000.0
 		if durSec > 1e-9 {
 			goodput = (float64(m.fileBytes) * 8.0 / 1e6) / durSec
+		}
+		if !m.tLastUniq.IsZero() {
+			durArrivalMs = m.tLastUniq.Sub(m.t0First).Milliseconds()
+			durArrivalSec := float64(durArrivalMs) / 1000.0
+			if durArrivalSec > 1e-9 {
+				goodputArrival = (float64(m.fileBytes) * 8.0 / 1e6) / durArrivalSec
+			}
 		}
 	}
 	// arrival-side overhead
 	var overPct float64
 	if m.totalSymbols > 0 {
 		overPct = float64(m.repairSymbols) / float64(m.totalSymbols) * 100.0
+	}
+	rxSourceSymbols := m.totalSymbols - m.repairSymbols
+	if rxSourceSymbols < 0 {
+		rxSourceSymbols = 0
+	}
+	rxSourceBytes := m.totalSymbolBytes - m.repairSymbolBytes
+	if rxSourceBytes < 0 {
+		rxSourceBytes = 0
 	}
 	// attempts mean/p95
 	meanAttempts, p95Attempts := meanAndP(intsToFloat(m.attempts), 0.95)
@@ -194,18 +277,31 @@ func (m *serverMetrics) Snapshot(now time.Time) Observation {
 		}
 	}
 	return Observation{
-		GoodputDecodeMbps:            goodput,
-		DurationDecodeMs:             durMs,
-		ResidualErasures:             0, // non-residual path only; finalize checks integrity
-		FECOverheadPctArrival:        overPct,
-		ARQAttemptsMean:              meanAttempts,
-		ARQAttemptsP95:               p95Attempts,
-		RxUniqueAtDDLMean:            meanDDL,
-		RxUniqueAtDDLP95:             p95DDL,
-		DecodeLatencyP50Ms:           p50Dec,
-		DecodeLatencyP95Ms:           p95Dec,
-		ArrivalSymbolRateKppsP95:     (float64(symSum) / (float64(n) * bucketSec)) / 1000.0,
-		EstimatedAvailableBwMbps:     estBW,
+		GoodputDecodeMbps:        goodput,
+		GoodputArrivalMbps:       goodputArrival,
+		DurationTransferMs:       durTransferMs,
+		DurationArrivalMs:        durArrivalMs,
+		DurationDecodeMs:         (m.decodeComputeTotalNs + 999_999) / 1_000_000, // ceil(ns->ms)
+		ResidualErasures:         0,                                              // non-residual path only; finalize checks integrity
+		FECOverheadPctArrival:    overPct,
+		RxTotalSymbols:           m.totalSymbols,
+		RxRepairSymbols:          m.repairSymbols,
+		RxSourceSymbols:          rxSourceSymbols,
+		RxTotalSymbolBytes:       m.totalSymbolBytes,
+		RxRepairSymbolBytes:      m.repairSymbolBytes,
+		RxSourceSymbolBytes:      rxSourceBytes,
+		CtrlTxBytes:              m.ctrlTxBytes,
+		CtrlTxAckMsgs:            m.ctrlTxAckMsgs,
+		CtrlTxNackMsgs:           m.ctrlTxNackMsgs,
+		CtrlTxDroppedMsgs:        m.ctrlTxDroppedMsgs,
+		ARQAttemptsMean:          meanAttempts,
+		ARQAttemptsP95:           p95Attempts,
+		RxUniqueAtDDLMean:        meanDDL,
+		RxUniqueAtDDLP95:         p95DDL,
+		DecodeLatencyP50Ms:       p50Dec,
+		DecodeLatencyP95Ms:       p95Dec,
+		ArrivalSymbolRateKppsP95: (float64(symSum) / (float64(n) * bucketSec)) / 1000.0,
+		EstimatedAvailableBwMbps: estBW,
 	}
 }
 

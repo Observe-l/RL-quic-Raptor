@@ -97,6 +97,19 @@ def main():
 
     algo = cfg.build(logger_creator=_logger_creator)
 
+    def _get_reward_mean(result: dict) -> float:
+        # RLlib result schema changed across versions. Prefer the env_runners section
+        # (ray>=2.3), then fall back to legacy top-level keys.
+        try:
+            v = (result.get("env_runners") or {}).get("episode_reward_mean")
+            if v is None:
+                v = result.get("episode_reward_mean")
+            if v is None:
+                v = result.get("episode_return_mean")
+            return float(v or 0.0)
+        except Exception:
+            return 0.0
+
     # Training loop: save a checkpoint every episode (assumes 1 episode per iteration)
     # Total episodes controlled via config (train_episodes)
     total_episodes = int(resolved_env_cfg.get("train_episodes", 1))
@@ -128,8 +141,8 @@ def main():
         except Exception:
             ckpt_path = None
 
-        # Track top-10 by episode_reward_mean
-        score = float(result.get("episode_reward_mean") or 0.0)
+        # Track top-10 by episode reward mean
+        score = _get_reward_mean(result)
         if ckpt_path:
             heapq.heappush(best_k, (score, ckpt_dir))
             if len(best_k) > 10:

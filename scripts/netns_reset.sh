@@ -28,4 +28,15 @@ sudo ip netns exec "$NS" ip addr add 10.10.0.2/24 dev veth1
 sudo ip netns exec "$NS" ip link set veth1 up
 sudo ip netns exec "$NS" ip link set lo up
 
+# Some environments (e.g., Cisco Secure Client VPN) install an iptables chain
+# that drops traffic by default. Allow local traffic over veth0 so the host
+# client can reach the server in the netns.
+if sudo iptables -S ciscovpn &>/dev/null; then
+  # Insert at top to ensure it matches before any DROP.
+  sudo iptables -C ciscovpn -o veth0 -s 10.10.0.1/32 -d 10.10.0.2/32 -j RETURN 2>/dev/null || \
+    sudo iptables -I ciscovpn 1 -o veth0 -s 10.10.0.1/32 -d 10.10.0.2/32 -j RETURN
+  sudo iptables -C ciscovpn -i veth0 -s 10.10.0.2/32 -d 10.10.0.1/32 -j RETURN 2>/dev/null || \
+    sudo iptables -I ciscovpn 1 -i veth0 -s 10.10.0.2/32 -d 10.10.0.1/32 -j RETURN
+fi
+
 echo "reset netns $NS with veth0(10.10.0.1)<->veth1(10.10.0.2)"

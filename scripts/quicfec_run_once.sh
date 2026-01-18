@@ -14,7 +14,7 @@ set -euo pipefail
 #               #   iid:5           (5% i.i.d. loss)
 #               #   gemodel:p,r,h,k (Gilbert-Elliott model, percents)
 #   FILE=$ROOT/go/test_data/train_FD001.txt
-#   K=40, SYMBOL_BYTES=1200, R0=6, W=8, DDL_MS=50, RSTEP=4, ALPHA=0.6, ACK_EVERY=8, MAX_ATTEMPTS=8
+#   K=40, SYMBOL_BYTES=1200, R0=6, W=8, DDL_MS=150, RSTEP=4, ALPHA=0.6, ACK_EVERY=8, MAX_ATTEMPTS=8
 #   OBS_JSONL=/tmp/quicfec_rl.jsonl
 #   POST_WAIT=0s (linger after client send; keep at 0s for fastest runs)
 #   SRV_TIMEOUT=10s (server max lifetime; lower keeps runs bounded)
@@ -36,14 +36,15 @@ OBS_JSONL=${OBS_JSONL:-/tmp/quicfec_rl.jsonl}
 
 K=${K:-30}
 SYMBOL_BYTES=${SYMBOL_BYTES:-1032}
-R0=${R0:-60}
-W=${W:-18}
+R0=${R0:-6}
+W=${W:-8}
 DDL_MS=${DDL_MS:-900}
-RSTEP=${RSTEP:-8}
-ALPHA=${ALPHA:-0.4}
+RSTEP=${RSTEP:-4}
+ALPHA=${ALPHA:-0.6}
 ACK_EVERY=${ACK_EVERY:-8}
 MAX_ATTEMPTS=${MAX_ATTEMPTS:-0}
-PACE_US=${PACE_US:-0}
+PACE_US=${PACE_US:-}
+TRANSPORT=${TRANSPORT:-dgram}
 if [[ -z "${POST_WAIT+x}" || -z "${POST_WAIT}" ]]; then
   # Default linger: ~3*RTT, clamped to [200ms, 800ms] to let tail datagrams/ARQ settle
   WAIT_MS=$(( RTT_MS * 3 ))
@@ -61,8 +62,7 @@ if [[ -z "${OBS_WAIT_SECS:-}" ]]; then
   fi
 fi
 
-# Allow overriding DDL via env; default aligns with DDL_MS used elsewhere
-DDL_MS=${DDL_MS:-150}
+# DDL_MS already defaulted above; kept here historically but now intentionally a no-op.
 
 chmod +x "$ROOT/scripts"/*.sh || true
 mkdir -p "$ROOT/go/test_data"
@@ -79,6 +79,16 @@ fi
 
 # Reset netns and (re)build binaries
 "$ROOT/scripts/netns_reset.sh" "$NS"
+
+# Quic-go attempts to increase UDP socket buffers. If the kernel caps are low,
+# this can cause drops under bursty senders (even when LOSS_PCT=0), which shows up
+# as run-to-run instability / occasional residual erasures.
+TUNE_UDP_BUFFERS=${TUNE_UDP_BUFFERS:-1}
+if [[ "${TUNE_UDP_BUFFERS}" == "1" ]]; then
+  # Best-effort: keep silent and don't fail the run if sysctl is restricted.
+  sudo sysctl -w net.core.rmem_max=33554432 net.core.wmem_max=33554432 >/dev/null 2>&1 || true
+  sudo sysctl -w net.core.rmem_default=33554432 net.core.wmem_default=33554432 >/dev/null 2>&1 || true
+fi
 # Rebuild if forced, binaries missing, or any Go source is newer than the binaries
 NEED_BUILD=0
 if [[ "${FORCE_BUILD:-0}" == "1" || ! -x "$BIN_DIR/quicfec-server" || ! -x "$BIN_DIR/quicfec-client" ]]; then
@@ -132,10 +142,14 @@ sleep 0.1
 
 # Run client (logs in /tmp/quic_fec_cli.*)
 CLI_LOG=$(mktemp -t quic_fec_cli.XXXXXX.log)
-export QUIC_FEC_CC_BYPASS=1
+export QUIC_FEC_CC_BYPASS=${QUIC_FEC_CC_BYPASS:-1}
 START=$(date +%s%N)
 pace_arg=""
-if [[ "${PACE_US:-0}" -le 0 ]]; then
+# Pacing:
+# - If PACE_US is unset, auto-compute an inter-packet gap targeting BITRATE_MBPS.
+# - If PACE_US=0, disable app-level pacing and rely on QUIC + tc shaping.
+# - If PACE_US>0, use the provided microsecond gap.
+if [[ -z "${PACE_US}" ]]; then
   # Auto pace: approximate dgram size (symbol + FEC header + QUIC/UDP/IP overhead)
   # Use a conservative +64B overhead fudge.
   local_sz=$(( SYMBOL_BYTES + 64 ))
@@ -143,17 +157,18 @@ if [[ "${PACE_US:-0}" -le 0 ]]; then
   # Simplifies to us = (bytes*8) / (Mbps)
   if [[ ${BITRATE_MBPS} -gt 0 && ${local_sz} -gt 0 ]]; then
     PACE_US=$(( (local_sz * 8 + BITRATE_MBPS - 1) / BITRATE_MBPS ))
-    # Clamp to a minimum of 200us to avoid tight spinning on very high rates
-    if [[ ${PACE_US} -lt 200 ]]; then PACE_US=200; fi
+    # Clamp to a minimum to avoid tight spinning on very high rates.
+    # For high-rate experiments (e.g., 100 Mbps), 200us would cap throughput too low.
+    if [[ ${PACE_US} -lt 50 ]]; then PACE_US=50; fi
   else
     PACE_US=0
   fi
 fi
-if [[ "${PACE_US}" -gt 0 ]]; then
+if [[ -n "${PACE_US}" && "${PACE_US}" -gt 0 ]]; then
   pace_arg="-pace ${PACE_US}us"
 fi
 "$BIN_DIR/quicfec-client" -addr 10.10.0.2:$PORT -file "$FILE" -N $((K+R0)) -K "$K" -L "$SYMBOL_BYTES" \
-  -post-wait "$POST_WAIT" -ack-every "$ACK_EVERY" -dgram-warn 1400 -arq -R0 "$R0" -W "$W" -Rstep "$RSTEP" -alpha "$ALPHA" -max-attempts "$MAX_ATTEMPTS" -loss 0 $pace_arg \
+  -post-wait "$POST_WAIT" -ack-every "$ACK_EVERY" -dgram-warn 1400 -transport "$TRANSPORT" -arq -R0 "$R0" -W "$W" -Rstep "$RSTEP" -alpha "$ALPHA" -max-attempts "$MAX_ATTEMPTS" -loss 0 $pace_arg \
   >"$CLI_LOG" 2>&1 || true
 END=$(date +%s%N)
 
@@ -224,15 +239,15 @@ if [[ -n "$S_LINE" ]]; then
 fi
 
 # Cleanup temp logs
-# Keep logs when a failure occurs (no RL_OBS) or residual_erasures=1; otherwise clean up
-if [[ -n "$RL_OBS" && "$KEEP_LOGS" == "0" ]]; then
-  rm -f "$CLI_LOG" "$SRV_LOG"
-fi
-
-# If BG=1, print log locations and return immediately so caller can tail /tmp/quic_fec*
+# - Keep logs when a failure occurs (no RL_OBS) or residual_erasures=1.
+# - Also keep logs when BG=1 (debug mode).
 if [[ "${BG:-0}" == "1" ]]; then
   echo "[bg] server log: $SRV_LOG" >&2
   echo "[bg] client log: $CLI_LOG" >&2
+else
+  if [[ -n "$RL_OBS" && "$KEEP_LOGS" == "0" ]]; then
+    rm -f "$CLI_LOG" "$SRV_LOG"
+  fi
 fi
 
 exit 0

@@ -56,6 +56,11 @@ type rxBlock struct {
 	syms map[int][]byte
 	// metrics timestamps
 	firstSeen time.Time
+	// ARQ de-bounce state
+	lastNackAt       time.Time
+	lastNackRxUnique int
+	nackBackoff      time.Duration
+	unseenNackSent   bool
 }
 
 // rxManager owns memory accounting, blocks, decode and write queues.
@@ -104,6 +109,8 @@ type rxManager struct {
 	ctrlWG  sync.WaitGroup
 	// server metrics aggregator
 	met *serverMetrics
+	// first arrival timestamp (for missing-block ARQ heuristics)
+	t0First time.Time
 
 	// tracking for missing blocks to NACK
 	minSeen int  // first seen block id
@@ -228,7 +235,11 @@ func (m *rxManager) start(rx RXOptions) {
 						m.mu.Unlock()
 						continue
 					}
-					m.decTimeTotal.Add(time.Since(t0).Milliseconds())
+					decNs := time.Since(t0).Nanoseconds()
+					m.decTimeTotal.Add((decNs + 999_999) / 1_000_000) // keep existing ms counter for debug
+					if m.met != nil {
+						m.met.OnDecodeComputeNs(decNs)
+					}
 					// schedule a single contiguous write for this block
 					off := int64(int(b.id) * b.K * b.L)
 					m.writeQ <- writeTask{off: off, data: bytes}
@@ -262,11 +273,18 @@ func (m *rxManager) start(rx RXOptions) {
 							UsedRepairs:     uint16(usedRep),
 							DecodeLatencyMs: uint32(time.Since(t0).Milliseconds()),
 						})
+						payload := buf.Bytes()
 						// non-blocking enqueue; drop if full (next events will resend state)
+						dropped := false
 						select {
-						case m.ctrlOut <- buf.Bytes():
+						case m.ctrlOut <- payload:
+							// ok
 						default:
+							dropped = true
 							fmt.Fprintf(os.Stderr, "[arq] ctrl queue full, dropping ACK block=%d\n", b.id)
+						}
+						if m.met != nil {
+							m.met.OnCtrlTx(len(payload), "ack", dropped)
 						}
 						fmt.Fprintf(os.Stderr, "[arq] ack block=%d rx_unique=%d used_rep=%d attempt=%d\n", b.id, rxUnique, usedRep, b.attempt)
 					}
@@ -281,6 +299,8 @@ func (m *rxManager) start(rx RXOptions) {
 		// Faster scheduler tick for more responsive ARQ without large sleeps.
 		t := time.NewTicker(1 * time.Millisecond)
 		defer t.Stop()
+		minSeenNack := 20 * time.Millisecond
+		minUnseenNack := 200 * time.Millisecond
 		for {
 			select {
 			case <-m.stopCh:
@@ -306,16 +326,72 @@ func (m *rxManager) start(rx RXOptions) {
 				if now.After(b.nextDDL) || now.Equal(b.nextDDL) {
 					// Calculate NACK recommendation under lock for deficit cases.
 					if m.ctrlOut != nil {
-						deficit := b.K - len(b.syms)
+						rxu := len(b.syms)
+						deficit := b.K - rxu
 						if deficit > 0 {
-							// Only count ARQ attempts when we actually need more symbols
-							b.attempt++
-							// Be more aggressive: ask for at least the deficit (min 4)
-							rec := deficit
-							if rec < 4 {
-								rec = 4
+							// Debounce: avoid spamming NACKs when nothing changes.
+							// - For seen blocks: allow NACK after a short grace and then with backoff.
+							// - For unseen placeholders: send at most once (or very rarely) only when
+							//   the block ID is within the observed range.
+							canNack := false
+							if !b.firstSeen.IsZero() {
+								// Seen block: require a minimum time since first symbol.
+								if now.Sub(b.firstSeen) >= minSeenNack {
+									if b.nackBackoff <= 0 {
+										b.nackBackoff = m.ddl
+									}
+									// If progress since last NACK, reset backoff.
+									if rxu > b.lastNackRxUnique {
+										b.nackBackoff = m.ddl
+									}
+									if b.lastNackAt.IsZero() || now.Sub(b.lastNackAt) >= b.nackBackoff {
+										canNack = true
+									}
+								}
+							} else {
+								// Unseen placeholder: only NACK if block is within [minSeen,maxSeen]
+								// (i.e., we have evidence it should exist), and rate-limit heavily.
+								// If totalBlocks is known, use [0,totalBlocks) so missing tail blocks are recoverable.
+								inRange := false
+								if m.totalBlocks > 0 {
+									inRange = int(b.id) >= 0 && int(b.id) < m.totalBlocks
+								} else {
+									inRange = (m.minSeen >= 0 && int(b.id) >= m.minSeen && int(b.id) <= m.maxSeen)
+								}
+								if inRange && !m.t0First.IsZero() && now.Sub(m.t0First) >= minUnseenNack {
+									if !b.unseenNackSent {
+										canNack = true
+									} else if !b.lastNackAt.IsZero() && now.Sub(b.lastNackAt) >= 4*m.ddl {
+										// very slow retry
+										canNack = true
+									}
+								}
 							}
-							nacks = append(nacks, nackMsg{blockID: b.id, attempt: b.attempt, rxu: len(b.syms), rec: rec, send: true})
+							if canNack {
+								// Only count ARQ attempts when we actually send a NACK.
+								b.attempt++
+								// Recommend at least the deficit (min 4)
+								rec := deficit
+								if rec < 4 {
+									rec = 4
+								}
+								nacks = append(nacks, nackMsg{blockID: b.id, attempt: b.attempt, rxu: rxu, rec: rec, send: true})
+								// Update per-block debounce state.
+								if b.firstSeen.IsZero() {
+									b.unseenNackSent = true
+								}
+								// Exponential backoff if no progress.
+								if rxu <= b.lastNackRxUnique {
+									if b.nackBackoff <= 0 {
+										b.nackBackoff = m.ddl
+									}
+									b.nackBackoff = minDur(4*m.ddl, 2*b.nackBackoff)
+								} else {
+									b.nackBackoff = m.ddl
+								}
+								b.lastNackAt = now
+								b.lastNackRxUnique = rxu
+							}
 						}
 					}
 					// Only queue for decode when we have at least K uniques (decoder likely to succeed).
@@ -352,13 +428,19 @@ func (m *rxManager) start(rx RXOptions) {
 					RecommendExtra: uint16(n.rec),
 					Reason:         0,
 				})
+				payload := buf.Bytes()
 				// non-blocking send; if closed or full, skip
+				dropped := false
 				select {
 				case <-m.stopCh:
 					return
-				case m.ctrlOut <- buf.Bytes():
+				case m.ctrlOut <- payload:
 				default:
 					// best-effort: drop if queue full
+					dropped = true
+				}
+				if m.met != nil {
+					m.met.OnCtrlTx(len(payload), "nack", dropped)
 				}
 				fmt.Fprintf(os.Stderr, "[arq] nack block=%d rx_unique=%d rec_extra=%d attempt=%d\n", n.blockID, n.rxu, n.rec, n.attempt)
 			}
@@ -545,6 +627,9 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 	// metrics: mark first unique for this block and file + arrival counts
 	if b.firstSeen.IsZero() {
 		b.firstSeen = time.Now()
+		if m.t0First.IsZero() {
+			m.t0First = b.firstSeen
+		}
 	}
 	if m.met != nil {
 		now := time.Now()
@@ -553,7 +638,92 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 			m.met.OnFirstUniqueSymbol(now)
 		}
 	}
+
+	// Fast path for systematic delivery: if we have all source symbols (0..K-1),
+	// we can reconstruct the block directly without running RaptorQ decode.
+	// This avoids unnecessary ARQ rounds and extra repairs on low/no-loss links.
+	var sysSyms [][]byte
+	var sysOff int64
+	var sysDataSize int
+	var sysRxUnique int
+	var sysUsedRep int
+	var sysAttempt int
+	var sysFirstSeen time.Time
+	var sysBlockID uint16
+	if !b.done && b.K > 0 && K > 0 && len(b.syms) >= K {
+		complete := true
+		for i := 0; i < K; i++ {
+			if _, ok := b.syms[i]; !ok {
+				complete = false
+				break
+			}
+		}
+		if complete {
+			sysSyms = make([][]byte, K)
+			for i := 0; i < K; i++ {
+				sysSyms[i] = b.syms[i]
+			}
+			sysOff = int64(int(b.id) * b.K * b.L)
+			sysDataSize = b.dataSize
+			sysRxUnique = len(b.syms)
+			sysUsedRep = max(0, sysRxUnique-b.K)
+			sysAttempt = b.attempt
+			sysFirstSeen = b.firstSeen
+			sysBlockID = b.id
+			// Release memory and mark done under lock.
+			for _, pp := range b.syms {
+				m.inUse.Add(int64(-len(pp)))
+			}
+			b.syms = nil
+			b.done = true
+			delete(m.blocks, b.id)
+			m.completed[b.id] = struct{}{}
+		}
+	}
 	m.mu.Unlock()
+
+	if sysSyms != nil {
+		// Assemble bytes in ESI order and enqueue a write.
+		out := make([]byte, sysDataSize)
+		pos := 0
+		for i := 0; i < len(sysSyms) && pos < len(out); i++ {
+			chunk := sysSyms[i]
+			if len(chunk) > len(out)-pos {
+				chunk = chunk[:len(out)-pos]
+			}
+			copy(out[pos:], chunk)
+			pos += len(chunk)
+		}
+		m.writeQ <- writeTask{off: sysOff, data: out}
+		m.decBlocks.Add(1)
+		if m.met != nil {
+			m.met.OnClusterDecoded(sysFirstSeen, time.Now(), sysAttempt, sysUsedRep)
+		}
+		if m.ctrlOut != nil {
+			var buf bytespkg.Buffer
+			_ = writeAck(&buf, AckSuccess{
+				FileID:          0,
+				ClusterID:       uint32(sysBlockID),
+				AttemptIdx:      uint16(sysAttempt),
+				RxUnique:        uint16(sysRxUnique),
+				UsedRepairs:     uint16(sysUsedRep),
+				DecodeLatencyMs: 0,
+			})
+			payload := buf.Bytes()
+			dropped := false
+			select {
+			case m.ctrlOut <- payload:
+			default:
+				dropped = true
+				fmt.Fprintf(os.Stderr, "[arq] ctrl queue full, dropping ACK block=%d\n", sysBlockID)
+			}
+			if m.met != nil {
+				m.met.OnCtrlTx(len(payload), "ack", dropped)
+			}
+			fmt.Fprintf(os.Stderr, "[arq] ack block=%d rx_unique=%d used_rep=%d attempt=%d\n", sysBlockID, sysRxUnique, sysUsedRep, sysAttempt)
+		}
+		return true
+	}
 
 	// feed decoder; if decoder reports readiness, queue a decode
 	b.decMu.Lock()
@@ -655,6 +825,13 @@ func (m *rxManager) closeAndFinalize(expectedSHA [32]byte) (string, error) {
 // helpers
 func max(a, b int) int {
 	if a > b {
+		return a
+	}
+	return b
+}
+
+func minDur(a, b time.Duration) time.Duration {
+	if a < b {
 		return a
 	}
 	return b

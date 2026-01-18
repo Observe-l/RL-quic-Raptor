@@ -43,7 +43,16 @@ class Action:
 
 
 class QuicFecRunner:
-    def __init__(self, root: str | None = None, ns: str = "qns", timeout_sec: int = 15):
+    def __init__(
+        self,
+        root: str | None = None,
+        ns: str = "qns",
+        timeout_sec: int = 15,
+        train_file_bytes: int | None = None,
+        post_wait: str = "0ms",
+        srv_timeout: str = "12s",
+        obs_wait_secs: int | None = None,
+    ):
         self.root = root or os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         self.ns = ns
         # Only use the shaped runner script (no local mode)
@@ -52,6 +61,33 @@ class QuicFecRunner:
         self.last_cfg = None
         self.timeout_sec = int(timeout_sec)
         self.pace_us = 200
+        self.train_file_bytes = int(train_file_bytes) if train_file_bytes is not None else None
+        self.post_wait = str(post_wait)
+        self.srv_timeout = str(srv_timeout)
+        self.obs_wait_secs = int(obs_wait_secs) if obs_wait_secs is not None else None
+        self._train_file_path: Optional[str] = None
+
+    def _ensure_train_file(self) -> Optional[str]:
+        if self.train_file_bytes is None:
+            return None
+        if self._train_file_path and os.path.exists(self._train_file_path):
+            return self._train_file_path
+
+        size = int(self.train_file_bytes)
+        if size <= 0:
+            return None
+
+        # Use a per-process path to avoid clashes between parallel Ray workers.
+        path = f"/tmp/quicfec_train_{size}_pid{os.getpid()}.bin"
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        except Exception:
+            pass
+        # Create a deterministic, fast-to-generate file (zeros; may be sparse).
+        with open(path, "wb") as f:
+            f.truncate(size)
+        self._train_file_path = path
+        return path
 
     def reset(self, cfg: EnvConfig) -> Dict[str, Any]:
         self.last_cfg = cfg
@@ -59,6 +95,7 @@ class QuicFecRunner:
         # If we don't fail fast here, training will continue with default observations
         # (and constant negative rewards), which looks like "training runs" but is meaningless.
         self._sudo_ensure()
+        self._ensure_train_file()
         return {"ok": True}
 
     def step(self, action: Action, rtt_ms: int, loss_pct: int, bitrate_mbps: Optional[int] = None, loss_mode: Optional[str] = None) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
@@ -82,12 +119,35 @@ class QuicFecRunner:
         env["ALPHA"] = str(float(action.alpha))
         env["EPSILON"] = str(int(action.epsilon))
         env["INTERLEAVER_SPAN"] = str(int(action.interleaver_span))
+        # Harness uses PACE_US (not PACING_US). Keep PACING_* for debugging, but set PACE_US for effect.
         env["PACING_GAIN"] = str(float(action.pacing_gain))
         env["PACING_US"] = str(np.round(float(action.pacing_gain * self.pace_us)))
+        env["PACE_US"] = str(int(np.round(float(action.pacing_gain * self.pace_us))))
+
+        # Congestion control mode: "bypass" uses a NoopSender in quic-go (lab-only).
+        # For higher goodput and fewer internal drops on shaped links, prefer CC enabled.
+        cc_mode = (self.last_cfg.cc_mode if self.last_cfg else "bypass")
+        env["QUIC_FEC_CC_BYPASS"] = "1" if cc_mode == "bypass" else "0"
+
+        # Transport selection: datagrams are unreliable; streams are reliable.
+        datagrams_enabled = bool(self.last_cfg.datagrams_enabled if self.last_cfg else True)
+        env.setdefault("TRANSPORT", "dgram" if datagrams_enabled else "stream")
         env["ACK_EVERY"] = os.environ.get("ACK_EVERY", "8")
         env["MAX_ATTEMPTS"] = os.environ.get("MAX_ATTEMPTS", "8")
         env["OUT_RAW"] = "/tmp/rl_arq_raw.csv"
         env["OUT_AGG"] = "/tmp/rl_arq_agg.csv"
+
+        # Training speed knobs: keep each trial bounded and avoid linger.
+        # The harness defaults POST_WAIT to ~3*RTT to let ARQ settle, but for RL
+        # we prefer faster feedback.
+        env.setdefault("POST_WAIT", self.post_wait)
+        env.setdefault("SRV_TIMEOUT", self.srv_timeout)
+        if self.obs_wait_secs is not None:
+            env.setdefault("OBS_WAIT_SECS", str(int(self.obs_wait_secs)))
+
+        train_file = self._ensure_train_file()
+        if train_file:
+            env["FILE"] = train_file
 
         lm = (loss_mode or (self.last_cfg.loss_profile if self.last_cfg else None))
         if lm:
@@ -150,8 +210,16 @@ class QuicFecRunner:
         return {
             "goodput_decode_mbps": 0.0,
             "duration_decode_ms": 2000.0 if timeout else 1500.0,
+            "duration_transfer_ms": 2000.0 if timeout else 1500.0,
             "residual_erasures": 1,
             "fec_overhead_pct_arrival": 0.0,
+            "rx_total_symbols": 0,
+            "rx_repair_symbols": 0,
+            "rx_total_symbol_bytes": 0,
+            "ctrl_tx_bytes": 0,
+            "ctrl_tx_ack_msgs": 0,
+            "ctrl_tx_nack_msgs": 0,
+            "ctrl_tx_dropped_msgs": 0,
             "arq_attempts_mean": 2.0,
             "arq_attempts_p95": 3.0,
             "rx_unique_at_ddl_mean": 0.0,
@@ -201,8 +269,16 @@ class FecEnv(gym.Env):
         self._obs_keys: List[str] = [
             "goodput_decode_mbps",
             "duration_decode_ms",
+            "duration_transfer_ms",
             "residual_erasures",
             "fec_overhead_pct_arrival",
+            "rx_total_symbols",
+            "rx_repair_symbols",
+            "rx_total_symbol_bytes",
+            "ctrl_tx_bytes",
+            "ctrl_tx_ack_msgs",
+            "ctrl_tx_nack_msgs",
+            "ctrl_tx_dropped_msgs",
             "arq_attempts_mean",
             "arq_attempts_p95",
             "rx_unique_at_ddl_mean",
@@ -252,10 +328,17 @@ class FecEnv(gym.Env):
         self._base_rtt_ms = int(self._rtt_ms)
         self._base_loss_pct = int(self._loss_pct)
         self._base_loss_mode = str(self._loss_mode)
-        # Fix physical capacity to 10 Mbps
-        self._bitrate_mbps = 10
-        self._capacity_mbps = 10.0
+
+        # Link capacity / shaping rate (Mbps)
+        self._bitrate_mbps = int(cfg.get("bitrate_mbps", 10))
+        self._capacity_mbps = float(self._bitrate_mbps)
         self._result_dir_hint = cfg.get("result_dir")
+
+        # Logging controls (step_metrics.json is JSONL)
+        # - log_obs_vec: large; disable by default to avoid bloating logs.
+        # - log_raw_obs_full: if False, only log the observation keys used by the policy.
+        self._log_obs_vec = bool(cfg.get("log_obs_vec", False))
+        self._log_raw_obs_full = bool(cfg.get("log_raw_obs_full", False))
 
         # Action mapping ranges from [-1,1] → [low, high]
         # Action order: K, symbol_bytes, R0_pct, R_step, W, ddl_ms, alpha, pacing_gain
@@ -263,7 +346,10 @@ class FecEnv(gym.Env):
         self._high = np.array([64, 1188, 1.00, 20, 20, 600, 1.1, 2], dtype=np.float32)
 
         # Runner
-        self._runner = QuicFecRunner(timeout_sec=int(cfg.get("timeout_sec", 30)))
+        self._runner = QuicFecRunner(
+            timeout_sec=int(cfg.get("timeout_sec", 30)),
+            train_file_bytes=(int(cfg.get("train_file_bytes")) if cfg.get("train_file_bytes") is not None else None),
+        )
         self._runner.reset(
             EnvConfig(
                 datagrams_enabled=True,
@@ -423,15 +509,26 @@ class FecEnv(gym.Env):
         )
         try:
             os.makedirs(dest_dir, exist_ok=True)
-            log_path = os.path.join(dest_dir, "step_metrics.jsonl")
+            # Keep JSONL format (one JSON object per line) but write to the
+            # requested filename.
+            log_path = os.path.join(dest_dir, "step_metrics.json")
+
+            if self._log_raw_obs_full:
+                raw_obs_out = obs_dict
+            else:
+                raw_obs_out = {k: obs_dict.get(k, 0.0) for k in self._obs_keys}
+
             rec = {
                 "t": int(self._global_step),
                 "epi": self.epi,
                 "reward": float(reward),
-                "obs_vec": [float(x) for x in obs_vec.tolist()],
-                "raw_obs": obs_dict,
+                "raw_obs": raw_obs_out,
                 **info,
             }
+
+            if self._log_obs_vec:
+                rec["obs_vec"] = [float(x) for x in obs_vec.tolist()]
+
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec) + "\n")
         except Exception:
@@ -489,8 +586,9 @@ class FecEnv(gym.Env):
     def _augment_obs(self, base: np.ndarray, ddl_ms: int) -> np.ndarray:
         # Normalized network features
         rtt_feat = float(self._rtt_ms) / 800.0
-        cap_feat = 1.0  # 10/10
-        estbw_feat = float(self._last_est_bw_mbps) / 10.0
+        cap = max(1.0, float(self._capacity_mbps))
+        cap_feat = 1.0  # normalized by itself
+        estbw_feat = float(self._last_est_bw_mbps) / cap
         ddl_feat = float(ddl_ms) / 1200.0
         extras = np.array([
             np.clip(rtt_feat, 0.0, 1.0),
@@ -504,7 +602,7 @@ class FecEnv(gym.Env):
         rng = self._rng
         def pick(xs):
             return xs[int(rng.randint(0, len(xs)))]
-        # Fixed capacity 10 Mbps
+        # Keep bitrate consistent with configured physical capacity
         self._bitrate_mbps = int(self._capacity_mbps)
         # RTT regimes: LEO/MEO/GEO
         rtt_choice = pick([30, 60, 120, 180, 550, 650])
