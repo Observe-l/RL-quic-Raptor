@@ -55,6 +55,20 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	if opts.PaceEach > 0 {
 		pc = newPacer(opts.PaceEach)
 	}
+	// At very small pacing intervals (e.g. ~100us at 100Mbps), doing a full pacing wait
+	// after every packet can become noticeable overhead. Batch pacing amortizes this cost
+	// by allowing short bursts while preserving the long-term average schedule.
+	if pc != nil {
+		paceBatch := 1
+		if v := os.Getenv("PACE_BATCH"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				paceBatch = n
+			}
+		} else if opts.PaceEach > 0 && opts.PaceEach <= 250*time.Microsecond {
+			paceBatch = 8
+		}
+		pc.SetBatch(paceBatch)
+	}
 	ecnStats := NewECNStats()
 	K := opts.K
 	if K <= 0 {
@@ -376,7 +390,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 								bt.nextESI++
 								bt.repairsOut++
 								if pc != nil {
-									pc.Wait()
+									pc.AfterSend()
 								}
 							}
 							bt.attempt = int(n.AttemptIdx)
@@ -424,8 +438,12 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 				time.Sleep(10 * time.Millisecond)
 			}
 		}
-		// Prepare encoder for this block so we can generate on-demand repairs later
-		blockBytes := make([]byte, len(buf))
+		// Prepare encoder for this block so we can generate on-demand repairs later.
+		// IMPORTANT: Always pad the source block to exactly K*L bytes. The RaptorQ
+		// encoder/decoder interpret ESIs relative to K; for the last partial block,
+		// failing to pad here can make repair symbols inconsistent with the padded
+		// systematic symbols we transmit (and what the receiver decodes).
+		blockBytes := make([]byte, K*L)
 		copy(blockBytes, buf)
 		tEnc := time.Now()
 		enc, encErr := fec.NewRaptorQEncoder(blockBytes, K, L)
@@ -540,7 +558,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 				dgramsSinceAck++
 			}
 			if pc != nil {
-				pc.Wait()
+				pc.AfterSend()
 			}
 			if esi >= K {
 				bt.nextESI = esi + 1
@@ -567,8 +585,19 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	skipDrain := os.Getenv("QUIC_FEC_SKIP_ARQ_DRAIN") == "1"
 	if opts.UseARQ && !skipDrain {
 		// Wait until all active blocks have been ACKed or until a cap.
-		// Base cap defaults to max(PostWait, 3s). If RTT_MS env is present, ensure at least ~10 RTTs (capped at 10s).
-		drainCap := 3 * time.Second
+		// Base cap defaults to max(PostWait, 15s).
+		// This prevents premature close under loss where ARQ may need multiple RTTs.
+		// For RL / fast experiments, override with QUIC_FEC_ARQ_DRAIN_CAP_MS.
+		drainCap := 15 * time.Second
+		if capStr := os.Getenv("QUIC_FEC_ARQ_DRAIN_CAP_MS"); capStr != "" {
+			if ms, err := strconv.Atoi(capStr); err == nil {
+				if ms <= 0 {
+					drainCap = 0
+				} else {
+					drainCap = time.Duration(ms) * time.Millisecond
+				}
+			}
+		}
 		if opts.PostWait > drainCap {
 			drainCap = opts.PostWait
 		}
@@ -576,13 +605,14 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 			if ms, err := strconv.Atoi(rttStr); err == nil && ms > 0 {
 				rttDur := time.Duration(ms) * time.Millisecond
 				minDrain := 10 * rttDur
-				if minDrain > 10*time.Second {
-					minDrain = 10 * time.Second
-				}
 				if minDrain > drainCap {
 					drainCap = minDrain
 				}
 			}
+		}
+		if drainCap <= 0 {
+			// Explicitly disabled.
+			return nil
 		}
 		deadline := time.Now().Add(drainCap)
 		// Poll with short sleeps to avoid indefinite waits on missing broadcasts.
@@ -804,13 +834,12 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 				continue
 			}
 			data := b[fecwire.HeaderLen : fecwire.HeaderLen+int(fh.PayloadLen)]
+			// IMPORTANT: Always decode blocks as if they were full-sized (K*L), even for the last
+			// partial block. The sender pads source symbols beyond EOF with zeros, and the decoder
+			// must see the same effective K to interpret ESIs consistently (otherwise late-ESI
+			// padded source symbols can be misinterpreted as repair symbols and corrupt decode).
 			maxBlock := int(fh.K) * int(hdr.ChunkL)
-			bytesBefore := uint64(int(fh.BlockID) * maxBlock)
-			remAtPos := int(hdr.FileSize - bytesBefore)
-			if remAtPos > maxBlock {
-				remAtPos = maxBlock
-			}
-			_ = rxm.ingest(fh.BlockID, int(fh.SymID), int(fh.N), int(fh.K), int(hdr.ChunkL), data, remAtPos)
+			_ = rxm.ingest(fh.BlockID, int(fh.SymID), int(fh.N), int(fh.K), int(hdr.ChunkL), data, maxBlock)
 		}
 	}()
 	// Uni stream receiver (symbols framed as {FEC header}{payload})
@@ -848,13 +877,9 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 					if _, err := io.ReadFull(us, buf); err != nil {
 						return
 					}
+					// See datagram path above: keep block decode size fixed to K*L.
 					maxBlock := int(fh.K) * int(hdr.ChunkL)
-					bytesBefore := uint64(int(fh.BlockID) * maxBlock)
-					remAtPos := int(hdr.FileSize - bytesBefore)
-					if remAtPos > maxBlock {
-						remAtPos = maxBlock
-					}
-					_ = rxm.ingest(fh.BlockID, int(fh.SymID), int(fh.N), int(fh.K), int(hdr.ChunkL), buf, remAtPos)
+					_ = rxm.ingest(fh.BlockID, int(fh.SymID), int(fh.N), int(fh.K), int(hdr.ChunkL), buf, maxBlock)
 				}
 			}(s)
 		}
@@ -975,39 +1000,74 @@ type pacer struct {
 	mu       sync.Mutex
 	nextDue  time.Time
 	interval time.Duration
+	batch    int
+	pending  int
 }
 
 func newPacer(interval time.Duration) *pacer {
 	if interval <= 0 {
 		return nil
 	}
-	return &pacer{interval: interval}
+	return &pacer{interval: interval, batch: 1}
 }
 
-// Wait blocks until the next scheduled time, then advances the schedule by interval.
-// It is safe for concurrent use; calls are serialized to maintain spacing across senders.
-func (p *pacer) Wait() {
+func (p *pacer) SetBatch(n int) {
 	if p == nil {
 		return
 	}
-	// Reserve the next slot and compute its due time.
+	if n <= 0 {
+		n = 1
+	}
+	p.mu.Lock()
+	p.batch = n
+	if p.pending >= p.batch {
+		// Don't block here; just force the next AfterSend() to pace immediately.
+		p.pending = p.batch
+	}
+	p.mu.Unlock()
+}
+
+// AfterSend should be called once per sent datagram. It applies pacing in batches.
+func (p *pacer) AfterSend() {
+	if p == nil {
+		return
+	}
+	slots := 0
+	p.mu.Lock()
+	p.pending++
+	if p.pending >= p.batch {
+		slots = p.pending
+		p.pending = 0
+	}
+	p.mu.Unlock()
+	if slots > 0 {
+		p.WaitN(slots)
+	}
+}
+
+// WaitN reserves N pacing slots and blocks until the scheduled time.
+func (p *pacer) WaitN(slots int) {
+	if p == nil {
+		return
+	}
+	if slots <= 0 {
+		slots = 1
+	}
+	step := time.Duration(slots) * p.interval
+
+	// Reserve the next slots and compute the due time.
 	p.mu.Lock()
 	due := p.nextDue
 	now := time.Now()
 	if due.IsZero() || now.After(due) {
-		// If we're behind or uninitialized, schedule from now.
-		due = now.Add(p.interval)
+		due = now.Add(step)
 	} else {
-		// Otherwise, move to the next slot.
-		due = due.Add(p.interval)
+		due = due.Add(step)
 	}
 	p.nextDue = due
 	p.mu.Unlock()
 
 	// Wait until due.
-	// For high-rate pacing (interval < ~2ms), Go's time.Sleep jitter / scheduler granularity
-	// can easily overshoot by hundreds of microseconds, significantly lowering throughput.
-	// In that regime, busy-waiting is the most stable option for experiments.
 	if p.interval < 2*time.Millisecond {
 		for time.Now().Before(due) {
 		}
@@ -1030,6 +1090,15 @@ func (p *pacer) Wait() {
 	}
 	for time.Now().Before(due) {
 	}
+}
+
+// Wait blocks until the next scheduled time, then advances the schedule by interval.
+// It is safe for concurrent use; calls are serialized to maintain spacing across senders.
+func (p *pacer) Wait() {
+	if p == nil {
+		return
+	}
+	p.WaitN(1)
 }
 
 // ListenAndServeLoopWithRX allows configuring the receiver options.

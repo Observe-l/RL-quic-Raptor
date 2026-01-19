@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 @dataclass(frozen=True)
 class RunResult:
-    loss_pct: int
+    loss_pct: float
     cc_bypass: int  # 0 or 1
     rep: int
     k: int
@@ -29,34 +29,36 @@ class RunResult:
     goodput_arrival_mbps: Optional[float]
     md5_ok: Optional[int]
     dur_ms: Optional[int]
+    duration_transfer_ms: Optional[int]
     duration_arrival_ms: Optional[int]
     residual_erasures: Optional[int]
     fec_overhead_pct_arrival: Optional[float]
     ctrl_tx_nack_msgs: Optional[int]
+    arq_attempts_p95: Optional[float]
 
 
-def _compute_r0_theory(k: int, loss_pct: int) -> int:
+def _compute_r0_theory(k: int, loss_pct: float) -> int:
     """Theoretical minimum initial repairs R0 for iid loss.
 
     Requirement: E[received] = (K + R0) * (1-p) >= K => R0 >= K*p/(1-p)
     """
-    if loss_pct <= 0:
+    if loss_pct <= 0.0:
         return 0
-    if loss_pct >= 100:
+    if loss_pct >= 100.0:
         return k  # degenerate; cap
     p = float(loss_pct) / 100.0
     return int(math.ceil((float(k) * p) / (1.0 - p)))
 
 
-def _decode_success_prob(k: int, r0: int, loss_pct: int) -> float:
+def _decode_success_prob(k: int, r0: int, loss_pct: float) -> float:
     """Probability a block decodes from initial (K+R0) transmissions under i.i.d loss.
 
     Success means: receive at least K packets out of N = K+R0.
     Equivalently: number of losses X <= R0, where X ~ Binomial(N, p).
     """
-    if loss_pct <= 0:
+    if loss_pct <= 0.0:
         return 1.0
-    if loss_pct >= 100:
+    if loss_pct >= 100.0:
         return 0.0
     p = float(loss_pct) / 100.0
     n = int(k + r0)
@@ -73,7 +75,7 @@ def _decode_success_prob(k: int, r0: int, loss_pct: int) -> float:
     return total
 
 
-def _pick_r0_for_target(k: int, loss_pct: int, target_success_prob: float, r0_cap: int = 200) -> int:
+def _pick_r0_for_target(k: int, loss_pct: float, target_success_prob: float, r0_cap: int = 200) -> int:
     """Pick smallest R0 such that P(success) >= target.
 
     This avoids the common pathology where the *expected* received packets are enough,
@@ -132,7 +134,7 @@ def _parse_run_line(output: str) -> Tuple[Optional[float], Optional[int], Option
 def _run_once(
     *,
     repo_root: Path,
-    loss_pct: int,
+    loss_pct: float,
     cc_bypass: int,
     transport: str,
     bitrate_mbps: int,
@@ -146,10 +148,13 @@ def _run_once(
     rep: int,
     r0_target: float,
     goodput_key: str,
+    ddl_ms: int,
 ) -> RunResult:
     env = os.environ.copy()
     env["LOSS_MODE"] = "iid"
-    env["LOSS_PCT"] = str(int(loss_pct))
+    # scripts/quicfec_run_once.sh passes LOSS_PCT directly to `tc netem loss ${LOSS_PCT}%`,
+    # which supports decimal percentages (e.g., 0.1%).
+    env["LOSS_PCT"] = str(float(loss_pct))
     env["QUIC_FEC_CC_BYPASS"] = "1" if int(cc_bypass) == 1 else "0"
     env["TRANSPORT"] = str(transport)
     env["BITRATE_MBPS"] = str(int(bitrate_mbps))
@@ -158,6 +163,9 @@ def _run_once(
     env["SYMBOL_BYTES"] = str(int(symbol_bytes))
     env["R0"] = str(int(r0))
     env["R0_TARGET"] = str(float(r0_target))
+    # Receiver-side decode deadline (also drives ARQ scheduling / backoff). A large DDL (e.g. 900ms)
+    # makes any rare ARQ event add a big tail, which is the main reason for W-shaped goodput.
+    env["DDL_MS"] = str(int(ddl_ms))
 
     if force_build:
         env["FORCE_BUILD"] = "1"
@@ -207,9 +215,11 @@ def _run_once(
     goodput_decode = None
     goodput_arrival = None
     duration_arrival_ms = None
+    duration_transfer_ms = None
     residual_erasures = None
     fec_overhead = None
     ctrl_tx_nack = None
+    arq_attempts_p95 = None
     if obs is not None:
         try:
             goodput_decode = float(obs.get("goodput_decode_mbps"))
@@ -224,6 +234,10 @@ def _run_once(
         except Exception:
             duration_arrival_ms = None
         try:
+            duration_transfer_ms = int(obs.get("duration_transfer_ms"))
+        except Exception:
+            duration_transfer_ms = None
+        try:
             residual_erasures = int(obs.get("residual_erasures"))
         except Exception:
             residual_erasures = None
@@ -235,6 +249,10 @@ def _run_once(
             ctrl_tx_nack = int(obs.get("ctrl_tx_nack_msgs"))
         except Exception:
             ctrl_tx_nack = None
+        try:
+            arq_attempts_p95 = float(obs.get("arq_attempts_p95"))
+        except Exception:
+            arq_attempts_p95 = None
 
     if goodput_key == "decode":
         goodput = goodput_decode
@@ -249,7 +267,7 @@ def _run_once(
     r0_theory = _compute_r0_theory(k, loss_pct)
 
     return RunResult(
-        loss_pct=int(loss_pct),
+        loss_pct=float(loss_pct),
         cc_bypass=int(cc_bypass),
         rep=int(rep),
         k=int(k),
@@ -262,10 +280,12 @@ def _run_once(
         goodput_arrival_mbps=goodput_arrival,
         md5_ok=md5_ok,
         dur_ms=dur_ms,
+        duration_transfer_ms=duration_transfer_ms,
         duration_arrival_ms=duration_arrival_ms,
         residual_erasures=residual_erasures,
         fec_overhead_pct_arrival=fec_overhead,
         ctrl_tx_nack_msgs=ctrl_tx_nack,
+        arq_attempts_p95=arq_attempts_p95,
     )
 
 
@@ -313,10 +333,12 @@ def _write_csv(path: Path, rows: List[RunResult]) -> None:
                 "goodput_arrival_mbps",
                 "md5_ok",
                 "dur_ms",
+                "duration_transfer_ms",
                 "duration_arrival_ms",
                 "residual_erasures",
                 "fec_overhead_pct_arrival",
                 "ctrl_tx_nack_msgs",
+                "arq_attempts_p95",
             ],
         )
         w.writeheader()
@@ -336,10 +358,12 @@ def _write_csv(path: Path, rows: List[RunResult]) -> None:
                     "goodput_arrival_mbps": r.goodput_arrival_mbps,
                     "md5_ok": r.md5_ok,
                     "dur_ms": r.dur_ms,
+                    "duration_transfer_ms": r.duration_transfer_ms,
                     "duration_arrival_ms": r.duration_arrival_ms,
                     "residual_erasures": r.residual_erasures,
                     "fec_overhead_pct_arrival": r.fec_overhead_pct_arrival,
                     "ctrl_tx_nack_msgs": r.ctrl_tx_nack_msgs,
+                    "arq_attempts_p95": r.arq_attempts_p95,
                 }
             )
 
@@ -365,11 +389,11 @@ def _plot(
             return float(vals[mid])
         return float((vals[mid - 1] + vals[mid]) / 2.0)
 
-    def series(cc_bypass: int) -> Tuple[List[int], List[float], List[int]]:
-        xs: List[int] = []
+    def series(cc_bypass: int) -> Tuple[List[float], List[float], List[int]]:
+        xs: List[float] = []
         ys: List[float] = []
         fails: List[int] = []
-        losses = sorted({r.loss_pct for r in rows})
+        losses = sorted({float(r.loss_pct) for r in rows})
         for loss_pct in losses:
             group = [r for r in rows if r.cc_bypass == cc_bypass and r.loss_pct == loss_pct]
             ok = [r for r in group if (r.md5_ok == 1 and (r.residual_erasures or 0) == 0 and r.goodput_mbps is not None)]
@@ -378,20 +402,24 @@ def _plot(
             fails.append(len(group) - len(ok))
         return xs, ys, fails
 
-    x0, y0, f0 = series(0)
-    x1, y1, f1 = series(1)
+    present = sorted({int(r.cc_bypass) for r in rows})
+    data: Dict[int, Tuple[List[int], List[float], List[int]]] = {v: series(v) for v in present}
 
     path_png.parent.mkdir(parents=True, exist_ok=True)
     plt.figure(figsize=(6.2, 4.2), dpi=160)
-    plt.plot(x0, y0, marker="o", linewidth=2.0, label="QUIC")
-    plt.plot(x1, y1, marker="s", linewidth=2.0, label="QUEC+FEC+ARQ")
-    # Mark failures with an 'x' at y=0 for visibility
-    for x, fc in zip(x0, f0):
-        if fc > 0:
-            plt.scatter([x], [0.0], marker="x", s=55, linewidths=2.0, color="C0")
-    for x, fc in zip(x1, f1):
-        if fc > 0:
-            plt.scatter([x], [0.0], marker="x", s=55, linewidths=2.0, color="C1")
+
+    # Map cc_bypass to a stable label + color.
+    labels = {0: "QUIC (CC)", 1: "QUIC+FEC+ARQ (cc_bypass)"}
+    markers = {0: "o", 1: "s"}
+    colors = {0: "C0", 1: "C1"}
+
+    for v in present:
+        xs, ys, fails = data[v]
+        plt.plot(xs, ys, marker=markers.get(v, "o"), linewidth=2.0, label=labels.get(v, f"cc_bypass={v}"), color=colors.get(v, None))
+        # Mark failures with an 'x' at y=0 for visibility
+        for x, fc in zip(xs, fails):
+            if fc > 0:
+                plt.scatter([x], [0.0], marker="x", s=55, linewidths=2.0, color=colors.get(v, None))
     plt.xlabel("i.i.d. loss rate (%)")
     if goodput_key == "arrival":
         plt.ylabel("Arrival Goodput (Mbps)")
@@ -422,7 +450,19 @@ def main() -> int:
         help="Which metric to plot / report when available in [rl-observation]",
     )
     ap.add_argument("--timeout-s", type=int, default=90)
+    ap.add_argument(
+        "--ddl-ms",
+        type=int,
+        default=150,
+        help="Server rx DDL in ms (drives ARQ/NACK timing). Smaller reduces tail latency under loss.",
+    )
     ap.add_argument("--reps", type=int, default=5, help="Repetitions per point (median is plotted)")
+    ap.add_argument(
+        "--cc-mode",
+        choices=["bypass", "cc", "both"],
+        default="both",
+        help="Which mode(s) to run: bypass=only QUIC_FEC_CC_BYPASS=1, cc=only CC enabled, both=runs both.",
+    )
     ap.add_argument("--run-retries", type=int, default=2, help="Retries per trial on transient failures")
     ap.add_argument(
         "--r0-target",
@@ -438,7 +478,7 @@ def main() -> int:
 
     repo_root = Path(__file__).resolve().parents[1]
 
-    losses = [int(x.strip()) for x in str(args.loss).split(",") if x.strip() != ""]
+    losses = [float(x.strip()) for x in str(args.loss).split(",") if x.strip() != ""]
 
     results: List[RunResult] = []
     force_build_first = True
@@ -446,7 +486,13 @@ def main() -> int:
         r0_theory = _compute_r0_theory(args.k, loss_pct)
         r0 = _pick_r0_for_target(args.k, loss_pct, float(args.r0_target))
         for rep in range(int(args.reps)):
-            for cc_bypass in (1, 0):
+            if str(args.cc_mode) == "bypass":
+                cc_bypass_values = (1,)
+            elif str(args.cc_mode) == "cc":
+                cc_bypass_values = (0,)
+            else:
+                cc_bypass_values = (1, 0)
+            for cc_bypass in cc_bypass_values:
                 r = _run_once_with_retries(
                     retries=int(args.run_retries),
                     repo_root=repo_root,
@@ -464,6 +510,7 @@ def main() -> int:
                     rep=rep,
                     r0_target=float(args.r0_target),
                     goodput_key=str(args.goodput_key),
+                    ddl_ms=int(args.ddl_ms),
                 )
                 force_build_first = False
                 results.append(r)

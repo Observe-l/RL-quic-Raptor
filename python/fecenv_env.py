@@ -142,6 +142,8 @@ class QuicFecRunner:
         # we prefer faster feedback.
         env.setdefault("POST_WAIT", self.post_wait)
         env.setdefault("SRV_TIMEOUT", self.srv_timeout)
+            # Avoid long tail waits during training; benchmarks can override.
+            env.setdefault("QUIC_FEC_ARQ_DRAIN_CAP_MS", "3000")
         if self.obs_wait_secs is not None:
             env.setdefault("OBS_WAIT_SECS", str(int(self.obs_wait_secs)))
 

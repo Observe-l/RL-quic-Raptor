@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/quic-go/quic-go/internal/congestion"
@@ -135,11 +136,17 @@ func newSentPacketHandler(
 			tracer.Debug("note", "CC bypass: using NoopSender (lab only)")
 		}
 	} else {
+		algo := strings.ToLower(strings.TrimSpace(os.Getenv("QUIC_FEC_CC_ALGO")))
+		// Default to CUBIC (quic-go default). Set QUIC_FEC_CC_ALGO=reno to use Reno.
+		useReno := algo == "reno"
+		if algo != "" && algo != "cubic" && algo != "reno" {
+			useReno = false
+		}
 		congestionCtrl = congestion.NewCubicSender(
 			congestion.DefaultClock{},
 			rttStats,
 			initialMaxDatagramSize,
-			true, // use Reno
+			useReno,
 			tracer,
 		)
 	}

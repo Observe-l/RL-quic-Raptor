@@ -54,6 +54,11 @@ type rxBlock struct {
 	nextDDL time.Time // next DDL fire time
 	// store received symbols by ESI to avoid duplicates and allow release
 	syms map[int][]byte
+	// Fast path for systematic source symbols (ESI < K): write directly into a block buffer
+	// to avoid per-symbol allocations and map overhead on low/no-loss links.
+	srcBuf       []byte
+	srcSeen      []bool
+	srcSeenCount int
 	// metrics timestamps
 	firstSeen time.Time
 	// ARQ de-bounce state
@@ -170,6 +175,9 @@ func (m *rxManager) start(rx RXOptions) {
 			}
 			_, _ = m.out.WriteAt(data, w.off)
 			m.written.Add(uint64(len(data)))
+			if m.met != nil {
+				m.met.OnWrite(time.Now())
+			}
 			// debug: print when nearing completion
 			if m.written.Load() >= m.fileSize {
 				//nolint
@@ -246,13 +254,24 @@ func (m *rxManager) start(rx RXOptions) {
 					m.decBlocks.Add(1)
 					// release memory and mark done
 					// capture stats before clearing
-					rxUnique := len(b.syms)
-					usedRep := max(0, rxUnique-b.K)
+					rxUnique := b.srcSeenCount + len(b.syms)
+					// Used repairs is at least the number of received repair symbols.
+					// (This may slightly overcount if repairs were redundant, but is stable and cheap.)
+					repairRx := 0
+					for e := range b.syms {
+						if e >= b.K {
+							repairRx++
+						}
+					}
+					usedRep := repairRx
 					m.mu.Lock()
 					for _, p := range b.syms {
 						m.inUse.Add(int64(-len(p)))
 					}
 					b.syms = nil
+					b.srcBuf = nil
+					b.srcSeen = nil
+					b.srcSeenCount = 0
 					b.done = true
 					delete(m.blocks, b.id)
 					// remember completion to ignore late arrivals for this block
@@ -561,10 +580,17 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 			m.minSeen = int(blockID)
 		}
 	}
-	// drop duplicates
-	if _, ok := b.syms[esi]; ok {
-		m.mu.Unlock()
-		return false
+	// drop duplicates (systematic vs repair symbols)
+	if !isRepair {
+		if b.srcSeen != nil && esi >= 0 && esi < len(b.srcSeen) && b.srcSeen[esi] {
+			m.mu.Unlock()
+			return false
+		}
+	} else {
+		if _, ok := b.syms[esi]; ok {
+			m.mu.Unlock()
+			return false
+		}
 	}
 	// prevent pathological growth: cap stored repairs per block (e.g., 8*K) for small-K scenarios
 	if isRepair && len(b.syms) > 0 {
@@ -606,18 +632,56 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 		m.dropsRepairs.Add(1)
 		return false
 	}
-	// store symbol
-	p := make([]byte, len(data))
-	copy(p, data)
-	b.syms[esi] = p
-	m.inUse.Add(int64(len(p)))
 	// Update block meta from header for placeholders or unknowns.
 	if b.K != K || b.L != L || b.dataSize != dataSize {
 		b.K = K
 		b.L = L
 		b.dataSize = dataSize
+		// Reset systematic fast-path state if parameters changed.
+		b.srcBuf = nil
+		b.srcSeen = nil
+		b.srcSeenCount = 0
 	}
-	// Lazily create decoder for placeholder blocks when the first symbol arrives (with correct size).
+
+	// Store symbol.
+	// Repairs are kept in a map and accounted against the memory budget.
+	// Systematic (source) symbols are written directly into a preallocated block buffer.
+	symLen := len(data)
+	var p []byte
+	if isRepair {
+		p = make([]byte, len(data))
+		copy(p, data)
+		b.syms[esi] = p
+		m.inUse.Add(int64(len(p)))
+	} else {
+		if b.srcBuf == nil {
+			// Allocate K*L to keep L-sized slices stable for decoder input, even if the
+			// last block is partial (dataSize < K*L).
+			b.srcBuf = make([]byte, K*L)
+		}
+		if b.srcSeen == nil || len(b.srcSeen) != K {
+			b.srcSeen = make([]bool, K)
+			b.srcSeenCount = 0
+		}
+		start := esi * L
+		if start < len(b.srcBuf) {
+			end := start + len(data)
+			if end > len(b.srcBuf) {
+				end = len(b.srcBuf)
+			}
+			copy(b.srcBuf[start:end], data[:end-start])
+		}
+		b.srcSeen[esi] = true
+		b.srcSeenCount++
+		// Feed decoder from stable memory.
+		if start >= 0 && start+L <= len(b.srcBuf) {
+			p = b.srcBuf[start : start+L]
+		} else {
+			p = data
+		}
+	}
+	// Lazily create decoder when needed.
+	// The decode worker assumes b.dec is non-nil once a block is queued.
 	if b.dec == nil {
 		dec, err := fec.NewRaptorQDecoder(b.dataSize, b.L)
 		if err == nil {
@@ -633,68 +697,49 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 	}
 	if m.met != nil {
 		now := time.Now()
-		m.met.OnUniqueSymbol(len(p), now, esi >= K)
+		m.met.OnUniqueSymbol(symLen, now, esi >= K)
 		if !m.met.gotFirst {
 			m.met.OnFirstUniqueSymbol(now)
 		}
 	}
 
-	// Fast path for systematic delivery: if we have all source symbols (0..K-1),
-	// we can reconstruct the block directly without running RaptorQ decode.
-	// This avoids unnecessary ARQ rounds and extra repairs on low/no-loss links.
-	var sysSyms [][]byte
+	// Fast path for systematic delivery: if we received all source symbols (0..K-1),
+	// the block is already assembled in srcBuf.
+	var sysBuf []byte
 	var sysOff int64
-	var sysDataSize int
 	var sysRxUnique int
 	var sysUsedRep int
 	var sysAttempt int
 	var sysFirstSeen time.Time
 	var sysBlockID uint16
-	if !b.done && b.K > 0 && K > 0 && len(b.syms) >= K {
-		complete := true
-		for i := 0; i < K; i++ {
-			if _, ok := b.syms[i]; !ok {
-				complete = false
-				break
-			}
+	if !b.done && b.srcBuf != nil && b.srcSeenCount >= K && K > 0 {
+		if b.dataSize > 0 && b.dataSize <= len(b.srcBuf) {
+			sysBuf = b.srcBuf[:b.dataSize]
+		} else {
+			sysBuf = b.srcBuf
 		}
-		if complete {
-			sysSyms = make([][]byte, K)
-			for i := 0; i < K; i++ {
-				sysSyms[i] = b.syms[i]
-			}
-			sysOff = int64(int(b.id) * b.K * b.L)
-			sysDataSize = b.dataSize
-			sysRxUnique = len(b.syms)
-			sysUsedRep = max(0, sysRxUnique-b.K)
-			sysAttempt = b.attempt
-			sysFirstSeen = b.firstSeen
-			sysBlockID = b.id
-			// Release memory and mark done under lock.
-			for _, pp := range b.syms {
-				m.inUse.Add(int64(-len(pp)))
-			}
-			b.syms = nil
-			b.done = true
-			delete(m.blocks, b.id)
-			m.completed[b.id] = struct{}{}
+		sysOff = int64(int(b.id) * b.K * b.L)
+		sysRxUnique = b.srcSeenCount + len(b.syms)
+		sysUsedRep = max(0, sysRxUnique-b.K)
+		sysAttempt = b.attempt
+		sysFirstSeen = b.firstSeen
+		sysBlockID = b.id
+		// Release any stored repairs (rare on loss=0), and mark done under lock.
+		for _, pp := range b.syms {
+			m.inUse.Add(int64(-len(pp)))
 		}
+		b.syms = nil
+		b.srcBuf = nil
+		b.srcSeen = nil
+		b.srcSeenCount = 0
+		b.done = true
+		delete(m.blocks, b.id)
+		m.completed[b.id] = struct{}{}
 	}
 	m.mu.Unlock()
 
-	if sysSyms != nil {
-		// Assemble bytes in ESI order and enqueue a write.
-		out := make([]byte, sysDataSize)
-		pos := 0
-		for i := 0; i < len(sysSyms) && pos < len(out); i++ {
-			chunk := sysSyms[i]
-			if len(chunk) > len(out)-pos {
-				chunk = chunk[:len(out)-pos]
-			}
-			copy(out[pos:], chunk)
-			pos += len(chunk)
-		}
-		m.writeQ <- writeTask{off: sysOff, data: out}
+	if sysBuf != nil {
+		m.writeQ <- writeTask{off: sysOff, data: sysBuf}
 		m.decBlocks.Add(1)
 		if m.met != nil {
 			m.met.OnClusterDecoded(sysFirstSeen, time.Now(), sysAttempt, sysUsedRep)
@@ -726,6 +771,10 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 	}
 
 	// feed decoder; if decoder reports readiness, queue a decode
+	if b.dec == nil {
+		// Shouldn't happen (we create it lazily above), but avoid panics.
+		return true
+	}
 	b.decMu.Lock()
 	ready, _ := b.dec.AddSymbol(uint32(esi), p)
 	b.decMu.Unlock()

@@ -52,10 +52,11 @@ type Observation struct {
 type serverMetrics struct {
 	mu sync.Mutex
 
-	fileBytes int
-	t0First   time.Time
-	tLastUniq time.Time
-	gotFirst  bool
+	fileBytes  int
+	t0First    time.Time
+	tLastUniq  time.Time
+	tLastWrite time.Time
+	gotFirst   bool
 
 	// arrival windows (200ms buckets, 10 buckets => 2s horizon)
 	bucketDur  time.Duration
@@ -149,6 +150,21 @@ func (m *serverMetrics) OnUniqueSymbol(nBytes int, when time.Time, isRepair bool
 	m.mu.Unlock()
 }
 
+// OnWrite marks completion progress of writing decoded / reconstructed bytes to the output.
+// This is used to compute decode/write goodput excluding finalize (e.g., SHA verification).
+func (m *serverMetrics) OnWrite(when time.Time) {
+	m.mu.Lock()
+	if !m.gotFirst {
+		m.gotFirst = true
+		m.t0First = when
+		m.startTick = when
+	}
+	if m.tLastWrite.IsZero() || when.After(m.tLastWrite) {
+		m.tLastWrite = when
+	}
+	m.mu.Unlock()
+}
+
 func (m *serverMetrics) OnCtrlTx(nBytes int, msgType string, dropped bool) {
 	m.mu.Lock()
 	if nBytes > 0 {
@@ -204,7 +220,13 @@ func (m *serverMetrics) Snapshot(now time.Time) Observation {
 	var durArrivalMs int64
 	var goodputArrival float64
 	if m.gotFirst {
-		durTransferMs = now.Sub(m.t0First).Milliseconds()
+		end := now
+		// For decode/write goodput, use the last-write timestamp if available.
+		// This intentionally excludes finalize (e.g., SHA verification) time.
+		if !m.tLastWrite.IsZero() {
+			end = m.tLastWrite
+		}
+		durTransferMs = end.Sub(m.t0First).Milliseconds()
 		durSec := float64(durTransferMs) / 1000.0
 		if durSec > 1e-9 {
 			goodput = (float64(m.fileBytes) * 8.0 / 1e6) / durSec
