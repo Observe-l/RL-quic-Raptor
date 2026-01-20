@@ -386,7 +386,10 @@ class FecEnv(gym.Env):
             "residual_erasures",
             "rx_unique_at_ddl_p95",
         ]
-        self._obs_extra_dim = 0
+        # Extra dims appended to the observation vector.
+        # We include the previous action (as discrete indices) since ARQ attempts and
+        # decoding dynamics depend on prior FEC/ARQ parameters.
+        self._obs_extra_dim = 4
         self.observation_space = spaces.Box(
             low=-5.0, high=+np.inf, shape=(len(self._obs_keys) + self._obs_extra_dim,), dtype=np.float32
         )
@@ -469,6 +472,10 @@ class FecEnv(gym.Env):
 
         self._last_obs_vec = np.zeros((len(self._obs_keys) + self._obs_extra_dim,), dtype=np.float32)
         self._prev_action = np.zeros((4,), dtype=np.int32)
+        # True once we've produced at least one valid policy observation via step().
+        # With episode_step=1, reset() needs to return a meaningful observation;
+        # we use the last step() observation as the next episode's reset obs.
+        self._has_last_obs = False
         self._cap_hits = 0
         self._norm = _RunningNorm(dim=self.observation_space.shape[0])
         self._global_step = 0
@@ -480,11 +487,19 @@ class FecEnv(gym.Env):
         self._ep_term_sums: Dict[str, float] = {}
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
-        self._last_obs_vec[:] = 0.0
+        # IMPORTANT for episode_step=1:
+        # RLlib will call reset() before every single action selection.
+        # Returning all-zeros here makes the policy effectively blind.
+        # Instead, return the last valid policy observation from the previous episode.
+        # (If no prior step() has run yet, fall back to zeros.)
+        if not self._has_last_obs:
+            self._last_obs_vec[:] = 0.0
         self._t_in_ep = 0
         self.epi += 1
         self._ep_return = 0.0
         self._ep_term_sums = {}
+        # Do NOT clear _prev_action here: we want the next episode's reset observation
+        # to carry the last action context (ARQ dynamics depend on prior parameters).
         if seed is not None:
             try:
                 self._rng.seed(int(seed))
@@ -555,11 +570,15 @@ class FecEnv(gym.Env):
                 raise RuntimeError(f"QUIC-FEC harness failed: {err}")
         # Compute reward (variant selectable via env_config)
         reward, r_terms = self._compute_reward_satellite(obs_dict, ddl_ms)
-        # Build observation vector: base obs + normalized net features + prev action
-        obs_vec = self._obs_to_vec(obs_dict)
+        # Update prev_action *before* building obs, so the returned observation
+        # contains the action that just produced the resulting transfer outcome.
+        self._prev_action = np.asarray([k_idx, r0_idx, rstep_idx, ddl_idx], dtype=np.int32)
+
+        # Build observation vector: base obs + previous action
+        obs_vec = self._augment_obs(self._obs_to_vec(obs_dict))
         obs_vec = self._norm.transform(self._norm.update(obs_vec))
         self._last_obs_vec = obs_vec
-        self._prev_action = np.asarray([k_idx, r0_idx, rstep_idx, ddl_idx], dtype=np.int32)
+        self._has_last_obs = True
 
         r0_used = max(0, int(float(R0_pct) * float(K)))
         info = {
@@ -603,6 +622,7 @@ class FecEnv(gym.Env):
 
             # Always log only the observations used by the policy.
             raw_obs_out = {k: obs_dict.get(k, 0.0) for k in self._obs_keys}
+            raw_obs_out["prev_action"] = [int(x) for x in self._prev_action.tolist()]
 
             # Return raw observations to the caller as well (useful for smoke tests).
             info["raw_obs"] = raw_obs_out
@@ -672,9 +692,17 @@ class FecEnv(gym.Env):
                 vals.append(0.0)
         return np.asarray(vals, dtype=np.float32)
 
-    def _augment_obs(self, base: np.ndarray, ddl_ms: int) -> np.ndarray:
-        # Kept for backward compatibility; currently no extra dims.
-        return base.astype(np.float32)
+    def _augment_obs(self, base: np.ndarray) -> np.ndarray:
+        # Append previous action (indices) scaled into [0,1].
+        # Indices ranges:
+        # - K_idx:   0..54
+        # - R0_idx:  0..10
+        # - RSTEP:   0..8
+        # - ddl_idx: 0..20
+        pa = self._prev_action.astype(np.float32)
+        denom = np.asarray([54.0, 10.0, 8.0, 20.0], dtype=np.float32)
+        pa01 = np.clip(pa / np.maximum(denom, 1.0), 0.0, 1.0)
+        return np.concatenate([base.astype(np.float32), pa01], axis=0)
 
     def _randomize_net_params(self) -> None:
         rng = self._rng

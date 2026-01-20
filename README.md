@@ -46,7 +46,7 @@ sudo -v
 cd python
 # Shaped (tc) run — requires sudo (see step 1)
 python3 fecenv_train.py \
-  --train-episodes 2 \
+  --train-episodes 200000 \
   --episode-step 1 \
   --rtt-ms 50 \
   --loss-mode iid:5 \
