@@ -380,7 +380,6 @@ class FecEnv(gym.Env):
         # Policy observation keys (keep only the required fields).
         self._obs_keys: List[str] = [
             "decode_latency_p95_ms",
-            "estimated_available_bw_mbps",
             "fec_overhead_pct_arrival",
             "ctrl_tx_nack_msgs",
             "arq_attempts_mean",
@@ -471,7 +470,6 @@ class FecEnv(gym.Env):
         self._last_obs_vec = np.zeros((len(self._obs_keys) + self._obs_extra_dim,), dtype=np.float32)
         self._prev_action = np.zeros((4,), dtype=np.int32)
         self._cap_hits = 0
-        self._last_est_bw_mbps = float(self._capacity_mbps)
         self._norm = _RunningNorm(dim=self.observation_space.shape[0])
         self._global_step = 0
         self.epi = -1
@@ -555,8 +553,6 @@ class FecEnv(gym.Env):
             err = str(info.get("error"))
             if not err.lower().startswith("timeout"):
                 raise RuntimeError(f"QUIC-FEC harness failed: {err}")
-        # Update last estimated bandwidth for next safety clamp
-        self._last_est_bw_mbps = float(obs_dict.get("estimated_available_bw_mbps", self._capacity_mbps))
         # Compute reward (variant selectable via env_config)
         reward, r_terms = self._compute_reward_satellite(obs_dict, ddl_ms)
         # Build observation vector: base obs + normalized net features + prev action
@@ -583,7 +579,6 @@ class FecEnv(gym.Env):
                 "cc_algo": str(getattr(self._runner.last_cfg or EnvConfig(), "cc_algo", "bbrv2")),
             },
             "bw_cap_mbps": float(self._capacity_mbps),
-            "est_bw_mbps": float(self._last_est_bw_mbps),
             "goodput_mbps": float(obs_dict.get("goodput_arrival_mbps", obs_dict.get("goodput_decode_mbps", 0.0))),
             "reward_terms": r_terms,
             # "cap_hit": cap_hit,
@@ -706,7 +701,6 @@ class FecEnv(gym.Env):
 
     def _compute_reward_satellite(self, obs: Dict[str, Any], ddl_ms: int) -> Tuple[float, Dict[str, float]]:
         g = float(obs.get("goodput_arrival_mbps", obs.get("goodput_decode_mbps", 0.0)))
-        est = float(obs.get("estimated_available_bw_mbps", self._capacity_mbps))
         e = float(obs.get("residual_erasures", 0.0))
         d95 = float(obs.get("decode_latency_p95_ms", 0.0))
         d = float(max(1, int(ddl_ms)))
@@ -715,7 +709,7 @@ class FecEnv(gym.Env):
 
         if self._reward_variant == "legacy":
             # Previous shaping (kept for reproducibility)
-            c = max(1.0, float(min(self._capacity_mbps, est)))
+            c = max(1.0, float(self._capacity_mbps))
             tp_term = float(np.clip(g / c, 0.0, 1.0))
             lam_e = 0.75
             resid_term = -lam_e * (e / (1.0 + e))
@@ -772,7 +766,6 @@ class FecEnv(gym.Env):
             "l_tilde": float(l_tilde),
             "r_tilde": float(r_tilde),
             "arq_tilde": float(arq_tilde),
-            "est_bw_mbps": float(est),
         }
 
 

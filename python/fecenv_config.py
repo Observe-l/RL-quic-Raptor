@@ -71,7 +71,7 @@ def build_ppo_config(env_name: str = "FECEnv-v0", env_config: Dict[str, Any] | N
         .framework("torch")
         .env_runners(num_env_runners=num_env_runners, rollout_fragment_length=rollout_fragment_length, batch_mode="complete_episodes")
         .training(train_batch_size=train_batch_size, sgd_minibatch_size=sgd_minibatch_size, num_sgd_iter=num_sgd_iter, lr=lr)
-        .resources(num_gpus=0)
+        .resources(num_gpus=1)
         .reporting(min_sample_timesteps_per_iteration=0, min_time_s_per_iteration=0)
     )
     return cfg, env_config

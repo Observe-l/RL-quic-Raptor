@@ -24,7 +24,7 @@ The RL environment is tuned for **QUIC-FEC + BBRv2 congestion control** (CC enab
   - `R0_pct`: one of `[0, 0.1, ..., 1.0]`, and `R0 = floor(K * R0_pct)`
   - `R_step`: integer in [1, 9]
   - `ddl_ms`: integer in [300, 600] with 15ms granularity
-- Observations: derived from server `[rl-observation]` JSON, focusing on arrival goodput, overhead, residual erasures, ARQ stats, latency, and estimated bandwidth.
+- Observations: derived from server `[rl-observation]` JSON, focusing on arrival goodput, overhead, residual erasures, ARQ stats, and latency.
 - Fixed knobs (by default): CC algorithm (`bbrv2`) and `symbol_bytes=1200`.
 
 ## Episode design
@@ -46,7 +46,7 @@ sudo -v
 cd python
 # Shaped (tc) run — requires sudo (see step 1)
 python3 fecenv_train.py \
-  --train-episodes 200 \
+  --train-episodes 2 \
   --episode-step 1 \
   --rtt-ms 50 \
   --loss-mode iid:5 \
