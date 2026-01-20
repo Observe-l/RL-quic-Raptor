@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import os
 import json
 import time
@@ -59,7 +60,43 @@ def _ensure_sudo_privileges() -> None:
     )
 
 
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Train RLlib PPO on QUIC-FEC shaped transfers")
+    p.add_argument("--train-episodes", type=int, default=None, help="Number of episodes to train (default via env/config)")
+    p.add_argument("--episode-step", type=int, default=None, help="Steps per episode (default 1)")
+    p.add_argument("--rtt-ms", type=int, default=None, help="RTT in ms (tc netem)")
+    p.add_argument("--loss-mode", type=str, default=None, help="Loss model: none | iid:x | gemodel:p,r,h,k")
+    p.add_argument("--loss-pct", type=int, default=None, help="Loss percentage (used when loss_mode not set)")
+    p.add_argument("--bitrate-mbps", type=int, default=None, help="Shaping rate in Mbps")
+    p.add_argument("--timeout-sec", type=int, default=None, help="Per-step harness timeout in seconds")
+    p.add_argument("--train-file-bytes", type=int, default=None, help="Bytes per transfer (default 1 MiB)")
+
+    p.add_argument(
+        "--randomize-net-params",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Whether to randomize network params on reset()",
+    )
+    p.add_argument("--curriculum-warmup-episodes", type=int, default=None, help="Warmup episodes before randomization")
+
+    p.add_argument(
+        "--reward-delay-binary",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="If true, delay penalty is a hard threshold; else smooth ratio",
+    )
+    p.add_argument(
+        "--reward-residual-binary",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="If true, residual penalty is binary; else smooth ratio",
+    )
+    p.add_argument("--reward-w-arq", type=float, default=None, help="ARQ penalty weight (default 0.1)")
+    return p.parse_args()
+
+
 def main():
+    args = _parse_args()
     # Fail fast before Ray starts if we don't have shaping privileges.
     try:
         _ensure_sudo_privileges()
@@ -82,10 +119,41 @@ def main():
     os.environ["RAY_RESULTS_DIR"] = run_dir
 
     # Build config; provide only the result_dir. All parameters are centralized in fecenv_config.
+    # Args (if set) override env/defaults.
+    env_overrides = {
+        "result_dir": run_dir,
+    }
+    if args.train_episodes is not None:
+        env_overrides["train_episodes"] = int(args.train_episodes)
+    if args.episode_step is not None:
+        env_overrides["episode_step"] = int(args.episode_step)
+    if args.rtt_ms is not None:
+        env_overrides["rtt_ms"] = int(args.rtt_ms)
+    if args.loss_pct is not None:
+        env_overrides["loss_pct"] = int(args.loss_pct)
+    if args.loss_mode is not None:
+        env_overrides["loss_mode"] = str(args.loss_mode)
+    if args.bitrate_mbps is not None:
+        env_overrides["bitrate_mbps"] = int(args.bitrate_mbps)
+    if args.timeout_sec is not None:
+        env_overrides["timeout_sec"] = int(args.timeout_sec)
+    if args.train_file_bytes is not None:
+        env_overrides["train_file_bytes"] = int(args.train_file_bytes)
+    if args.randomize_net_params is not None:
+        env_overrides["randomize_net_params"] = bool(args.randomize_net_params)
+    if args.curriculum_warmup_episodes is not None:
+        env_overrides["curriculum_warmup_episodes"] = int(args.curriculum_warmup_episodes)
+    if args.reward_delay_binary is not None:
+        env_overrides["reward_delay_binary"] = bool(args.reward_delay_binary)
+    if args.reward_residual_binary is not None:
+        env_overrides["reward_residual_binary"] = bool(args.reward_residual_binary)
+    if args.reward_w_arq is not None:
+        env_overrides["reward_w_arq"] = float(args.reward_w_arq)
+
     cfg, resolved_env_cfg = build_ppo_config(
         env_name="FECEnv-v0",
         env_config={
-            "result_dir": run_dir,
+            **env_overrides,
         },
     )
 

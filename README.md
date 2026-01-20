@@ -13,21 +13,23 @@ This repo integrates a QUIC-FEC Go stack with an RLlib (IPPO) pipeline. Each RL 
   - `python/fecenv_config.py` — PPO config builder
   - `python/fecenv_train.py` — training entrypoint
 - Results & logs are written under `python/results/run-<timestamp>/`:
-  - per-step metrics (JSONL): `step_metrics.jsonl`
+  - per-step metrics (JSON): `step_metrics.json`
   - RLlib summary for the iteration: `ray_result.json`
 
 ## RL interface (current)
 The RL environment is tuned for **QUIC-FEC + BBRv2 congestion control** (CC enabled).
 
-- Action space: 2-D continuous in [-1, 1]^2 (mapped internally)
-  - `R0_pct`: initial repair ratio relative to `K` (e.g., 0.2 means `R0≈0.2*K`)
-  - `ddl_ms`: receiver decode deadline (affects ARQ timing)
+- Action space: **MultiDiscrete(4)**
+  - `K`: integer in [10, 64]
+  - `R0_pct`: one of `[0, 0.1, ..., 1.0]`, and `R0 = floor(K * R0_pct)`
+  - `R_step`: integer in [1, 9]
+  - `ddl_ms`: integer in [300, 600] with 15ms granularity
 - Observations: derived from server `[rl-observation]` JSON, focusing on arrival goodput, overhead, residual erasures, ARQ stats, latency, and estimated bandwidth.
-- Fixed knobs (by default): CC algorithm (`bbrv2`), `K`, and `symbol_bytes`. Adjust via `EnvConfig` in `python/fecenv_env.py` if needed.
+- Fixed knobs (by default): CC algorithm (`bbrv2`) and `symbol_bytes=1200`.
 
 ## Episode design
-- Default `episode_step=100` (configurable via env var `EPISODE_STEP`).
-- Default per-step transfer: 1 MiB file, shaped to 50 Mbps, RTT=100 ms (override via `env_config` in `python/fecenv_env.py` / RLlib config).
+- Default `episode_step=1` (each episode is one transfer).
+- Default per-step transfer: 1 MiB (generated under `/tmp`), shaped to 50 Mbps.
 - Network parameters are randomized on every `reset()` with a 40%/40%/20% mix of:
   - iid loss + RTT jitter + slow bandwidth drift
   - Gilbert–Elliott burst loss
@@ -39,16 +41,28 @@ The RL environment is tuned for **QUIC-FEC + BBRv2 congestion control** (CC enab
 sudo -v
 ```
 
-2) Train with RLlib IPPO (100-step episode by default):
+2) Train with RLlib PPO (CLI arguments; env vars still supported):
 ```bash
 cd python
 # Shaped (tc) run — requires sudo (see step 1)
-EPISODE_STEP=100 python3 fecenv_train.py
+python3 fecenv_train.py \
+  --train-episodes 200 \
+  --episode-step 1 \
+  --rtt-ms 50 \
+  --loss-mode iid:5 \
+  --bitrate-mbps 50 \
+  --train-file-bytes 1048576 \
+  --timeout-sec 10 \
+  --no-randomize-net-params \
+  --curriculum-warmup-episodes 0 \
+  --no-reward-delay-binary \
+  --no-reward-residual-binary \
+  --reward-w-arq 0.1
 ```
 
 Notes:
-- Each episode contains `EPISODE_STEP` QUIC-FEC transfers.
-- Results live in `python/results/run-<timestamp>/` alongside `step_metrics.jsonl` and `ray_result.json`.
+- Each episode contains `episode_step` QUIC-FEC transfers (default 1).
+- Results live in `python/results/run-<timestamp>/` alongside `step_metrics.json` and `ray_result.json`.
 - Ensure `scripts/*` and Go binaries exist; the harness builds automatically if missing.
 
 ## Troubleshooting

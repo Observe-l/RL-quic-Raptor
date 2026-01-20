@@ -187,11 +187,10 @@ class QuicFecRunner:
         env["SYMBOL_BYTES"] = str(int(getattr(cfg, "symbol_bytes", 1200)))
 
         # Map R0_pct -> integer R0.
-        # Requirement: R0 in [0.1*K, 1.0*K]. Enforce it after rounding.
-        r0 = int(round(float(action.R0_pct) * float(k)))
-        min_r0 = max(1, (int(k) + 9) // 10)  # ceil(0.1*K)
-        if r0 < min_r0:
-            r0 = min_r0
+        # Discrete control: R0 = floor(K * R0_pct), allowing 0.
+        r0 = int(float(action.R0_pct) * float(k))
+        if r0 < 0:
+            r0 = 0
         if r0 > int(k):
             r0 = int(k)
         env["R0"] = str(int(r0))
@@ -247,19 +246,22 @@ class QuicFecRunner:
             bitrate_mbps = int((cfg.target_bitrate_bps if cfg else 10_000_000) // 1_000_000)
         env["BITRATE_MBPS"] = str(int(bitrate_mbps))
 
-        # If the network hasn't been configured for this episode (or parameters changed),
-        # run a one-time setup pass.
-        try:
-            self.configure_network(
-                rtt_ms=int(rtt_ms),
-                loss_mode=str(lm or f"iid:{int(loss_pct)}"),
-                loss_pct=int(loss_pct),
-                bitrate_mbps=int(bitrate_mbps),
-            )
-        except Exception:
-            # Fall back to old behavior (script will reconfigure everything) if setup fails.
-            # This keeps the environment robust in interactive/debug sessions.
-            self._net_cfg_key = None
+        # Network setup optimization:
+        # If shaping parameters are constant (typical for RL), configure once and reuse.
+        # Only reconfigure when the desired key changes.
+        desired_key = (int(rtt_ms), str(lm or f"iid:{int(loss_pct)}"), int(bitrate_mbps))
+        if self._net_cfg_key != desired_key:
+            try:
+                self.configure_network(
+                    rtt_ms=int(rtt_ms),
+                    loss_mode=desired_key[1],
+                    loss_pct=int(loss_pct),
+                    bitrate_mbps=int(bitrate_mbps),
+                )
+            except Exception:
+                # Fall back to old behavior (script will reconfigure everything) if setup fails.
+                # This keeps the environment robust in interactive/debug sessions.
+                self._net_cfg_key = None
 
         try:
             env["NS"] = self.ns
@@ -367,14 +369,21 @@ class FecEnv(gym.Env):
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         cfg = config or {}
-        # 4-D action in [-1, 1]^4 (tanh-squashed typical): [K, R0_pct, RSTEP, ddl_ms]
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
+        # Discrete action space (MultiDiscrete), matching the requirement that
+        # controls are chosen from a finite set (not a clipped continuous Box).
+        # Order: [K_idx, R0_pct_idx, RSTEP_idx, ddl_idx]
+        #   K: 10..64                       -> 55 values
+        #   R0_pct: 0.0..1.0 step 0.1        -> 11 values
+        #   RSTEP: 1..9                      -> 9 values
+        #   ddl_ms: 300..600 step 15ms        -> 21 values
+        self.action_space = spaces.MultiDiscrete([55, 11, 9, 21])
         # Policy observation keys (keep only the required fields).
         self._obs_keys: List[str] = [
             "decode_latency_p95_ms",
             "estimated_available_bw_mbps",
             "fec_overhead_pct_arrival",
             "ctrl_tx_nack_msgs",
+            "arq_attempts_mean",
             "residual_erasures",
             "rx_unique_at_ddl_p95",
         ]
@@ -384,7 +393,8 @@ class FecEnv(gym.Env):
         )
 
         # Episode length control
-        self._episode_steps = int(cfg.get("episode_step", 100))
+        # By default, treat each transfer as one episode.
+        self._episode_steps = int(cfg.get("episode_step", 1))
         self._t_in_ep = 0
 
         # If the external harness fails (missing deps, netns issues, etc.), it's usually
@@ -426,25 +436,20 @@ class FecEnv(gym.Env):
 
         # Logging controls (step_metrics.json is JSON)
         # - log_obs_vec: large; disable by default to avoid bloating logs.
-        # - log_raw_obs_full: if False, only log the observation keys used by the policy.
+        # - log_raw_obs_full: deprecated; step_metrics.json always logs policy obs only.
         self._log_obs_vec = bool(cfg.get("log_obs_vec", False))
         self._log_raw_obs_full = bool(cfg.get("log_raw_obs_full", False))
-
-        # Action mapping ranges from [-1,1] → [low, high]
-        # Order: K, R0_pct, RSTEP, ddl_ms
-        # Notes:
-        # - K is integer in [10,64]
-        # - R0_pct in [0.1, 1.0] and maps to R0 = round(R0_pct * K)
-        # - RSTEP is integer (range chosen to be safe for loss<=10%)
-        # - decoding deadline in [300,600] ms
-        self._low = np.array([10.0, 0.10, 1.0, 300.0], dtype=np.float32)
-        self._high = np.array([64.0, 1.00, 8.0, 600.0], dtype=np.float32)
 
         # Runner
         # Default training file size: 1 MiB
         default_train_file_bytes = 1 * 1024 * 1024
+        timeout_sec = int(cfg.get("timeout_sec", 30))
         self._runner = QuicFecRunner(
-            timeout_sec=int(cfg.get("timeout_sec", 30)),
+            timeout_sec=timeout_sec,
+            # Keep the server lifetime bounded to roughly the same budget as the
+            # subprocess timeout, so pathological configs (e.g., R0=0) don't hang.
+            srv_timeout=f"{max(1, timeout_sec)}s",
+            obs_wait_secs=max(1, timeout_sec),
             train_file_bytes=(
                 int(cfg.get("train_file_bytes"))
                 if cfg.get("train_file_bytes") is not None
@@ -464,7 +469,7 @@ class FecEnv(gym.Env):
         )
 
         self._last_obs_vec = np.zeros((len(self._obs_keys) + self._obs_extra_dim,), dtype=np.float32)
-        self._prev_action = np.zeros((4,), dtype=np.float32)
+        self._prev_action = np.zeros((4,), dtype=np.int32)
         self._cap_hits = 0
         self._last_est_bw_mbps = float(self._capacity_mbps)
         self._norm = _RunningNorm(dim=self.observation_space.shape[0])
@@ -496,45 +501,47 @@ class FecEnv(gym.Env):
             self._loss_pct = int(self._base_loss_pct)
             self._loss_mode = str(self._base_loss_mode)
 
-        # Training optimization: apply netns/tc shaping once per episode.
-        # Each step() then reuses the configured network and only runs the transfer.
-        try:
-            self._runner.configure_network(
-                rtt_ms=int(self._rtt_ms),
-                loss_mode=str(self._loss_mode),
-                loss_pct=int(self._loss_pct),
-                bitrate_mbps=int(self._bitrate_mbps),
-            )
-        except Exception as e:
-            # If shaping setup fails here, step() will fall back to the old behavior.
-            if not self._ignore_runner_errors:
-                raise RuntimeError(f"QUIC-FEC network setup failed: {e}")
+        # Training optimization: configure netns/tc once and reuse.
+        # Only reconfigure if the network parameters change (e.g., randomization/curriculum).
+        desired_key = (int(self._rtt_ms), str(self._loss_mode), int(self._bitrate_mbps))
+        if getattr(self._runner, "_net_cfg_key", None) != desired_key:
+            try:
+                self._runner.configure_network(
+                    rtt_ms=int(self._rtt_ms),
+                    loss_mode=str(self._loss_mode),
+                    loss_pct=int(self._loss_pct),
+                    bitrate_mbps=int(self._bitrate_mbps),
+                )
+            except Exception as e:
+                # If shaping setup fails here, step() will fall back to the old behavior.
+                if not self._ignore_runner_errors:
+                    raise RuntimeError(f"QUIC-FEC network setup failed: {e}")
         return self._last_obs_vec.copy(), {}
 
     def step(self, action: np.ndarray):
-        a = np.asarray(action, dtype=np.float32).reshape(-1)
-        if a.size < 4:
-            raise ValueError("Action must be length-4 array")
-        a = np.clip(a[:4], -1.0, 1.0)
-        # Map from [-1,1] → [low, high]
-        a_scaled = self._low + (a + 1.0) * 0.5 * (self._high - self._low)
-        K = int(np.round(float(a_scaled[0])))
-        if K < 10:
-            K = 10
-        if K > 64:
-            K = 64
-        R0_pct = float(a_scaled[1])
-        RSTEP = int(np.round(float(a_scaled[2])))
-        if RSTEP < 1:
-            RSTEP = 1
-        if RSTEP > 8:
-            RSTEP = 8
-        ddl_ms = int(np.round(float(a_scaled[3])))
-        if ddl_ms < 300:
-            ddl_ms = 300
-        if ddl_ms > 600:
-            ddl_ms = 600
-        act = Action(K=K, R0_pct=R0_pct, RSTEP=RSTEP, ddl_ms=ddl_ms)
+        a = np.asarray(action).reshape(-1)
+        if a.size != 4:
+            raise ValueError("Action must be length-4 MultiDiscrete array")
+
+        k_idx = int(a[0])
+        r0_idx = int(a[1])
+        rstep_idx = int(a[2])
+        ddl_idx = int(a[3])
+
+        if not (0 <= k_idx <= 54):
+            raise ValueError(f"K index out of range: {k_idx}")
+        if not (0 <= r0_idx <= 10):
+            raise ValueError(f"R0_pct index out of range: {r0_idx}")
+        if not (0 <= rstep_idx <= 8):
+            raise ValueError(f"RSTEP index out of range: {rstep_idx}")
+        if not (0 <= ddl_idx <= 20):
+            raise ValueError(f"ddl index out of range: {ddl_idx}")
+
+        K = 10 + k_idx
+        R0_pct = 0.1 * float(r0_idx)
+        RSTEP = 1 + rstep_idx
+        ddl_ms = 300 + 15 * ddl_idx
+        act = Action(K=int(K), R0_pct=float(R0_pct), RSTEP=int(RSTEP), ddl_ms=int(ddl_ms))
 
         obs_dict, _reward_unused, _done_transfer, info = self._runner.step(
             act,
@@ -556,9 +563,9 @@ class FecEnv(gym.Env):
         obs_vec = self._obs_to_vec(obs_dict)
         obs_vec = self._norm.transform(self._norm.update(obs_vec))
         self._last_obs_vec = obs_vec
-        self._prev_action = a.copy()
+        self._prev_action = np.asarray([k_idx, r0_idx, rstep_idx, ddl_idx], dtype=np.int32)
 
-        r0_used = max(0, int(round(float(R0_pct) * float(K))))
+        r0_used = max(0, int(float(R0_pct) * float(K)))
         info = {
             **(info or {}),
             "net_params": {
@@ -599,10 +606,8 @@ class FecEnv(gym.Env):
             # requested filename.
             log_path = os.path.join(dest_dir, "step_metrics.json")
 
-            if self._log_raw_obs_full:
-                raw_obs_out = obs_dict
-            else:
-                raw_obs_out = {k: obs_dict.get(k, 0.0) for k in self._obs_keys}
+            # Always log only the observations used by the policy.
+            raw_obs_out = {k: obs_dict.get(k, 0.0) for k in self._obs_keys}
 
             # Return raw observations to the caller as well (useful for smoke tests).
             info["raw_obs"] = raw_obs_out
@@ -706,7 +711,7 @@ class FecEnv(gym.Env):
         d95 = float(obs.get("decode_latency_p95_ms", 0.0))
         d = float(max(1, int(ddl_ms)))
         oh = float(obs.get("fec_overhead_pct_arrival", 0.0))
-        a95 = float(obs.get("arq_attempts_p95", 0.0))
+        a_mean = float(obs.get("arq_attempts_mean", 0.0))
 
         if self._reward_variant == "legacy":
             # Previous shaping (kept for reproducibility)
@@ -718,7 +723,7 @@ class FecEnv(gym.Env):
             lat_term = -lam_d * max(0.0, (d95 - d) / max(d, 1.0))
             lam_o = 0.3
             oh_term = -lam_o * max(0.0, (oh - 40.0) / 60.0)
-            arq_term = -min(0.3, 0.08 * a95)
+            arq_term = -min(0.3, 0.08 * a_mean)
             r = tp_term + resid_term + lat_term + oh_term + arq_term
             return float(r), {
                 "tp_term": float(tp_term),
@@ -748,7 +753,7 @@ class FecEnv(gym.Env):
         r_tilde = float(np.clip(oh / 100.0, 0.0, 1.0))
 
         # Optional ARQ penalty (scaled, non-saturating by default)
-        arq_tilde = float(np.clip(a95 / 30.0, 0.0, 1.0))
+        arq_tilde = float(np.clip(a_mean / 30.0, 0.0, 1.0))
 
         tp_term = self._reward_w_goodput * g_tilde
         lat_term = -self._reward_w_delay * d_tilde
