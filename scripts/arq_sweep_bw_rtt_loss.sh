@@ -41,9 +41,9 @@ fi
 FILE="$ROOT/go/test_data/train_FD001.txt"
 FILE_SIZE=$(stat -c%s "$FILE")
 
-# JSONL file for rl-observation lines
-OBS_JSONL=${OBS_JSONL:-/tmp/arq_sweep_10mbps_rl.jsonl}
-echo -n >"$OBS_JSONL"
+# JSON (line-oriented) file for rl-observation lines
+OBS_JSON=${OBS_JSON:-/tmp/arq_sweep_10mbps_rl.json}
+echo -n >"$OBS_JSON"
 
 # CSV headers
 echo "rate_mbps,rtt_ms,loss_pct,run,client_bytes,client_dgrams,client_send_mbps,server_goodput_mbps,dur_ms,clusters,attempts,repairs,symbols_total,overhead_pct,md5_ok" >"$OUT_RAW"
@@ -119,7 +119,7 @@ for rtt in "${RTTS[@]}"; do
 
       echo "[run] rate=10 rtt=${rtt}ms loss=${loss}% run=${run} dur_ms=${DUR_MS} md5_ok=${MD5_OK} c_mbps=${C_MBPS} s_mbps=${S_MBPS} attempts=${ATTEMPTS} overhead=${OVER_PCT}%" >&2
       if [[ -n "$RL_OBS" ]]; then
-        echo "$RL_OBS" >>"$OBS_JSONL"
+        echo "$RL_OBS" >>"$OBS_JSON"
         echo "$RL_OBS" >&2
       fi
 

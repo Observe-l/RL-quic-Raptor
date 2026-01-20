@@ -19,8 +19,8 @@ ACK_EVERY=${ACK_EVERY:-0}
 SYMBOL_BYTES=${SYMBOL_BYTES:-1200}
 PACE_US=${PACE_US:-0}
 
-OBS_JSONL=${OBS_JSONL:-/tmp/arq_local_smoke_rl.jsonl}
-echo -n >"$OBS_JSONL"
+OBS_JSON=${OBS_JSON:-/tmp/arq_local_smoke_rl.json}
+echo -n >"$OBS_JSON"
 
 chmod +x "$ROOT/scripts"/*.sh || true
 
@@ -58,7 +58,7 @@ for run in $(seq 1 "$REPS"); do
 
   RL_OBS=$(grep -E "^\[rl-observation\]" "$SRV_LOG" | tail -n1 || true)
   if [[ -n "$RL_OBS" ]]; then
-    echo "$RL_OBS" | tee -a "$OBS_JSONL" >&2
+    echo "$RL_OBS" | tee -a "$OBS_JSON" >&2
   else
     echo "[warn] no [rl-observation] line found" >&2
     tail -n +1 "$SRV_LOG" >&2 || true
@@ -66,4 +66,4 @@ for run in $(seq 1 "$REPS"); do
   rm -f "$CLI_LOG" "$SRV_LOG"
 done
 
-echo "[done] observations: $OBS_JSONL" >&2
+echo "[done] observations: $OBS_JSON" >&2

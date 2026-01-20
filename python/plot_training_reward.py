@@ -80,12 +80,12 @@ def episode_returns(epis: np.ndarray, rewards: np.ndarray) -> Tuple[np.ndarray, 
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Plot training reward from step_metrics.jsonl")
+    parser = argparse.ArgumentParser(description="Plot training reward from step_metrics.json (JSON Lines)")
     parser.add_argument(
         "--input",
         type=Path,
-        default=Path("python/results/run-20250907-232947/step_metrics.jsonl"),
-        help="Path to step_metrics.json or step_metrics.jsonl (JSON Lines)",
+        default=Path("python/results/run-20250907-232947/step_metrics.json"),
+        help="Path to step_metrics.json (JSON Lines) or step_metrics.jsonl",
     )
     parser.add_argument(
         "--out",

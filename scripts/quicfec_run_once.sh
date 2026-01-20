@@ -4,7 +4,14 @@ set -euo pipefail
 # Single trial QUIC-FEC run for RL. Configurable via env vars.
 # - Sets up/refreshes a netns and veth pair, configures tc for RTT/loss/rate.
 # - Starts server in the namespace, runs client on host once.
-# - Extracts last [rl-observation] line from server log and appends to OBS_JSONL.
+# - Extracts last [rl-observation] line from server log and appends to OBS_JSON.
+#
+# Training speed flags:
+#   SETUP_ONLY=1         Only prepare netns/tc (and optional build), then exit 0.
+#   SKIP_NETNS_RESET=1   Assume netns/veth already exist; do not recreate.
+#   SKIP_TC_CONFIG=1     Assume tc qdiscs already configured; do not replace.
+#   SKIP_SYSCTL=1        Skip UDP buffer sysctl tuning.
+#   SKIP_BUILD=1         Skip go build / rebuild checks (requires existing binaries).
 #
 # Env vars (with defaults):
 #   NS=qns, PORT=45300
@@ -15,7 +22,7 @@ set -euo pipefail
 #               #   gemodel:p,r,h,k (Gilbert-Elliott model, percents)
 #   FILE=$ROOT/go/test_data/train_FD001.txt
 #   K=40, SYMBOL_BYTES=1200, R0=6, W=8, DDL_MS=150, RSTEP=4, ALPHA=0.6, ACK_EVERY=8, MAX_ATTEMPTS=8
-#   OBS_JSONL=/tmp/quicfec_rl.jsonl
+#   OBS_JSON=/tmp/quicfec_rl.json
 #   POST_WAIT=0s (linger after client send; keep at 0s for fastest runs)
 #   SRV_TIMEOUT=10s (server max lifetime; lower keeps runs bounded)
 #   FORCE_BUILD=0 (set to 1 to force rebuilding Go binaries)
@@ -32,7 +39,7 @@ LOSS_PCT=${LOSS_PCT:-0}
 RATE="${BITRATE_MBPS}mbit"
 
 FILE=${FILE:-"$ROOT/go/test_data/train_FD001.txt"}
-OBS_JSONL=${OBS_JSONL:-/tmp/quicfec_rl.jsonl}
+OBS_JSON=${OBS_JSON:-/tmp/quicfec_rl.json}
 
 K=${K:-30}
 SYMBOL_BYTES=${SYMBOL_BYTES:-1032}
@@ -62,6 +69,12 @@ if [[ -z "${OBS_WAIT_SECS:-}" ]]; then
   fi
 fi
 
+SETUP_ONLY=${SETUP_ONLY:-0}
+SKIP_NETNS_RESET=${SKIP_NETNS_RESET:-0}
+SKIP_TC_CONFIG=${SKIP_TC_CONFIG:-0}
+SKIP_SYSCTL=${SKIP_SYSCTL:-0}
+SKIP_BUILD=${SKIP_BUILD:-0}
+
 # DDL_MS already defaulted above; kept here historically but now intentionally a no-op.
 
 chmod +x "$ROOT/scripts"/*.sh || true
@@ -77,63 +90,93 @@ if ! sudo -n true 2>/dev/null; then
   exit 1
 fi
 
-# Reset netns and (re)build binaries
-"$ROOT/scripts/netns_reset.sh" "$NS"
+# Reset netns (unless explicitly reusing an existing one)
+if [[ "$SKIP_NETNS_RESET" != "1" ]]; then
+  "$ROOT/scripts/netns_reset.sh" "$NS"
+else
+  # Validate the expected topology exists.
+  if ! sudo ip netns list | awk '{print $1}' | grep -qx "$NS"; then
+    echo "[error] netns '$NS' not found but SKIP_NETNS_RESET=1" >&2
+    exit 2
+  fi
+  if ! ip link show veth0 &>/dev/null; then
+    echo "[error] host veth0 not found but SKIP_NETNS_RESET=1" >&2
+    exit 2
+  fi
+  if ! sudo ip netns exec "$NS" ip link show veth1 &>/dev/null; then
+    echo "[error] ns veth1 not found but SKIP_NETNS_RESET=1" >&2
+    exit 2
+  fi
+fi
 
 # Quic-go attempts to increase UDP socket buffers. If the kernel caps are low,
 # this can cause drops under bursty senders (even when LOSS_PCT=0), which shows up
 # as run-to-run instability / occasional residual erasures.
 TUNE_UDP_BUFFERS=${TUNE_UDP_BUFFERS:-1}
-if [[ "${TUNE_UDP_BUFFERS}" == "1" ]]; then
+if [[ "${TUNE_UDP_BUFFERS}" == "1" && "$SKIP_SYSCTL" != "1" ]]; then
   # Best-effort: keep silent and don't fail the run if sysctl is restricted.
   sudo sysctl -w net.core.rmem_max=33554432 net.core.wmem_max=33554432 >/dev/null 2>&1 || true
   sudo sysctl -w net.core.rmem_default=33554432 net.core.wmem_default=33554432 >/dev/null 2>&1 || true
 fi
 # Rebuild if forced, binaries missing, or any Go source is newer than the binaries
 NEED_BUILD=0
-if [[ "${FORCE_BUILD:-0}" == "1" || ! -x "$BIN_DIR/quicfec-server" || ! -x "$BIN_DIR/quicfec-client" ]]; then
-  NEED_BUILD=1
+if [[ "$SKIP_BUILD" == "1" ]]; then
+  if [[ ! -x "$BIN_DIR/quicfec-server" || ! -x "$BIN_DIR/quicfec-client" ]]; then
+    echo "[error] SKIP_BUILD=1 but binaries missing in $BIN_DIR" >&2
+    exit 2
+  fi
 else
+  if [[ "${FORCE_BUILD:-0}" == "1" || ! -x "$BIN_DIR/quicfec-server" || ! -x "$BIN_DIR/quicfec-client" ]]; then
+  NEED_BUILD=1
+  else
   # If any Go file is newer than either binary, trigger rebuild
   if find "$ROOT/go" -type f -name '*.go' -newer "$BIN_DIR/quicfec-server" -print -quit | grep -q .; then NEED_BUILD=1; fi
   if find "$ROOT/go" -type f -name '*.go' -newer "$BIN_DIR/quicfec-client" -print -quit | grep -q .; then NEED_BUILD=1; fi
-fi
-if [[ "$NEED_BUILD" == "1" ]]; then
+  fi
+  if [[ "$NEED_BUILD" == "1" ]]; then
   mkdir -p "$BIN_DIR"
   (cd "$ROOT/go" && go build -o "$BIN_DIR/quicfec-server" ./cmd/quicfec-server && go build -o "$BIN_DIR/quicfec-client" ./cmd/quicfec-client)
+fi
 fi
 
 FILE_SIZE=$(stat -c%s "$FILE")
 
 # Configure qdiscs: half RTT on each direction; apply TBF at root and NETEM as child on host side
 half=$(( RTT_MS / 2 ))
-sudo tc qdisc del dev veth0 root 2>/dev/null || true
+if [[ "$SKIP_TC_CONFIG" != "1" ]]; then
+  sudo tc qdisc del dev veth0 root 2>/dev/null || true
 
-# Build NETEM args for loss model
-LOSS_MODE=${LOSS_MODE:-}
-NETEM_ARGS=(delay ${half}ms)
-case "$LOSS_MODE" in
-  none)
-    NETEM_ARGS+=(loss 0%) ;;
-  iid:*)
-    pct=${LOSS_MODE#iid:}
-    NETEM_ARGS+=(loss ${pct}%) ;;
-  gemodel:*)
-    params=${LOSS_MODE#gemodel:}
-    IFS=',' read -r p r h k <<<"$params"
-    NETEM_ARGS+=(loss gemodel ${p}% ${r}% ${h}% ${k}%) ;;
-  ""|*)
-    NETEM_ARGS+=(loss ${LOSS_PCT}%) ;;
-esac
+  # Build NETEM args for loss model
+  LOSS_MODE=${LOSS_MODE:-}
+  NETEM_ARGS=(delay ${half}ms)
+  case "$LOSS_MODE" in
+    none)
+      NETEM_ARGS+=(loss 0%) ;;
+    iid:*)
+      pct=${LOSS_MODE#iid:}
+      NETEM_ARGS+=(loss ${pct}%) ;;
+    gemodel:*)
+      params=${LOSS_MODE#gemodel:}
+      IFS=',' read -r p r h k <<<"$params"
+      NETEM_ARGS+=(loss gemodel ${p}% ${r}% ${h}% ${k}%) ;;
+    ""|*)
+      NETEM_ARGS+=(loss ${LOSS_PCT}%) ;;
+  esac
 
-# Apply TBF at root to enforce rate, then NETEM as child for delay/loss
-sudo tc qdisc replace dev veth0 root handle 1: tbf rate ${RATE} burst 32kb latency 400ms
-sudo tc qdisc replace dev veth0 parent 1:1 handle 10: netem "${NETEM_ARGS[@]}"
-sudo ip netns exec "$NS" tc qdisc del dev veth1 root 2>/dev/null || true
-sudo ip netns exec "$NS" tc qdisc replace dev veth1 root netem delay ${half}ms
+  # Apply TBF at root to enforce rate, then NETEM as child for delay/loss
+  sudo tc qdisc replace dev veth0 root handle 1: tbf rate ${RATE} burst 32kb latency 400ms
+  sudo tc qdisc replace dev veth0 parent 1:1 handle 10: netem "${NETEM_ARGS[@]}"
+  sudo ip netns exec "$NS" tc qdisc del dev veth1 root 2>/dev/null || true
+  sudo ip netns exec "$NS" tc qdisc replace dev veth1 root netem delay ${half}ms
+fi
 
-# JSONL for RL obs
-touch "$OBS_JSONL"
+# JSON (line-oriented) for RL obs
+touch "$OBS_JSON"
+
+if [[ "$SETUP_ONLY" == "1" ]]; then
+  # Network is configured; nothing else to do.
+  exit 0
+fi
 
 # Run server (logs in /tmp/quic_fec_srv.* for easy tailing)
 SRV_LOG=$(mktemp -t quic_fec_srv.XXXXXX.log)
@@ -266,7 +309,7 @@ if isinstance(ccj, dict):
 sys.stdout.write('[rl-observation] ' + json.dumps(payload, separators=(',', ':')))
 PY
   )
-  echo "$MERGED_LINE" >>"$OBS_JSONL"
+  echo "$MERGED_LINE" >>"$OBS_JSON"
   echo "$MERGED_LINE" >&2
   # If residual_erasures reported, keep logs for diagnosis and print tails
   if echo "$MERGED_LINE" | grep -q '"residual_erasures"[[:space:]]*:[[:space:]]*1'; then

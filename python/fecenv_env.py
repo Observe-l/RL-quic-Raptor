@@ -59,6 +59,8 @@ class QuicFecRunner:
         self.ns = ns
         # Only use the shaped runner script (no local mode)
         self.script = os.path.join(self.root, "scripts", "quicfec_run_once.sh")
+        # The shaping harness writes observations as one JSON object per line.
+        # We keep the format but use .json suffix (some tools dislike .jsonl).
         self.obs_json = os.environ.get("QUICFEC_OBS_JSON", "/tmp/quicfec_rl.json")
         self.last_cfg = None
         self.timeout_sec = int(timeout_sec)
@@ -68,6 +70,9 @@ class QuicFecRunner:
         self.srv_timeout = str(srv_timeout)
         self.obs_wait_secs = int(obs_wait_secs) if obs_wait_secs is not None else None
         self._train_file_path: Optional[str] = None
+        # Cache of the last applied network shaping parameters.
+        # When stable within an episode, we can skip netns/tc reconfiguration per step.
+        self._net_cfg_key: Optional[Tuple[int, str, int]] = None  # (rtt_ms, loss_mode, bitrate_mbps)
 
     def _ensure_train_file(self) -> Optional[str]:
         if self.train_file_bytes is None:
@@ -98,7 +103,69 @@ class QuicFecRunner:
         # (and constant negative rewards), which looks like "training runs" but is meaningless.
         self._sudo_ensure()
         self._ensure_train_file()
+        # Network config is applied per-episode by FecEnv.reset().
+        self._net_cfg_key = None
         return {"ok": True}
+
+    def configure_network(self, *, rtt_ms: int, loss_mode: str, loss_pct: int, bitrate_mbps: int) -> None:
+        """Configure netns + tc shaping once (typically at episode start).
+
+        The trial runner script is relatively expensive when it recreates the
+        namespace and replaces qdiscs. For RL training, network parameters are
+        constant within an episode, so we do this once in reset().
+        """
+
+        key = (int(rtt_ms), str(loss_mode), int(bitrate_mbps))
+        if self._net_cfg_key == key:
+            return
+
+        env = os.environ.copy()
+        path = env.get("PATH", "")
+        for p in ("/usr/local/go/bin", "/usr/local/bin", "/usr/bin", "/bin", "/sbin"):
+            if p not in path.split(":"):
+                path = (path + ":" + p) if path else p
+        env["PATH"] = path
+
+        cfg = self.last_cfg or EnvConfig()
+        env["NS"] = self.ns
+        env["RTT_MS"] = str(int(rtt_ms))
+        env["LOSS_MODE"] = str(loss_mode)
+        env["LOSS_PCT"] = str(int(loss_pct))
+        env["BITRATE_MBPS"] = str(int(bitrate_mbps))
+
+        # Keep the file deterministic and per-worker.
+        train_file = self._ensure_train_file()
+        if train_file:
+            env["FILE"] = train_file
+
+        # Ensure the observation file path exists, even though setup-only won't write observations.
+        obs_json_path = os.environ.get("QUICFEC_OBS_JSON", self.obs_json)
+        try:
+            os.makedirs(os.path.dirname(obs_json_path), exist_ok=True)
+        except Exception:
+            pass
+        env["OBS_JSON"] = obs_json_path
+
+        # One-time setup for this episode.
+        env["SETUP_ONLY"] = "1"
+        env["SKIP_NETNS_RESET"] = "0"
+        env["SKIP_TC_CONFIG"] = "0"
+        env["SKIP_SYSCTL"] = "0"
+        env["SKIP_BUILD"] = "0"
+
+        # Make sure sudo privileges are present.
+        self._sudo_ensure()
+        p = subprocess.run(
+            ["bash", "-c", f"bash '{self.script}'"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=self.timeout_sec,
+        )
+        if p.returncode != 0:
+            raise RuntimeError(f"network setup failed: code={p.returncode} stderr={p.stderr[-400:]}\nstdout={p.stdout[-400:]}")
+
+        self._net_cfg_key = key
 
     def step(self, action: Action, rtt_ms: int, loss_pct: int, bitrate_mbps: Optional[int] = None, loss_mode: Optional[str] = None) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
         env = os.environ.copy()
@@ -180,10 +247,32 @@ class QuicFecRunner:
             bitrate_mbps = int((cfg.target_bitrate_bps if cfg else 10_000_000) // 1_000_000)
         env["BITRATE_MBPS"] = str(int(bitrate_mbps))
 
+        # If the network hasn't been configured for this episode (or parameters changed),
+        # run a one-time setup pass.
+        try:
+            self.configure_network(
+                rtt_ms=int(rtt_ms),
+                loss_mode=str(lm or f"iid:{int(loss_pct)}"),
+                loss_pct=int(loss_pct),
+                bitrate_mbps=int(bitrate_mbps),
+            )
+        except Exception:
+            # Fall back to old behavior (script will reconfigure everything) if setup fails.
+            # This keeps the environment robust in interactive/debug sessions.
+            self._net_cfg_key = None
+
         try:
             env["NS"] = self.ns
             env["RTT_MS"] = str(int(rtt_ms))
             self._sudo_ensure()
+            # Training optimization: reuse per-episode netns/tc configuration.
+            # The episode-level setup is done via configure_network() from reset().
+            if self._net_cfg_key is not None:
+                env.setdefault("SETUP_ONLY", "0")
+                env.setdefault("SKIP_NETNS_RESET", "1")
+                env.setdefault("SKIP_TC_CONFIG", "1")
+                env.setdefault("SKIP_SYSCTL", "1")
+                env.setdefault("SKIP_BUILD", "1")
             # Avoid running as a login shell ("-l"), which can override PATH and
             # break tool discovery in non-interactive Ray workers.
             p = subprocess.run(["bash", "-c", f"bash '{self.script}'"], env=env, capture_output=True, text=True, timeout=self.timeout_sec)
@@ -406,6 +495,20 @@ class FecEnv(gym.Env):
             self._rtt_ms = int(self._base_rtt_ms)
             self._loss_pct = int(self._base_loss_pct)
             self._loss_mode = str(self._base_loss_mode)
+
+        # Training optimization: apply netns/tc shaping once per episode.
+        # Each step() then reuses the configured network and only runs the transfer.
+        try:
+            self._runner.configure_network(
+                rtt_ms=int(self._rtt_ms),
+                loss_mode=str(self._loss_mode),
+                loss_pct=int(self._loss_pct),
+                bitrate_mbps=int(self._bitrate_mbps),
+            )
+        except Exception as e:
+            # If shaping setup fails here, step() will fall back to the old behavior.
+            if not self._ignore_runner_errors:
+                raise RuntimeError(f"QUIC-FEC network setup failed: {e}")
         return self._last_obs_vec.copy(), {}
 
     def step(self, action: np.ndarray):
