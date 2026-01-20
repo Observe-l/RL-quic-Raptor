@@ -137,18 +137,41 @@ func newSentPacketHandler(
 		}
 	} else {
 		algo := strings.ToLower(strings.TrimSpace(os.Getenv("QUIC_FEC_CC_ALGO")))
-		// Default to CUBIC (quic-go default). Set QUIC_FEC_CC_ALGO=reno to use Reno.
-		useReno := algo == "reno"
-		if algo != "" && algo != "cubic" && algo != "reno" {
-			useReno = false
+		// Default to CUBIC (quic-go default).
+		switch algo {
+		case "", "cubic":
+			congestionCtrl = congestion.NewCubicSender(
+				congestion.DefaultClock{},
+				rttStats,
+				initialMaxDatagramSize,
+				false,
+				tracer,
+			)
+		case "reno":
+			congestionCtrl = congestion.NewCubicSender(
+				congestion.DefaultClock{},
+				rttStats,
+				initialMaxDatagramSize,
+				true,
+				tracer,
+			)
+		case "bbr", "bbrv2":
+			congestionCtrl = congestion.NewBBRv2Sender(
+				congestion.DefaultClock{},
+				rttStats,
+				initialMaxDatagramSize,
+				tracer,
+			)
+		default:
+			// Unknown value: fall back to CUBIC.
+			congestionCtrl = congestion.NewCubicSender(
+				congestion.DefaultClock{},
+				rttStats,
+				initialMaxDatagramSize,
+				false,
+				tracer,
+			)
 		}
-		congestionCtrl = congestion.NewCubicSender(
-			congestion.DefaultClock{},
-			rttStats,
-			initialMaxDatagramSize,
-			useReno,
-			tracer,
-		)
 	}
 
 	h := &sentPacketHandler{

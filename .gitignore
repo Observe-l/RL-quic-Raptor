@@ -26,3 +26,4 @@ docs
 __pycache__/
 *.pyc
 wandb/
+.venv/

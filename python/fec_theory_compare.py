@@ -149,6 +149,7 @@ def _run_once(
     r0_target: float,
     goodput_key: str,
     ddl_ms: int,
+    cc_algo: str,
 ) -> RunResult:
     env = os.environ.copy()
     env["LOSS_MODE"] = "iid"
@@ -156,6 +157,8 @@ def _run_once(
     # which supports decimal percentages (e.g., 0.1%).
     env["LOSS_PCT"] = str(float(loss_pct))
     env["QUIC_FEC_CC_BYPASS"] = "1" if int(cc_bypass) == 1 else "0"
+    if int(cc_bypass) == 0:
+        env["QUIC_FEC_CC_ALGO"] = str(cc_algo)
     env["TRANSPORT"] = str(transport)
     env["BITRATE_MBPS"] = str(int(bitrate_mbps))
     env["RTT_MS"] = str(int(rtt_ms))
@@ -451,6 +454,12 @@ def main() -> int:
     )
     ap.add_argument("--timeout-s", type=int, default=90)
     ap.add_argument(
+        "--cc-algo",
+        choices=["cubic", "reno", "bbr", "bbrv2"],
+        default="cubic",
+        help="Congestion control algorithm when CC is enabled (cc_bypass=0).",
+    )
+    ap.add_argument(
         "--ddl-ms",
         type=int,
         default=150,
@@ -511,6 +520,7 @@ def main() -> int:
                     r0_target=float(args.r0_target),
                     goodput_key=str(args.goodput_key),
                     ddl_ms=int(args.ddl_ms),
+                    cc_algo=str(args.cc_algo),
                 )
                 force_build_first = False
                 results.append(r)

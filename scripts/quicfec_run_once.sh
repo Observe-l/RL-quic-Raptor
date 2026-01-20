@@ -197,10 +197,79 @@ DUR_MS=$(( (END-START)/1000000 ))
 # Extract server observation (preferred)
 KEEP_LOGS=0
 if [[ -n "$RL_OBS" ]]; then
-  echo "$RL_OBS" >>"$OBS_JSONL"
-  echo "$RL_OBS" >&2
+  # Post-process observation:
+  # - Server-side estimated_available_bw_mbps is an arrival-rate estimator and can
+  #   collapse to goodput when the sender is app-limited or transfers are short.
+  # - For RL we want a sender-side bandwidth estimate derived from transport signals.
+  #   We extract the congestion-controller estimate emitted by the client and merge it.
+  # Preserve the server estimator under estimated_available_bw_arrival_mbps.
+  CC_EST=$(grep -E '^\[cc-estimate\] ' "$CLI_LOG" | tail -n1 || true)
+  MERGED_LINE=$(RL_OBS_LINE="$RL_OBS" CC_EST_LINE="$CC_EST" python3 - <<'PY'
+import json
+import os
+import sys
+
+line = os.environ.get('RL_OBS_LINE', '')
+cc = os.environ.get('CC_EST_LINE', '')
+
+if not line.startswith('[rl-observation] '):
+    sys.stdout.write(line)
+    sys.exit(0)
+
+try:
+    payload = json.loads(line.split(' ', 1)[1])
+except Exception:
+    sys.stdout.write(line)
+    sys.exit(0)
+
+# Keep a copy of the server's arrival-based estimator.
+try:
+    payload['estimated_available_bw_arrival_mbps'] = float(payload.get('estimated_available_bw_mbps', 0.0))
+except Exception:
+    payload['estimated_available_bw_arrival_mbps'] = 0.0
+
+def parse_cc_line(s: str):
+  s = (s or '').strip()
+  if not s.startswith('[cc-estimate] '):
+    return None
+  try:
+    return json.loads(s.split(' ', 1)[1])
+  except Exception:
+    return None
+
+ccj = parse_cc_line(cc)
+if isinstance(ccj, dict):
+  # Prefer BBRv2's delivery-rate sample (bw_mbps). Keep pacing bandwidth too.
+  bw = ccj.get('bw_mbps', None)
+  try:
+    bw = float(bw)
+  except Exception:
+    bw = None
+  # Basic sanity clamp: ignore insane values (e.g., ack compression artifacts).
+  if bw is not None and bw > 0 and bw < 100000:
+    payload['estimated_available_bw_mbps'] = bw
+    payload['estimated_available_bw_cc_mbps'] = bw
+  pbw = ccj.get('pacing_bw_mbps', None)
+  try:
+    pbw = float(pbw)
+  except Exception:
+    pbw = None
+  if pbw is not None and pbw > 0:
+    payload['estimated_pacing_bw_cc_mbps'] = pbw
+  algo = ccj.get('algo', None)
+  if algo is not None:
+    payload['cc_algo_reported'] = algo
+  mode = ccj.get('mode', None)
+  if mode is not None:
+    payload['cc_mode'] = mode
+
+sys.stdout.write('[rl-observation] ' + json.dumps(payload, separators=(',', ':')))
+PY
+  )
+  echo "$MERGED_LINE" >>"$OBS_JSONL"
+  echo "$MERGED_LINE" >&2
   # If residual_erasures reported, keep logs for diagnosis and print tails
-  if echo "$RL_OBS" | grep -q '"residual_erasures"[[:space:]]*:[[:space:]]*1'; then
+  if echo "$MERGED_LINE" | grep -q '"residual_erasures"[[:space:]]*:[[:space:]]*1'; then
     KEEP_LOGS=1
     echo "[diag] residual_erasures=1 detected; preserving logs:" >&2
     echo "[diag] server log: $SRV_LOG" >&2

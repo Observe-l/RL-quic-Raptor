@@ -105,7 +105,10 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	qconf := &quic.Config{
 		// attach our ECN tracer to observe CE/ECT counts
 		Tracer: func(ctx context.Context, p logging.Perspective, cid logging.ConnectionID) *logging.ConnectionTracer {
-			return NewECNConnTracer(ecnStats)
+			return logging.NewMultiplexedConnectionTracer(
+				NewECNConnTracer(ecnStats),
+				NewCCDebugConnTracer(),
+			)
 		},
 		EnableDatagrams: true,
 		// Prevent idle timeouts; keep small to avoid tail delays on shutdown.

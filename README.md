@@ -13,11 +13,21 @@ This repo integrates a QUIC-FEC Go stack with an RLlib (IPPO) pipeline. Each RL 
   - `python/fecenv_config.py` — PPO config builder
   - `python/fecenv_train.py` — training entrypoint
 - Results & logs are written under `python/results/run-<timestamp>/`:
-  - per-step metrics: `step_metrics.jsonl`
+  - per-step metrics (JSONL): `step_metrics.jsonl`
   - RLlib summary for the iteration: `ray_result.json`
+
+## RL interface (current)
+The RL environment is tuned for **QUIC-FEC + BBRv2 congestion control** (CC enabled).
+
+- Action space: 2-D continuous in [-1, 1]^2 (mapped internally)
+  - `R0_pct`: initial repair ratio relative to `K` (e.g., 0.2 means `R0≈0.2*K`)
+  - `ddl_ms`: receiver decode deadline (affects ARQ timing)
+- Observations: derived from server `[rl-observation]` JSON, focusing on arrival goodput, overhead, residual erasures, ARQ stats, latency, and estimated bandwidth.
+- Fixed knobs (by default): CC algorithm (`bbrv2`), `K`, and `symbol_bytes`. Adjust via `EnvConfig` in `python/fecenv_env.py` if needed.
 
 ## Episode design
 - Default `episode_step=100` (configurable via env var `EPISODE_STEP`).
+- Default per-step transfer: 1 MiB file, shaped to 50 Mbps, RTT=100 ms (override via `env_config` in `python/fecenv_env.py` / RLlib config).
 - Network parameters are randomized on every `reset()` with a 40%/40%/20% mix of:
   - iid loss + RTT jitter + slow bandwidth drift
   - Gilbert–Elliott burst loss
@@ -33,10 +43,7 @@ sudo -v
 ```bash
 cd python
 # Shaped (tc) run — requires sudo (see step 1)
-FECENV_LOCAL=0 EPISODE_STEP=100 python3 fecenv_train.py
-
-# Optional: sudo-free local pacing (no tc shaping)
-FECENV_LOCAL=1 EPISODE_STEP=100 python3 fecenv_train.py
+EPISODE_STEP=100 python3 fecenv_train.py
 ```
 
 Notes:

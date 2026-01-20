@@ -262,11 +262,16 @@ func (m *serverMetrics) Snapshot(now time.Time) Observation {
 	bytesSum := int64(0)
 	symSum := int64(0)
 	n := len(m.buckets)
+	active := 0
 	rates := make([]float64, 0, n)
 	bucketSec := float64(m.bucketDur) / float64(time.Second)
 	for _, b := range m.buckets {
 		bytesSum += b.bytes
 		symSum += b.symbols
+		if b.bytes <= 0 {
+			continue
+		}
+		active++
 		rate := (float64(b.bytes) * 8.0 / 1e6)
 		if bucketSec > 0 {
 			rate = rate / bucketSec
@@ -299,30 +304,36 @@ func (m *serverMetrics) Snapshot(now time.Time) Observation {
 		}
 	}
 	return Observation{
-		GoodputDecodeMbps:        goodput,
-		GoodputArrivalMbps:       goodputArrival,
-		DurationTransferMs:       durTransferMs,
-		DurationArrivalMs:        durArrivalMs,
-		DurationDecodeMs:         (m.decodeComputeTotalNs + 999_999) / 1_000_000, // ceil(ns->ms)
-		ResidualErasures:         0,                                              // non-residual path only; finalize checks integrity
-		FECOverheadPctArrival:    overPct,
-		RxTotalSymbols:           m.totalSymbols,
-		RxRepairSymbols:          m.repairSymbols,
-		RxSourceSymbols:          rxSourceSymbols,
-		RxTotalSymbolBytes:       m.totalSymbolBytes,
-		RxRepairSymbolBytes:      m.repairSymbolBytes,
-		RxSourceSymbolBytes:      rxSourceBytes,
-		CtrlTxBytes:              m.ctrlTxBytes,
-		CtrlTxAckMsgs:            m.ctrlTxAckMsgs,
-		CtrlTxNackMsgs:           m.ctrlTxNackMsgs,
-		CtrlTxDroppedMsgs:        m.ctrlTxDroppedMsgs,
-		ARQAttemptsMean:          meanAttempts,
-		ARQAttemptsP95:           p95Attempts,
-		RxUniqueAtDDLMean:        meanDDL,
-		RxUniqueAtDDLP95:         p95DDL,
-		DecodeLatencyP50Ms:       p50Dec,
-		DecodeLatencyP95Ms:       p95Dec,
-		ArrivalSymbolRateKppsP95: (float64(symSum) / (float64(n) * bucketSec)) / 1000.0,
+		GoodputDecodeMbps:     goodput,
+		GoodputArrivalMbps:    goodputArrival,
+		DurationTransferMs:    durTransferMs,
+		DurationArrivalMs:     durArrivalMs,
+		DurationDecodeMs:      (m.decodeComputeTotalNs + 999_999) / 1_000_000, // ceil(ns->ms)
+		ResidualErasures:      0,                                              // non-residual path only; finalize checks integrity
+		FECOverheadPctArrival: overPct,
+		RxTotalSymbols:        m.totalSymbols,
+		RxRepairSymbols:       m.repairSymbols,
+		RxSourceSymbols:       rxSourceSymbols,
+		RxTotalSymbolBytes:    m.totalSymbolBytes,
+		RxRepairSymbolBytes:   m.repairSymbolBytes,
+		RxSourceSymbolBytes:   rxSourceBytes,
+		CtrlTxBytes:           m.ctrlTxBytes,
+		CtrlTxAckMsgs:         m.ctrlTxAckMsgs,
+		CtrlTxNackMsgs:        m.ctrlTxNackMsgs,
+		CtrlTxDroppedMsgs:     m.ctrlTxDroppedMsgs,
+		ARQAttemptsMean:       meanAttempts,
+		ARQAttemptsP95:        p95Attempts,
+		RxUniqueAtDDLMean:     meanDDL,
+		RxUniqueAtDDLP95:      p95DDL,
+		DecodeLatencyP50Ms:    p50Dec,
+		DecodeLatencyP95Ms:    p95Dec,
+		// Use active bucket count to avoid dilution from idle buckets (common for short transfers).
+		ArrivalSymbolRateKppsP95: func() float64 {
+			if active <= 0 || bucketSec <= 0 {
+				return 0
+			}
+			return (float64(symSum) / (float64(active) * bucketSec)) / 1000.0
+		}(),
 		EstimatedAvailableBwMbps: estBW,
 	}
 }

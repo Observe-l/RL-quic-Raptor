@@ -21,25 +21,27 @@ except Exception:
 class EnvConfig:
     datagrams_enabled: bool = True
     num_connections: int = 1
-    cc_mode: str = "bypass"
+    # RL runs assume CC enabled with BBRv2. (cc_bypass is lab-only.)
+    cc_algo: str = "bbrv2"
     target_bitrate_bps: int = 10_000_000
     loss_profile: str = "iid:0"
-    K: int = 40
+    # Coding params.
+    # Fix symbol_bytes to 1200 to avoid MTU issues and improve goodput.
+    K: int = 30
     symbol_bytes: int = 1200
 
 
 @dataclass
 class Action:
-    R0: int = 6
-    R_step: int = 4
-    window_W: int = 8
-    ddl_ms: int = 200
-    alpha: float = 0.6
-    epsilon: int = 1
-    interleaver_span: int = 0
-    pacing_gain: float = 1.0
-    K: int | None = None
-    symbol_bytes: int | None = None
+    # Action space for QUIC-FEC control:
+    # - K: source symbols per block
+    # - R0_pct: initial parity ratio relative to K
+    # - RSTEP: incremental repair step size
+    # - ddl_ms: receiver decode deadline used for ARQ/NACK timing
+    K: int = 30
+    R0_pct: float = 0.2
+    RSTEP: int = 4
+    ddl_ms: int = 450
 
 
 class QuicFecRunner:
@@ -50,14 +52,14 @@ class QuicFecRunner:
         timeout_sec: int = 15,
         train_file_bytes: int | None = None,
         post_wait: str = "0ms",
-        srv_timeout: str = "12s",
+        srv_timeout: str = "30s",
         obs_wait_secs: int | None = None,
     ):
         self.root = root or os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         self.ns = ns
         # Only use the shaped runner script (no local mode)
         self.script = os.path.join(self.root, "scripts", "quicfec_run_once.sh")
-        self.obs_jsonl = os.environ.get("QUICFEC_OBS_JSONL", "/tmp/quicfec_rl.jsonl")
+        self.obs_json = os.environ.get("QUICFEC_OBS_JSON", "/tmp/quicfec_rl.json")
         self.last_cfg = None
         self.timeout_sec = int(timeout_sec)
         self.pace_us = 200
@@ -108,32 +110,43 @@ class QuicFecRunner:
                 path = (path + ":" + p) if path else p
         env["PATH"] = path
         env["REPS"] = "1"
-        k_val = action.K if (action.K is not None) else (self.last_cfg.K if self.last_cfg else 40)
-        sb_val = action.symbol_bytes if (action.symbol_bytes is not None) else (self.last_cfg.symbol_bytes if self.last_cfg else 1200)
-        env["K"] = str(int(k_val))
-        env["SYMBOL_BYTES"] = str(int(sb_val))
-        env["R0"] = str(int(action.R0))
-        env["W"] = str(int(action.window_W))
-        env["DDL_MS"] = str(int(action.ddl_ms))
-        env["RSTEP"] = str(int(action.R_step))
-        env["ALPHA"] = str(float(action.alpha))
-        env["EPSILON"] = str(int(action.epsilon))
-        env["INTERLEAVER_SPAN"] = str(int(action.interleaver_span))
-        # Harness uses PACE_US (not PACING_US). Keep PACING_* for debugging, but set PACE_US for effect.
-        env["PACING_GAIN"] = str(float(action.pacing_gain))
-        env["PACING_US"] = str(np.round(float(action.pacing_gain * self.pace_us)))
-        env["PACE_US"] = str(int(np.round(float(action.pacing_gain * self.pace_us))))
+        cfg = self.last_cfg or EnvConfig()
+        # K and RSTEP are controlled by the policy.
+        k = int(getattr(action, "K", cfg.K))
+        if k < 1:
+            k = 1
+        env["K"] = str(int(k))
+        # Keep SYMBOL_BYTES fixed to avoid MTU-triggered fragmentation.
+        env["SYMBOL_BYTES"] = str(int(getattr(cfg, "symbol_bytes", 1200)))
 
-        # Congestion control mode: "bypass" uses a NoopSender in quic-go (lab-only).
-        # For higher goodput and fewer internal drops on shaped links, prefer CC enabled.
-        cc_mode = (self.last_cfg.cc_mode if self.last_cfg else "bypass")
-        env["QUIC_FEC_CC_BYPASS"] = "1" if cc_mode == "bypass" else "0"
+        # Map R0_pct -> integer R0.
+        # Requirement: R0 in [0.1*K, 1.0*K]. Enforce it after rounding.
+        r0 = int(round(float(action.R0_pct) * float(k)))
+        min_r0 = max(1, (int(k) + 9) // 10)  # ceil(0.1*K)
+        if r0 < min_r0:
+            r0 = min_r0
+        if r0 > int(k):
+            r0 = int(k)
+        env["R0"] = str(int(r0))
+        env["DDL_MS"] = str(int(action.ddl_ms))
+
+        # ARQ policy (RSTEP is controlled by the policy).
+        env["W"] = os.environ.get("W", "8")
+        env["RSTEP"] = str(int(getattr(action, "RSTEP", int(os.environ.get("RSTEP", "4")))))
+        env["ALPHA"] = os.environ.get("ALPHA", "0.6")
+        env["MAX_ATTEMPTS"] = os.environ.get("MAX_ATTEMPTS", "5")
+
+        # CC is always enabled with BBRv2.
+        env["QUIC_FEC_CC_BYPASS"] = "0"
+        env["QUIC_FEC_CC_ALGO"] = str(getattr(cfg, "cc_algo", "bbrv2"))
+
+        # Disable app-level pacing when CC is enabled.
+        env["PACE_US"] = "0"
 
         # Transport selection: datagrams are unreliable; streams are reliable.
-        datagrams_enabled = bool(self.last_cfg.datagrams_enabled if self.last_cfg else True)
+        datagrams_enabled = bool(cfg.datagrams_enabled)
         env.setdefault("TRANSPORT", "dgram" if datagrams_enabled else "stream")
         env["ACK_EVERY"] = os.environ.get("ACK_EVERY", "8")
-        env["MAX_ATTEMPTS"] = os.environ.get("MAX_ATTEMPTS", "8")
         env["OUT_RAW"] = "/tmp/rl_arq_raw.csv"
         env["OUT_AGG"] = "/tmp/rl_arq_agg.csv"
 
@@ -142,8 +155,8 @@ class QuicFecRunner:
         # we prefer faster feedback.
         env.setdefault("POST_WAIT", self.post_wait)
         env.setdefault("SRV_TIMEOUT", self.srv_timeout)
-            # Avoid long tail waits during training; benchmarks can override.
-            env.setdefault("QUIC_FEC_ARQ_DRAIN_CAP_MS", "3000")
+        # Avoid long tail waits during training; benchmarks can override.
+        env.setdefault("QUIC_FEC_ARQ_DRAIN_CAP_MS", "3000")
         if self.obs_wait_secs is not None:
             env.setdefault("OBS_WAIT_SECS", str(int(self.obs_wait_secs)))
 
@@ -151,20 +164,20 @@ class QuicFecRunner:
         if train_file:
             env["FILE"] = train_file
 
-        lm = (loss_mode or (self.last_cfg.loss_profile if self.last_cfg else None))
+        lm = (loss_mode or (cfg.loss_profile if cfg else None))
         if lm:
             env["LOSS_MODE"] = str(lm)
         env["LOSS_PCT"] = str(int(loss_pct))
 
-        obs_jsonl_path = os.environ.get("QUICFEC_OBS_JSONL", self.obs_jsonl)
+        obs_json_path = os.environ.get("QUICFEC_OBS_JSON", self.obs_json)
         try:
-            os.makedirs(os.path.dirname(obs_jsonl_path), exist_ok=True)
+            os.makedirs(os.path.dirname(obs_json_path), exist_ok=True)
         except Exception:
             pass
-        env["OBS_JSONL"] = obs_jsonl_path
+        env["OBS_JSON"] = obs_json_path
 
         if bitrate_mbps is None:
-            bitrate_mbps = int((self.last_cfg.target_bitrate_bps if self.last_cfg else 10_000_000) // 1_000_000)
+            bitrate_mbps = int((cfg.target_bitrate_bps if cfg else 10_000_000) // 1_000_000)
         env["BITRATE_MBPS"] = str(int(bitrate_mbps))
 
         try:
@@ -176,7 +189,7 @@ class QuicFecRunner:
             p = subprocess.run(["bash", "-c", f"bash '{self.script}'"], env=env, capture_output=True, text=True, timeout=self.timeout_sec)
             if p.returncode != 0:
                 raise RuntimeError(f"harness failed: code={p.returncode} stderr={p.stderr[-400:]}\nstdout={p.stdout[-400:]}")
-            obs = self._read_last_obs(obs_jsonl_path)
+            obs = self._read_last_obs(obs_json_path)
         # Reward is computed at the Env level; return 0.0 placeholder here.
             return obs, 0.0, True, {}
         except subprocess.TimeoutExpired as te:
@@ -190,7 +203,7 @@ class QuicFecRunner:
 
     def _read_last_obs(self, file_path: Optional[str] = None) -> Dict[str, Any]:
         last = None
-        path = file_path or self.obs_jsonl
+        path = file_path or self.obs_json
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as f:
                 for line in f:
@@ -265,32 +278,18 @@ class FecEnv(gym.Env):
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         cfg = config or {}
-        # 8-D action in [-1, 1]^8 (tanh-squashed typical); mapped to actual config ranges.
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(8,), dtype=np.float32)
-        # Base observation keys coming from server
+        # 4-D action in [-1, 1]^4 (tanh-squashed typical): [K, R0_pct, RSTEP, ddl_ms]
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
+        # Policy observation keys (keep only the required fields).
         self._obs_keys: List[str] = [
-            "goodput_decode_mbps",
-            "duration_decode_ms",
-            "duration_transfer_ms",
-            "residual_erasures",
-            "fec_overhead_pct_arrival",
-            "rx_total_symbols",
-            "rx_repair_symbols",
-            "rx_total_symbol_bytes",
-            "ctrl_tx_bytes",
-            "ctrl_tx_ack_msgs",
-            "ctrl_tx_nack_msgs",
-            "ctrl_tx_dropped_msgs",
-            "arq_attempts_mean",
-            "arq_attempts_p95",
-            "rx_unique_at_ddl_mean",
-            "rx_unique_at_ddl_p95",
-            "decode_latency_p50_ms",
             "decode_latency_p95_ms",
             "estimated_available_bw_mbps",
+            "fec_overhead_pct_arrival",
+            "ctrl_tx_nack_msgs",
+            "residual_erasures",
+            "rx_unique_at_ddl_p95",
         ]
-        # We append normalized network features (4) and previous action (8)
-        self._obs_extra_dim = 4 + 8
+        self._obs_extra_dim = 0
         self.observation_space = spaces.Box(
             low=-5.0, high=+np.inf, shape=(len(self._obs_keys) + self._obs_extra_dim,), dtype=np.float32
         )
@@ -305,7 +304,7 @@ class FecEnv(gym.Env):
         self._ignore_runner_errors = bool(cfg.get("ignore_runner_errors", False))
 
         # Curriculum / randomization
-        self._randomize_net_params_enabled = bool(cfg.get("randomize_net_params", True))
+        self._randomize_net_params_enabled = bool(cfg.get("randomize_net_params", False))
         self._curriculum_warmup_episodes = int(cfg.get("curriculum_warmup_episodes", 0))
 
         # Reward shaping (default matches docs/main.pdf Eq. (25) more closely)
@@ -332,40 +331,51 @@ class FecEnv(gym.Env):
         self._base_loss_mode = str(self._loss_mode)
 
         # Link capacity / shaping rate (Mbps)
-        self._bitrate_mbps = int(cfg.get("bitrate_mbps", 10))
+        self._bitrate_mbps = int(cfg.get("bitrate_mbps", 50))
         self._capacity_mbps = float(self._bitrate_mbps)
         self._result_dir_hint = cfg.get("result_dir")
 
-        # Logging controls (step_metrics.json is JSONL)
+        # Logging controls (step_metrics.json is JSON)
         # - log_obs_vec: large; disable by default to avoid bloating logs.
         # - log_raw_obs_full: if False, only log the observation keys used by the policy.
         self._log_obs_vec = bool(cfg.get("log_obs_vec", False))
         self._log_raw_obs_full = bool(cfg.get("log_raw_obs_full", False))
 
         # Action mapping ranges from [-1,1] → [low, high]
-        # Action order: K, symbol_bytes, R0_pct, R_step, W, ddl_ms, alpha, pacing_gain
-        self._low = np.array([10, 768, 0.10, 1, 5, 300, 0.4, 0.85], dtype=np.float32)
-        self._high = np.array([64, 1188, 1.00, 20, 20, 600, 1.1, 2], dtype=np.float32)
+        # Order: K, R0_pct, RSTEP, ddl_ms
+        # Notes:
+        # - K is integer in [10,64]
+        # - R0_pct in [0.1, 1.0] and maps to R0 = round(R0_pct * K)
+        # - RSTEP is integer (range chosen to be safe for loss<=10%)
+        # - decoding deadline in [300,600] ms
+        self._low = np.array([10.0, 0.10, 1.0, 300.0], dtype=np.float32)
+        self._high = np.array([64.0, 1.00, 8.0, 600.0], dtype=np.float32)
 
         # Runner
+        # Default training file size: 1 MiB
+        default_train_file_bytes = 1 * 1024 * 1024
         self._runner = QuicFecRunner(
             timeout_sec=int(cfg.get("timeout_sec", 30)),
-            train_file_bytes=(int(cfg.get("train_file_bytes")) if cfg.get("train_file_bytes") is not None else None),
+            train_file_bytes=(
+                int(cfg.get("train_file_bytes"))
+                if cfg.get("train_file_bytes") is not None
+                else int(default_train_file_bytes)
+            ),
         )
         self._runner.reset(
             EnvConfig(
                 datagrams_enabled=True,
                 num_connections=1,
-                cc_mode="bypass",
+                cc_algo="bbrv2",
                 target_bitrate_bps=int(self._capacity_mbps * 1_000_000),
                 loss_profile=self._loss_mode,
-                K=40,
+                K=30,
                 symbol_bytes=1200,
             )
         )
 
         self._last_obs_vec = np.zeros((len(self._obs_keys) + self._obs_extra_dim,), dtype=np.float32)
-        self._prev_action = np.zeros((8,), dtype=np.float32)
+        self._prev_action = np.zeros((4,), dtype=np.float32)
         self._cap_hits = 0
         self._last_est_bw_mbps = float(self._capacity_mbps)
         self._norm = _RunningNorm(dim=self.observation_space.shape[0])
@@ -400,55 +410,28 @@ class FecEnv(gym.Env):
 
     def step(self, action: np.ndarray):
         a = np.asarray(action, dtype=np.float32).reshape(-1)
-        if a.size < 8:
-            raise ValueError("Action must be length-8 array")
-        a = np.clip(a[:8], -1.0, 1.0)
+        if a.size < 4:
+            raise ValueError("Action must be length-4 array")
+        a = np.clip(a[:4], -1.0, 1.0)
         # Map from [-1,1] → [low, high]
         a_scaled = self._low + (a + 1.0) * 0.5 * (self._high - self._low)
-        # Round discrete fields
-        int_idx = [0, 1, 3, 4]
-        a_scaled[int_idx] = np.round(a_scaled[int_idx])
-
-        K = int(a_scaled[0])
-        symbol_bytes = int(a_scaled[1])
-        R0_pct = float(a_scaled[2])
-        R_step = int(a_scaled[3])
-        W = int(a_scaled[4])
-        ddl_ms = int(a_scaled[5])
-        alpha = float(a_scaled[6])
-        pacing_gain = float(a_scaled[7])
-
-        # Payload alignment and safety margin
-        safety = 12
-        align = 8
-        max_payload = 1200 - safety
-        symbol_bytes = min(symbol_bytes, max_payload)
-        symbol_bytes = symbol_bytes - (symbol_bytes % align)
-
-        # Dynamic ddl lower bound for satellite
-        # ddl_floor = max(300, int(2 * self._rtt_ms))
-        # ddl_ms = int(min(max(ddl_ms, ddl_floor), 900))
-
-        # Desired parity and safety clamp by link budget
-        R0_desired = max(0, int(round(K * R0_pct)))
-        # avail = float(min(self._capacity_mbps, self._last_est_bw_mbps))
-        # R0_capped = cap_parity_by_budget(K, symbol_bytes, R0_desired, ddl_ms, avail)
-        # cap_hit = int(R0_capped < R0_desired)
-        # if cap_hit:
-        #     self._cap_hits += 1
-
-        act = Action(
-            R0=R0_desired,
-            R_step=R_step,
-            window_W=W,
-            ddl_ms=ddl_ms,
-            alpha=float(alpha),
-            epsilon=1,  # fixed
-            interleaver_span=0,  # fixed
-            pacing_gain=float(pacing_gain),
-            K=K,
-            symbol_bytes=symbol_bytes,
-        )
+        K = int(np.round(float(a_scaled[0])))
+        if K < 10:
+            K = 10
+        if K > 64:
+            K = 64
+        R0_pct = float(a_scaled[1])
+        RSTEP = int(np.round(float(a_scaled[2])))
+        if RSTEP < 1:
+            RSTEP = 1
+        if RSTEP > 8:
+            RSTEP = 8
+        ddl_ms = int(np.round(float(a_scaled[3])))
+        if ddl_ms < 300:
+            ddl_ms = 300
+        if ddl_ms > 600:
+            ddl_ms = 600
+        act = Action(K=K, R0_pct=R0_pct, RSTEP=RSTEP, ddl_ms=ddl_ms)
 
         obs_dict, _reward_unused, _done_transfer, info = self._runner.step(
             act,
@@ -467,12 +450,12 @@ class FecEnv(gym.Env):
         # Compute reward (variant selectable via env_config)
         reward, r_terms = self._compute_reward_satellite(obs_dict, ddl_ms)
         # Build observation vector: base obs + normalized net features + prev action
-        obs_vec_raw = self._obs_to_vec(obs_dict)
-        obs_vec = self._augment_obs(obs_vec_raw, ddl_ms)
+        obs_vec = self._obs_to_vec(obs_dict)
         obs_vec = self._norm.transform(self._norm.update(obs_vec))
         self._last_obs_vec = obs_vec
         self._prev_action = a.copy()
 
+        r0_used = max(0, int(round(float(R0_pct) * float(K))))
         info = {
             **(info or {}),
             "net_params": {
@@ -481,19 +464,17 @@ class FecEnv(gym.Env):
                 "loss_mode": self._loss_mode,
             },
             "fec_cfg": {
-                "K": K,
-                "symbol_bytes": symbol_bytes,
-                "R0_desired": R0_desired,
-                # "R0_capped": R0_capped,
-                "R_step": int(act.R_step),
-                "W": int(act.window_W),
+                "K": int(K),
+                "symbol_bytes": 1200,
+                "R0_pct": float(R0_pct),
+                "R0": int(r0_used),
+                "RSTEP": int(RSTEP),
                 "ddl_ms": ddl_ms,
-                "alpha": float(alpha),
-                "pacing_gain": float(pacing_gain),
+                "cc_algo": str(getattr(self._runner.last_cfg or EnvConfig(), "cc_algo", "bbrv2")),
             },
             "bw_cap_mbps": float(self._capacity_mbps),
             "est_bw_mbps": float(self._last_est_bw_mbps),
-            "goodput_mbps": float(obs_dict.get("goodput_decode_mbps", 0.0)),
+            "goodput_mbps": float(obs_dict.get("goodput_arrival_mbps", obs_dict.get("goodput_decode_mbps", 0.0))),
             "reward_terms": r_terms,
             # "cap_hit": cap_hit,
             "cap_hits_cum": self._cap_hits,
@@ -511,7 +492,7 @@ class FecEnv(gym.Env):
         )
         try:
             os.makedirs(dest_dir, exist_ok=True)
-            # Keep JSONL format (one JSON object per line) but write to the
+            # Keep JSON format (one JSON object per line) but write to the
             # requested filename.
             log_path = os.path.join(dest_dir, "step_metrics.json")
 
@@ -519,6 +500,9 @@ class FecEnv(gym.Env):
                 raw_obs_out = obs_dict
             else:
                 raw_obs_out = {k: obs_dict.get(k, 0.0) for k in self._obs_keys}
+
+            # Return raw observations to the caller as well (useful for smoke tests).
+            info["raw_obs"] = raw_obs_out
 
             rec = {
                 "t": int(self._global_step),
@@ -552,7 +536,7 @@ class FecEnv(gym.Env):
         if terminated:
             # Write episode summary to help diagnose learning signal and non-stationarity.
             try:
-                epi_path = os.path.join(dest_dir, "episode_metrics.jsonl")
+                epi_path = os.path.join(dest_dir, "episode_metrics.json")
                 denom = max(1, int(self._t_in_ep))
                 avg_terms = {k: float(v) / float(denom) for k, v in self._ep_term_sums.items()}
                 epi_rec = {
@@ -586,19 +570,8 @@ class FecEnv(gym.Env):
         return np.asarray(vals, dtype=np.float32)
 
     def _augment_obs(self, base: np.ndarray, ddl_ms: int) -> np.ndarray:
-        # Normalized network features
-        rtt_feat = float(self._rtt_ms) / 800.0
-        cap = max(1.0, float(self._capacity_mbps))
-        cap_feat = 1.0  # normalized by itself
-        estbw_feat = float(self._last_est_bw_mbps) / cap
-        ddl_feat = float(ddl_ms) / 1200.0
-        extras = np.array([
-            np.clip(rtt_feat, 0.0, 1.0),
-            np.clip(cap_feat, 0.0, 1.0),
-            np.clip(estbw_feat, 0.0, 1.0),
-            np.clip(ddl_feat, 0.0, 1.0),
-        ], dtype=np.float32)
-        return np.concatenate([base.astype(np.float32), extras, self._prev_action.astype(np.float32)], axis=0)
+        # Kept for backward compatibility; currently no extra dims.
+        return base.astype(np.float32)
 
     def _randomize_net_params(self) -> None:
         rng = self._rng
@@ -624,7 +597,7 @@ class FecEnv(gym.Env):
             self._loss_mode = f"gemodel:{pG},{r},{h},{pB}"
 
     def _compute_reward_satellite(self, obs: Dict[str, Any], ddl_ms: int) -> Tuple[float, Dict[str, float]]:
-        g = float(obs.get("goodput_decode_mbps", 0.0))
+        g = float(obs.get("goodput_arrival_mbps", obs.get("goodput_decode_mbps", 0.0)))
         est = float(obs.get("estimated_available_bw_mbps", self._capacity_mbps))
         e = float(obs.get("residual_erasures", 0.0))
         d95 = float(obs.get("decode_latency_p95_ms", 0.0))
