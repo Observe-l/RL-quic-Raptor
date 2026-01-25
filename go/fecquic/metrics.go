@@ -44,6 +44,7 @@ type Observation struct {
 	RxUniqueAtDDLP95         float64 `json:"rx_unique_at_ddl_p95"`
 	DecodeLatencyP50Ms       float64 `json:"decode_latency_p50_ms"`
 	DecodeLatencyP95Ms       float64 `json:"decode_latency_p95_ms"`
+	DecodeLatencyMeanMs      float64 `json:"decode_latency_mean_ms"`
 	ArrivalSymbolRateKppsP95 float64 `json:"arrival_symbol_rate_kpps_p95"`
 	EstimatedAvailableBwMbps float64 `json:"estimated_available_bw_mbps"`
 }
@@ -257,7 +258,9 @@ func (m *serverMetrics) Snapshot(now time.Time) Observation {
 	// rx_unique@DDL mean/p95
 	meanDDL, p95DDL := meanAndP(intsToFloat(m.ddlSamples), 0.95)
 	// decode latency p50/p95
-	p50Dec, p95Dec := percentiles(int64sToFloat(m.decodeLatencyMs), []float64{0.50, 0.95})
+	decLatFloats := int64sToFloat(m.decodeLatencyMs)
+	p50Dec, p95Dec := percentiles(decLatFloats, []float64{0.50, 0.95})
+	meanDec, _ := meanAndP(decLatFloats, 0.50)
 	// arrival rates per bucket and robust BW estimate
 	bytesSum := int64(0)
 	symSum := int64(0)
@@ -327,6 +330,7 @@ func (m *serverMetrics) Snapshot(now time.Time) Observation {
 		RxUniqueAtDDLP95:      p95DDL,
 		DecodeLatencyP50Ms:    p50Dec,
 		DecodeLatencyP95Ms:    p95Dec,
+		DecodeLatencyMeanMs:   meanDec,
 		// Use active bucket count to avoid dilution from idle buckets (common for short transfers).
 		ArrivalSymbolRateKppsP95: func() float64 {
 			if active <= 0 || bucketSec <= 0 {

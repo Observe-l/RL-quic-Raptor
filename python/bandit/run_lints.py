@@ -18,6 +18,8 @@ _ROOT_DIR = os.path.abspath(os.path.join(_THIS_DIR, ".."))
 if _ROOT_DIR not in sys.path:
     sys.path.insert(0, _ROOT_DIR)
 
+_REPO_ROOT = os.path.abspath(os.path.join(_ROOT_DIR, ".."))
+
 from fecenv_env import FecEnv  # noqa: E402
 
 from bandit.action_set import ActionSet  # noqa: E402
@@ -25,6 +27,31 @@ from bandit.context import ContextBuilder, ContextConfig  # noqa: E402
 from bandit.features import phi as phi_fn  # noqa: E402
 from bandit.lints import LinTS, LinTSConfig  # noqa: E402
 from bandit.model_io import load_checkpoint, save_checkpoint  # noqa: E402
+
+
+def _json_default(o: Any):
+    """JSON fallback encoder for long-running experiments."""
+
+    if isinstance(o, (bytes, bytearray, memoryview)):
+        try:
+            return bytes(o).decode("utf-8", errors="replace")
+        except Exception:
+            return repr(o)
+
+    try:
+        import numpy as _np
+
+        if isinstance(o, _np.generic):
+            return o.item()
+        if isinstance(o, _np.ndarray):
+            return o.tolist()
+    except Exception:
+        pass
+
+    try:
+        return str(o)
+    except Exception:
+        return repr(o)
 
 
 def _ensure_dir(p: str) -> None:
@@ -62,7 +89,9 @@ def main() -> int:
 
     ap.add_argument("--reward-w-arq", type=float, default=0.1)
     ap.add_argument("--reward-variant", type=str, default="qarc_v1")
-    ap.add_argument("--reward-delay-binary", type=int, default=1)
+    # Delay shaping: use continuous penalty by default to avoid a hard threshold
+    # that can dominate the reward when d95 hovers around ddl.
+    ap.add_argument("--reward-delay-binary", type=int, default=0)
     ap.add_argument("--reward-residual-binary", type=int, default=1)
 
     # Context builder
@@ -108,6 +137,8 @@ def main() -> int:
         "reward_delay_binary": bool(int(args.reward_delay_binary)),
         "reward_residual_binary": bool(int(args.reward_residual_binary)),
         "log_obs_vec": False,
+        # Bandit should only consume the environment observation (no debug info).
+        "normalize_obs": False,
     }
 
     env = FecEnv(env_cfg)
@@ -118,7 +149,7 @@ def main() -> int:
     dest_dir = args.result_dir or os.environ.get("QUICFEC_RESULT_DIR")
     if not dest_dir:
         ts = time.strftime("%Y%m%d-%H%M%S")
-        dest_dir = os.path.join(os.path.dirname(__file__), "..", "results", f"bandit-run-{ts}")
+        dest_dir = os.path.join(_REPO_ROOT, "python/results", f"bandit-run-{ts}")
     dest_dir = os.path.abspath(dest_dir)
     _ensure_dir(dest_dir)
     # Keep JSON-lines format (one JSON object per line) but use .json suffix.
@@ -245,8 +276,9 @@ def main() -> int:
             assert terminated or truncated  # env is configured with episode_step=1
 
             # Convert ddl_idx back to ddl_ms for context update
-            ddl_ms = 300 + 15 * int(a.ddl_idx)
-            ctx.update(info=info if isinstance(info, dict) else {}, ddl_ms=int(ddl_ms))
+            ddl_ms_values = [100, 150, 200, 250, 300, 350]
+            ddl_ms = int(ddl_ms_values[int(a.ddl_idx)])
+            ctx.update_from_obs(obs=obs, ddl_ms=int(ddl_ms))
 
             # Update LinTS
             if (t - int(start_t)) >= warmup:
@@ -276,7 +308,7 @@ def main() -> int:
                 rec["theta_norm"] = float(np.linalg.norm(theta))
 
             with open(log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec) + "\n")
+                f.write(json.dumps(rec, ensure_ascii=False, default=_json_default) + "\n")
 
             # Save top-k models by reward.
             maybe_save_topk(reward_val=float(reward), step_t=int(t))

@@ -28,6 +28,13 @@ sudo ip netns exec "$NS" ip addr add 10.10.0.2/24 dev veth1
 sudo ip netns exec "$NS" ip link set veth1 up
 sudo ip netns exec "$NS" ip link set lo up
 
+# Install permanent neighbor entries so ARP resolution doesn't depend on packets
+# getting through tc-netem loss (which can otherwise blackhole the link).
+VETH0_MAC=$(cat /sys/class/net/veth0/address)
+VETH1_MAC=$(sudo ip netns exec "$NS" cat /sys/class/net/veth1/address)
+sudo ip neigh replace 10.10.0.2 lladdr "$VETH1_MAC" dev veth0 nud permanent || true
+sudo ip netns exec "$NS" ip neigh replace 10.10.0.1 lladdr "$VETH0_MAC" dev veth1 nud permanent || true
+
 # Some environments (e.g., Cisco Secure Client VPN) install an iptables chain
 # that drops traffic by default. Allow local traffic over veth0 so the host
 # client can reach the server in the netns.

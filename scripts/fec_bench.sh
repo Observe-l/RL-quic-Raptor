@@ -2,7 +2,12 @@
 set -euo pipefail
 # FEC microbench at constant rate with CC bypass. Section 6 harness.
 # Usage:
-#   ./scripts/fec_bench.sh --rate 36mbit --K 40 --N 46 --payload 1200 --loss "iid:5"|"gemodel:0.5,20,80,0.1"
+#   ./scripts/fec_bench.sh --rate 36mbit --K 40 --N 46 --payload 1200 --loss "iid:5"|"gemodel:p,r,h,k"
+#
+# NOTE on gemodel:
+#   LOSS="gemodel:p,r,h,k" uses h=GOOD-state loss% and k=BAD-state loss%.
+#   `tc netem loss gemodel` expects: p r 1-h 1-k, where 1-h is BAD loss and 1-k
+#   is GOOD loss, so we pass k then h.
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN_DIR="$ROOT/go/bin"
@@ -57,7 +62,7 @@ if [[ -n "$LOSS" ]]; then
   elif [[ "$LOSS" == gemodel:* ]]; then
     params=${LOSS#gemodel:}
     IFS=',' read -r p r h k <<<"$params"
-    sudo tc qdisc replace dev veth0 root netem loss gemodel ${p}% ${r}% ${h}% ${k}%
+    sudo tc qdisc replace dev veth0 root netem loss gemodel ${p}% ${r}% ${k}% ${h}%
   fi
 else
   sudo tc qdisc replace dev veth0 root netem loss 0%

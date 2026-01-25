@@ -47,6 +47,8 @@ def _load_baseline(paths: Iterable[Path]) -> List[Row]:
             proto = str(r["proto"]).strip()
             if proto == "quic_raw":
                 method = "quic_raw_cubic"
+            elif proto in {"quic_bbrv2", "quic_raw_bbrv2", "quicraw_bbrv2"}:
+                method = "quic_bbrv2"
             elif proto == "tcp":
                 method = "tcp"
             else:
@@ -109,6 +111,7 @@ def _plot(medians: Dict[str, Dict[float, float]], losses: List[float], out_png: 
 
     styles = {
         "quic_raw_cubic": ("C0", "o", "Raw QUIC (CUBIC)"),
+        "quic_bbrv2": ("C4", "x", "Raw QUIC (BBRv2)"),
         "tcp": ("C2", "s", "TCP"),
         "quic_fec_cubic": ("C3", "^", "QUIC-FEC (CUBIC)"),
         "quic_fec_bbrv2": ("C1", "D", "QUIC-FEC (BBRv2)"),
@@ -138,6 +141,10 @@ def main() -> int:
     baseline_low = results_dir / "baseline_quicraw_tcp_bw50_loss_0p1_0p5_reps3.csv"
     baseline_high = results_dir / "baseline_quicraw_tcp_bw50_loss_1_5_10_reps3.csv"
 
+    # Optional: QUIC raw with BBRv2 baseline (if you produced it).
+    baseline_bbrv2_low = results_dir / "baseline_quicraw_bbrv2_tcp_bw50_loss_0p1_0p5_reps3.csv"
+    baseline_bbrv2_high = results_dir / "baseline_quicraw_bbrv2_tcp_bw50_loss_1_5_10_reps3.csv"
+
     fec_cubic_low = results_dir / "quicfec_cc_cubic_bw50_loss_0p1_0p5_reps3.csv"
     fec_cubic_high = results_dir / "quicfec_cc_cubic_bw50_loss_1_5_10_reps3.csv"
 
@@ -158,10 +165,17 @@ def main() -> int:
 
     rows: List[Row] = []
     rows += _load_baseline([baseline_low, baseline_high])
+    if baseline_bbrv2_low.exists() and baseline_bbrv2_high.exists():
+        rows += _load_baseline([baseline_bbrv2_low, baseline_bbrv2_high])
+    else:
+        print(
+            "[warn] QUIC-BBRv2 baseline CSVs not found; skipping. Expected both:\n"
+            f"  - {baseline_bbrv2_low}\n  - {baseline_bbrv2_high}"
+        )
     rows += _load_fec([fec_cubic_low, fec_cubic_high], method="quic_fec_cubic")
     rows += _load_fec([fec_bbrv2_low, fec_bbrv2_high], method="quic_fec_bbrv2")
 
-    out_csv = results_dir / "compare_4methods_bw50_loss_0p1_10_reps3.csv"
+    out_csv = results_dir / "compare_5methods_bw50_loss_0p1_10_reps3.csv"
     with out_csv.open("w", newline="") as f:
         w = csv.DictWriter(
             f,
@@ -180,12 +194,12 @@ def main() -> int:
                 }
             )
 
-    methods = ["quic_raw_cubic", "tcp", "quic_fec_cubic", "quic_fec_bbrv2"]
+    methods = ["quic_raw_cubic", "quic_bbrv2", "tcp", "quic_fec_cubic", "quic_fec_bbrv2"]
     per_method: Dict[str, Dict[float, float]] = {}
     for m in methods:
         per_method[m] = _median_per_loss([r for r in rows if r.method == m], losses)
 
-    out_png = results_dir / "compare_4methods_bw50_loss_0p1_10_reps3.png"
+    out_png = results_dir / "compare_5methods_bw50_loss_0p1_10_reps3.png"
     _plot(per_method, losses, out_png, title="Goodput vs loss @50Mbps (median over reps)")
 
     # Print a compact table.

@@ -50,6 +50,7 @@ RSTEP=${RSTEP:-4}
 ALPHA=${ALPHA:-0.6}
 ACK_EVERY=${ACK_EVERY:-8}
 MAX_ATTEMPTS=${MAX_ATTEMPTS:-0}
+USE_ARQ=${USE_ARQ:-1}
 PACE_US=${PACE_US:-}
 TRANSPORT=${TRANSPORT:-dgram}
 if [[ -z "${POST_WAIT+x}" || -z "${POST_WAIT}" ]]; then
@@ -59,7 +60,11 @@ if [[ -z "${POST_WAIT+x}" || -z "${POST_WAIT}" ]]; then
   if [[ $WAIT_MS -gt 800 ]]; then WAIT_MS=800; fi
   POST_WAIT="${WAIT_MS}ms"
 fi
-SRV_TIMEOUT=${SRV_TIMEOUT:-45s}
+# Experiment-level transfer timeout in seconds (15s by default).
+TIMEOUT_S=${TIMEOUT_S:-15}
+# Server / client lifetime caps (defaults to TIMEOUT_S).
+SRV_TIMEOUT=${SRV_TIMEOUT:-${TIMEOUT_S}s}
+CLI_TIMEOUT=${CLI_TIMEOUT:-${TIMEOUT_S}s}
 # Observation wait budget in seconds (default: derived from SRV_TIMEOUT if of the form \d+s, else 30s)
 if [[ -z "${OBS_WAIT_SECS:-}" ]]; then
   if [[ "$SRV_TIMEOUT" =~ ^([0-9]+)s$ ]]; then
@@ -158,7 +163,13 @@ if [[ "$SKIP_TC_CONFIG" != "1" ]]; then
     gemodel:*)
       params=${LOSS_MODE#gemodel:}
       IFS=',' read -r p r h k <<<"$params"
-      NETEM_ARGS+=(loss gemodel ${p}% ${r}% ${h}% ${k}%) ;;
+      # IMPORTANT: `tc netem loss gemodel` expects parameters as:
+      #   p r 1-h 1-k
+      # where 1-h is the BAD-state loss probability and 1-k is the GOOD-state
+      # loss probability (see `man tc-netem`).
+      # Our LOSS_MODE=gemodel:p,r,h,k uses h=GOOD loss probability, k=BAD loss
+      # probability, so we pass (1-h)=k and (1-k)=h.
+      NETEM_ARGS+=(loss gemodel ${p}% ${r}% ${k}% ${h}%) ;;
     ""|*)
       NETEM_ARGS+=(loss ${LOSS_PCT}%) ;;
   esac
@@ -210,9 +221,26 @@ fi
 if [[ -n "${PACE_US}" && "${PACE_US}" -gt 0 ]]; then
   pace_arg="-pace ${PACE_US}us"
 fi
-"$BIN_DIR/quicfec-client" -addr 10.10.0.2:$PORT -file "$FILE" -N $((K+R0)) -K "$K" -L "$SYMBOL_BYTES" \
-  -post-wait "$POST_WAIT" -ack-every "$ACK_EVERY" -dgram-warn 1400 -transport "$TRANSPORT" -arq -R0 "$R0" -W "$W" -Rstep "$RSTEP" -alpha "$ALPHA" -max-attempts "$MAX_ATTEMPTS" -loss 0 $pace_arg \
-  >"$CLI_LOG" 2>&1 || true
+
+arq_flag=""
+if [[ "${USE_ARQ}" == "1" ]]; then
+  arq_flag="-arq"
+fi
+if command -v timeout >/dev/null 2>&1; then
+  timeout --signal=KILL ${TIMEOUT_S}s \
+    "$BIN_DIR/quicfec-client" -addr 10.10.0.2:$PORT -file "$FILE" -N $((K+R0)) -K "$K" -L "$SYMBOL_BYTES" \
+      -post-wait "$POST_WAIT" -ack-every "$ACK_EVERY" -dgram-warn 1400 -transport "$TRANSPORT" $arq_flag -R0 "$R0" -W "$W" -Rstep "$RSTEP" -alpha "$ALPHA" -max-attempts "$MAX_ATTEMPTS" -loss 0 $pace_arg \
+      >"$CLI_LOG" 2>&1 || RC=$?
+else
+  "$BIN_DIR/quicfec-client" -addr 10.10.0.2:$PORT -file "$FILE" -N $((K+R0)) -K "$K" -L "$SYMBOL_BYTES" \
+    -post-wait "$POST_WAIT" -ack-every "$ACK_EVERY" -dgram-warn 1400 -transport "$TRANSPORT" $arq_flag -R0 "$R0" -W "$W" -Rstep "$RSTEP" -alpha "$ALPHA" -max-attempts "$MAX_ATTEMPTS" -loss 0 $pace_arg \
+    >"$CLI_LOG" 2>&1 || RC=$?
+fi
+RC=${RC:-0}
+TIMED_OUT=0
+if [[ "$RC" == "124" || "$RC" == "137" ]]; then
+  TIMED_OUT=1
+fi
 END=$(date +%s%N)
 
 # Wait for server to emit the observation before stopping it (cap by OBS_WAIT_SECS)
@@ -235,7 +263,29 @@ IN_MD5=$(md5sum "$FILE" | awk '{print $1}')
 OUT_MD5=$(md5sum "$ROOT/go/test_data/$(basename "$FILE").recv" | awk '{print $1}' || true)
 MD5_OK=0; [[ "$IN_MD5" == "$OUT_MD5" ]] && MD5_OK=1
 
-DUR_MS=$(( (END-START)/1000000 ))
+# Timeout => count as failure.
+if [[ "$TIMED_OUT" == "1" ]]; then
+  MD5_OK=0
+fi
+
+# Client wall duration (includes optional ARQ drain / post-wait), does NOT include md5.
+DUR_MS_CLIENT=$(( (END-START)/1000000 ))
+
+# Prefer server-side E2E completion time when available.
+# This excludes closeAndFinalize() (disk write + SHA verification) and matches:
+#   sender starts sending -> receiver finished decoding all data.
+E2E_LINE=$(grep -E '^\[server-e2e\] ' "$SRV_LOG" | tail -n1 || true)
+E2E_MS=""
+E2E_OK=""
+if [[ -n "$E2E_LINE" ]]; then
+  E2E_MS=$(echo "$E2E_LINE" | sed -n 's/.*e2e_ms=\([0-9]\+\).*/\1/p')
+  E2E_OK=$(echo "$E2E_LINE" | sed -n 's/.*ok=\([0-9]\+\).*/\1/p')
+fi
+
+DUR_MS=$DUR_MS_CLIENT
+if [[ -n "$E2E_MS" && "$E2E_OK" == "1" ]]; then
+  DUR_MS=$E2E_MS
+fi
 
 # Extract server observation (preferred)
 KEEP_LOGS=0
@@ -330,25 +380,32 @@ else
   tail -n 50 "$CLI_LOG" >&2 || true
 fi
 
-# Optional: echo a concise run summary
+# Echo a concise run summary (always)
 S_LINE=$(grep -E "^\[server-stats\]" "$SRV_LOG" | tail -n1 || true)
+S_DUR=""
 if [[ -n "$S_LINE" ]]; then
   S_DUR=$(echo "$S_LINE" | sed -n 's/.*dur_s=\([0-9.\-]\+\).*/\1/p')
-  if [[ -n "$S_DUR" && "$S_DUR" != "0" ]]; then
-    S_MBPS=$(awk -v sz="$FILE_SIZE" -v ds="$S_DUR" 'BEGIN{printf "%.2f", (sz*8.0/1000000.0)/ds}')
-  else
-    if [[ "$DUR_MS" -gt 0 ]]; then
-      S_MBPS=$(awk -v sz="$FILE_SIZE" -v ms="$DUR_MS" 'BEGIN{printf "%.2f", (sz*8.0/1000000.0)/(ms/1000.0)}')
-    else
-      S_MBPS=0
-    fi
-  fi
-  LOSS_DESC="${LOSS_PCT}%"
-  if [[ -n "${LOSS_MODE:-}" ]]; then
-    LOSS_DESC="${LOSS_MODE}"
-  fi
-  echo "[run] bitrate=${BITRATE_MBPS}Mbps rtt=${RTT_MS}ms loss=${LOSS_DESC} dur_ms=${DUR_MS} md5_ok=${MD5_OK} s_mbps=${S_MBPS}" >&2
 fi
+if [[ -n "$S_DUR" && "$S_DUR" != "0" ]]; then
+  S_MBPS=$(awk -v sz="$FILE_SIZE" -v ds="$S_DUR" 'BEGIN{printf "%.2f", (sz*8.0/1000000.0)/ds}')
+else
+  if [[ "$DUR_MS" -gt 0 ]]; then
+    S_MBPS=$(awk -v sz="$FILE_SIZE" -v ms="$DUR_MS" 'BEGIN{printf "%.2f", (sz*8.0/1000000.0)/(ms/1000.0)}')
+  else
+    S_MBPS=0
+  fi
+fi
+
+if [[ "$TIMED_OUT" == "1" ]]; then
+  S_MBPS=0
+fi
+
+LOSS_DESC="${LOSS_PCT}%"
+if [[ -n "${LOSS_MODE:-}" ]]; then
+  LOSS_DESC="${LOSS_MODE}"
+fi
+
+echo "[run] proto=quic_fec bitrate=${BITRATE_MBPS}Mbps rtt=${RTT_MS}ms loss=${LOSS_DESC} dur_ms=${DUR_MS} dur_ms_client=${DUR_MS_CLIENT} timed_out=${TIMED_OUT} md5_ok=${MD5_OK} s_mbps=${S_MBPS}" >&2
 
 # Cleanup temp logs
 # - Keep logs when a failure occurs (no RL_OBS) or residual_erasures=1.

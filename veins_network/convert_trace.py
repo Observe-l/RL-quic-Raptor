@@ -215,7 +215,7 @@ def main():
 
     # steady-by-recvpps parameters (recommended)
     ap.add_argument("--steady_window", type=float, default=1.0, help="Window size (s) for steady_rp filtering")
-    ap.add_argument("--min_recv_pps", type=float, default=8.0, help="Threshold recv_pps for steady_rp windows")
+    ap.add_argument("--min_recv_pps", type=float, default=5.0, help="Threshold recv_pps for steady_rp windows")
     ap.add_argument("--min_good_windows", type=int, default=3, help="Minimum number of good windows to accept steady_rp")
     ap.add_argument("--steady_fallback", default="first_last_success",
                     choices=["first_last_success", "full", "empty"],

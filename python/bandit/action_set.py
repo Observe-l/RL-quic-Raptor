@@ -24,10 +24,7 @@ class ActionSet:
 
     Notes on discretization:
     - The existing env uses MultiDiscrete indices:
-      K = 10 + k_idx, R0_pct = 0.1*r0_idx, RSTEP = 1+rstep_idx, ddl_ms = 300+15*ddl_idx.
-    - `docs/bandit.md` suggests some values (e.g., ddl=350ms, R0_pct=0.15) that are
-      not exactly representable in the env; we therefore use a representable subset
-      by default.
+            K = 10 + k_idx, R0_pct = 0.05*r0_idx, RSTEP = 1+rstep_idx, ddl_ms in {100,150,200,250,300,350}.
     """
 
     def __init__(
@@ -44,13 +41,12 @@ class ActionSet:
             if 64 not in k_values:
                 k_values = list(k_values) + [64]
         if r0_pct_values is None:
-            # Env supports 0.0..1.0 step 0.1; choose a smaller subset.
-            r0_pct_values = [0.1, 0.2, 0.3, 0.4, 0.5]
+            # Env supports 0.0..1.0 step 0.05; choose a smaller subset.
+            r0_pct_values = [0.05, 0.1, 0.15, 0.2, 0.25]
         if rstep_values is None:
-            rstep_values = [1, 2, 3, 4]
+            rstep_values = [1, 2, 3, 4, 5, 6, 7, 8]
         if ddl_ms_values is None:
-            # Env supports 300..600 step 15; pick a coarse grid close to bandit.md.
-            ddl_ms_values = [300, 345, 390, 435, 480, 525, 570, 600]
+            ddl_ms_values = [100, 150, 200, 250, 300, 350]
 
         self.k_values = sorted({int(x) for x in k_values})
         self.r0_pct_values = sorted({float(x) for x in r0_pct_values})
@@ -58,20 +54,23 @@ class ActionSet:
         self.ddl_ms_values = sorted({int(x) for x in ddl_ms_values})
 
         self.actions: List[ActionSpec] = []
+        ddl_levels = [100, 150, 200, 250, 300, 350]
+        ddl_to_idx = {v: i for i, v in enumerate(ddl_levels)}
         for K in self.k_values:
             k_idx = int(K) - 10
             if not (0 <= k_idx <= 54):
                 continue
             for r0 in self.r0_pct_values:
-                r0_idx = int(round(float(r0) / 0.1))
-                r0_idx = int(np.clip(r0_idx, 0, 10))
+                r0_idx = int(round(float(r0) / 0.05))
+                r0_idx = int(np.clip(r0_idx, 0, 20))
                 for RSTEP in self.rstep_values:
-                    rstep_idx = int(RSTEP) - 1
-                    if not (0 <= rstep_idx <= 8):
-                        continue
+                    rstep_idx = int(np.clip(int(RSTEP) - 1, 0, 7))
                     for ddl_ms in self.ddl_ms_values:
-                        ddl_idx = int(round((int(ddl_ms) - 300) / 15))
-                        ddl_idx = int(np.clip(ddl_idx, 0, 20))
+                        ddl_idx = ddl_to_idx.get(int(ddl_ms))
+                        if ddl_idx is None:
+                            # Backward-compat: map unsupported values to nearest level.
+                            target = int(ddl_ms)
+                            ddl_idx = int(min(range(len(ddl_levels)), key=lambda i: abs(int(ddl_levels[i]) - target)))
                         self.actions.append(ActionSpec(k_idx=k_idx, r0_idx=r0_idx, rstep_idx=rstep_idx, ddl_idx=ddl_idx))
 
         if not self.actions:

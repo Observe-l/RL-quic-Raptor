@@ -1,28 +1,23 @@
 package main
 
 import (
+	"bufio"
 	"context"
-	"crypto/tls"
 	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"time"
-
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/fecquic"
-	"github.com/quic-go/quic-go/logging"
 )
 
 func main() {
 	var (
-		addr         = flag.String("addr", "127.0.0.1:4445", "server address")
-		alpn         = flag.String("alpn", "quic-raw", "ALPN protocol")
+		addr         = flag.String("addr", "127.0.0.1:45302", "server address")
 		filePath     = flag.String("file", "go/test_data/train_FD001.txt", "file to send")
 		timeout      = flag.Duration("timeout", 60*time.Second, "client timeout")
-		postWait     = flag.Duration("post-wait", 0, "linger after sending")
 		measureDelay = flag.Bool("measure-delay", true, "send framed records for delay measurement")
 		packetBytes  = flag.Int("packet-bytes", 1200, "payload bytes per record")
 	)
@@ -31,26 +26,15 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
-	tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{*alpn}}
-
-	qconf := &quic.Config{
-		Tracer: func(ctx context.Context, p logging.Perspective, cid logging.ConnectionID) *logging.ConnectionTracer {
-			return fecquic.NewCCDebugConnTracer()
-		},
-	}
-	conn, err := quic.DialAddr(ctx, *addr, tlsConf, qconf)
+	d := net.Dialer{}
+	conn, err := d.DialContext(ctx, "tcp", *addr)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "dial error:", err)
 		os.Exit(1)
 	}
-	defer func() { _ = conn.CloseWithError(0, "") }()
+	defer conn.Close()
 
-	stream, err := conn.OpenStreamSync(ctx)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "open stream error:", err)
-		os.Exit(1)
-	}
-	defer func() { _ = stream.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(*timeout))
 
 	f, err := os.Open(*filePath)
 	if err != nil {
@@ -59,24 +43,28 @@ func main() {
 	}
 	defer f.Close()
 
+	bw := bufio.NewWriterSize(conn, 256*1024)
+	br := bufio.NewReaderSize(conn, 64*1024)
+
 	base := filepath.Base(*filePath)
 	if len(base) > 0xFFFF {
 		fmt.Fprintln(os.Stderr, "filename too long")
 		os.Exit(1)
 	}
-	if err := binary.Write(stream, binary.BigEndian, uint16(len(base))); err != nil {
+	if err := binary.Write(bw, binary.BigEndian, uint16(len(base))); err != nil {
 		fmt.Fprintln(os.Stderr, "write nameLen error:", err)
 		os.Exit(1)
 	}
-	if _, err := stream.Write([]byte(base)); err != nil {
+	if _, err := bw.WriteString(base); err != nil {
 		fmt.Fprintln(os.Stderr, "write name error:", err)
 		os.Exit(1)
 	}
+
 	mode := byte(0)
 	if *measureDelay {
 		mode = 1
 	}
-	if _, err := stream.Write([]byte{mode}); err != nil {
+	if err := bw.WriteByte(mode); err != nil {
 		fmt.Fprintln(os.Stderr, "write mode error:", err)
 		os.Exit(1)
 	}
@@ -84,9 +72,13 @@ func main() {
 	start := time.Now()
 	var n int64
 	if !*measureDelay {
-		n, err = io.CopyBuffer(stream, f, make([]byte, 256*1024))
+		n, err = io.CopyBuffer(bw, f, make([]byte, 256*1024))
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "copy error:", err)
+			os.Exit(1)
+		}
+		if err := bw.Flush(); err != nil {
+			fmt.Fprintln(os.Stderr, "flush error:", err)
 			os.Exit(1)
 		}
 	} else {
@@ -101,19 +93,19 @@ func main() {
 			if r > 0 {
 				seq++
 				sendNs := time.Now().UnixNano()
-				if err := binary.Write(stream, binary.BigEndian, uint32(r)); err != nil {
+				if err := binary.Write(bw, binary.BigEndian, uint32(r)); err != nil {
 					fmt.Fprintln(os.Stderr, "write len error:", err)
 					os.Exit(1)
 				}
-				if err := binary.Write(stream, binary.BigEndian, seq); err != nil {
+				if err := binary.Write(bw, binary.BigEndian, seq); err != nil {
 					fmt.Fprintln(os.Stderr, "write seq error:", err)
 					os.Exit(1)
 				}
-				if err := binary.Write(stream, binary.BigEndian, int64(sendNs)); err != nil {
+				if err := binary.Write(bw, binary.BigEndian, int64(sendNs)); err != nil {
 					fmt.Fprintln(os.Stderr, "write ts error:", err)
 					os.Exit(1)
 				}
-				if _, err := stream.Write(buf[:r]); err != nil {
+				if _, err := bw.Write(buf[:r]); err != nil {
 					fmt.Fprintln(os.Stderr, "write payload error:", err)
 					os.Exit(1)
 				}
@@ -128,29 +120,24 @@ func main() {
 			}
 		}
 		// EOF marker
-		if err := binary.Write(stream, binary.BigEndian, uint32(0)); err != nil {
+		if err := binary.Write(bw, binary.BigEndian, uint32(0)); err != nil {
 			fmt.Fprintln(os.Stderr, "write eof marker error:", err)
 			os.Exit(1)
 		}
+		if err := bw.Flush(); err != nil {
+			fmt.Fprintln(os.Stderr, "flush error:", err)
+			os.Exit(1)
+		}
 	}
-	_ = stream.Close()
-	// Wait for server completion ACK (1 byte).
+
+	// Expect 1-byte ack.
 	ack := []byte{0}
-	_ = stream.SetReadDeadline(time.Now().Add(15 * time.Second))
-	if _, err := io.ReadFull(stream, ack); err != nil {
+	if _, err := io.ReadFull(br, ack); err != nil {
 		fmt.Fprintln(os.Stderr, "read ack error:", err)
 		os.Exit(1)
 	}
-	if *postWait > 0 {
-		t := time.NewTimer(*postWait)
-		select {
-		case <-ctx.Done():
-		case <-t.C:
-		}
-	}
-	_ = conn.CloseWithError(0, "")
 
 	dur := time.Since(start)
 	mbps := (float64(n) * 8 / 1e6) / dur.Seconds()
-	fmt.Fprintf(os.Stderr, "[raw-client] sent=%s bytes=%d dur_ms=%d goodput_mbps=%.3f\n", base, n, dur.Milliseconds(), mbps)
+	fmt.Fprintf(os.Stderr, "[tcpraw-client] sent=%s bytes=%d dur_ms=%d goodput_mbps=%.3f\n", base, n, dur.Milliseconds(), mbps)
 }

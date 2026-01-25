@@ -80,6 +80,14 @@ func main() {
 			base = "recv"
 		}
 
+		mode, err := br.ReadByte()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "read mode error:", err)
+			_ = stream.Close()
+			_ = conn.CloseWithError(0, "")
+			continue
+		}
+
 		if err := os.MkdirAll(*outDir, 0o755); err != nil {
 			fmt.Fprintln(os.Stderr, "mkdir error:", err)
 			_ = stream.Close()
@@ -95,13 +103,79 @@ func main() {
 			continue
 		}
 
-		n, err := io.CopyBuffer(f, br, make([]byte, 256*1024))
-		_ = f.Close()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "copy error:", err)
-			_ = stream.Close()
-			_ = conn.CloseWithError(0, "")
-			continue
+		var n int64
+		var delaySumMs float64
+		var delayCnt int64
+		if mode == 0 {
+			n, err = io.CopyBuffer(f, br, make([]byte, 256*1024))
+			_ = f.Close()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "copy error:", err)
+				_ = stream.Close()
+				_ = conn.CloseWithError(0, "")
+				continue
+			}
+		} else {
+			for {
+				var plen uint32
+				if err := binary.Read(br, binary.BigEndian, &plen); err != nil {
+					if err == io.EOF {
+						break
+					}
+					fmt.Fprintln(os.Stderr, "read len error:", err)
+					_ = f.Close()
+					_ = stream.Close()
+					_ = conn.CloseWithError(0, "")
+					continue
+				}
+				if plen == 0 {
+					break
+				}
+				var seq uint64
+				var sendNs int64
+				if err := binary.Read(br, binary.BigEndian, &seq); err != nil {
+					fmt.Fprintln(os.Stderr, "read seq error:", err)
+					_ = f.Close()
+					_ = stream.Close()
+					_ = conn.CloseWithError(0, "")
+					continue
+				}
+				if err := binary.Read(br, binary.BigEndian, &sendNs); err != nil {
+					fmt.Fprintln(os.Stderr, "read ts error:", err)
+					_ = f.Close()
+					_ = stream.Close()
+					_ = conn.CloseWithError(0, "")
+					continue
+				}
+				buf := make([]byte, int(plen))
+				if _, err := io.ReadFull(br, buf); err != nil {
+					fmt.Fprintln(os.Stderr, "read payload error:", err)
+					_ = f.Close()
+					_ = stream.Close()
+					_ = conn.CloseWithError(0, "")
+					continue
+				}
+				recvNs := time.Now().UnixNano()
+				dms := float64(recvNs-sendNs) / 1e6
+				if dms >= 0 && dms < 60000 {
+					delaySumMs += dms
+					delayCnt++
+				}
+				wn, werr := f.Write(buf)
+				n += int64(wn)
+				if werr != nil {
+					fmt.Fprintln(os.Stderr, "write file error:", werr)
+					_ = f.Close()
+					_ = stream.Close()
+					_ = conn.CloseWithError(0, "")
+					continue
+				}
+			}
+			_ = f.Close()
+			if delayCnt > 0 {
+				avg := delaySumMs / float64(delayCnt)
+				fmt.Fprintf(os.Stderr, "[delay] delay_ms_avg=%.3f delay_samples=%d\n", avg, delayCnt)
+			}
 		}
 		// Application-level ack so the client doesn't close the connection early.
 		_, _ = stream.Write([]byte{1})

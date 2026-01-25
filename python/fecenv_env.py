@@ -221,6 +221,7 @@ class QuicFecRunner:
         # we prefer faster feedback.
         env.setdefault("POST_WAIT", self.post_wait)
         env.setdefault("SRV_TIMEOUT", self.srv_timeout)
+        env.setdefault("CLI_TIMEOUT", self.srv_timeout)
         # Avoid long tail waits during training; benchmarks can override.
         env.setdefault("QUIC_FEC_ARQ_DRAIN_CAP_MS", "3000")
         if self.obs_wait_secs is not None:
@@ -277,15 +278,48 @@ class QuicFecRunner:
                 env.setdefault("SKIP_BUILD", "1")
             # Avoid running as a login shell ("-l"), which can override PATH and
             # break tool discovery in non-interactive Ray workers.
-            p = subprocess.run(["bash", "-c", f"bash '{self.script}'"], env=env, capture_output=True, text=True, timeout=self.timeout_sec)
+            #
+            # Give the harness a small grace window beyond the configured timeout.
+            # Otherwise, a Python-side TimeoutExpired can kill the wrapper script
+            # while it still has a server running inside the netns, leading to
+            # cascading failures on subsequent steps when reusing the netns.
+            p = subprocess.run(
+                ["bash", "-c", f"bash '{self.script}'"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=int(self.timeout_sec) + 10,
+            )
             if p.returncode != 0:
                 raise RuntimeError(f"harness failed: code={p.returncode} stderr={p.stderr[-400:]}\nstdout={p.stdout[-400:]}")
             obs = self._read_last_obs(obs_json_path)
         # Reward is computed at the Env level; return 0.0 placeholder here.
             return obs, 0.0, True, {}
         except subprocess.TimeoutExpired as te:
+            # If the harness times out, assume the netns may have leaked processes.
+            # Force a full netns/tc reset on the next step by dropping the cached key.
+            self._net_cfg_key = None
             obs = self._default_obs(timeout=True)
-            info = {"error": f"timeout after {self.timeout_sec}s", "stderr_tail": getattr(te, 'stderr', None)}
+            def _to_text(v: Any) -> str | None:
+                if v is None:
+                    return None
+                if isinstance(v, str):
+                    return v
+                if isinstance(v, (bytes, bytearray, memoryview)):
+                    try:
+                        return bytes(v).decode("utf-8", errors="replace")
+                    except Exception:
+                        return repr(v)
+                try:
+                    return str(v)
+                except Exception:
+                    return repr(v)
+
+            info = {
+                "error": f"timeout after {self.timeout_sec}s",
+                "stderr_tail": _to_text(getattr(te, "stderr", None)),
+                "stdout_tail": _to_text(getattr(te, "stdout", None)),
+            }
             return obs, 0.0, True, info
         except Exception as e:
             obs = self._default_obs(timeout=False)
@@ -315,6 +349,8 @@ class QuicFecRunner:
     def _default_obs(self, timeout: bool) -> Dict[str, Any]:
         return {
             "goodput_decode_mbps": 0.0,
+            "goodput_mbps": 0.0,
+            "goodput": 0.0,
             "duration_decode_ms": 2000.0 if timeout else 1500.0,
             "duration_transfer_ms": 2000.0 if timeout else 1500.0,
             "residual_erasures": 1,
@@ -372,27 +408,40 @@ class FecEnv(gym.Env):
         # Discrete action space (MultiDiscrete), matching the requirement that
         # controls are chosen from a finite set (not a clipped continuous Box).
         # Order: [K_idx, R0_pct_idx, RSTEP_idx, ddl_idx]
-        #   K: 10..64                       -> 55 values
-        #   R0_pct: 0.0..1.0 step 0.1        -> 11 values
-        #   RSTEP: 1..9                      -> 9 values
-        #   ddl_ms: 300..600 step 15ms        -> 21 values
-        self.action_space = spaces.MultiDiscrete([55, 11, 9, 21])
-        # Policy observation keys (keep only the required fields).
+        #   K: 10..64                                -> 55 values
+        #   R0_pct: 0.0..1.0 step 0.05               -> 21 values
+        #   RSTEP: 1..8                              -> 8 values
+        #   ddl_ms: {100,150,200,250,300,350}        -> 6 values
+        self.action_space = spaces.MultiDiscrete([55, 21, 8, 6])
+        # Policy observation keys.
+        # Keep this strictly limited to the learning signal (no debug/leakage).
+        # Layout (requested):
+        #   goodput,
+        #   decode_latency_p95_ms,
+        #   fec_overhead_pct_arrival,
+        #   ctrl_tx_nack_msgs,
+        #   arq_attempts_mean,
+        #   residual_erasures,
+        #   fec_rate (R0/K),
+        #   ddl_ms (executed)
         self._obs_keys: List[str] = [
+            "goodput",
             "decode_latency_p95_ms",
             "fec_overhead_pct_arrival",
             "ctrl_tx_nack_msgs",
             "arq_attempts_mean",
             "residual_erasures",
-            "rx_unique_at_ddl_p95",
+            "fec_rate",
+            "ddl_ms",
         ]
-        # Extra dims appended to the observation vector.
-        # We include the previous action (as discrete indices) since ARQ attempts and
-        # decoding dynamics depend on prior FEC/ARQ parameters.
-        self._obs_extra_dim = 4
         self.observation_space = spaces.Box(
-            low=-5.0, high=+np.inf, shape=(len(self._obs_keys) + self._obs_extra_dim,), dtype=np.float32
+            low=-5.0, high=+np.inf, shape=(len(self._obs_keys),), dtype=np.float32
         )
+
+        # Whether to apply a running normalization to observations.
+        # RL agents often benefit from normalization; contextual bandits may prefer
+        # stable, interpretable scales.
+        self._normalize_obs = bool(cfg.get("normalize_obs", True))
 
         # Episode length control
         # By default, treat each transfer as one episode.
@@ -413,10 +462,11 @@ class FecEnv(gym.Env):
         # - "qarc_v1": soft penalties, non-saturating signals for throughput/overhead
         # - "legacy": previous clipped/thresholded reward
         self._reward_variant = str(cfg.get("reward_variant", "qarc_v1"))
-        self._reward_w_goodput = float(cfg.get("reward_w_goodput", 1.0))
-        self._reward_w_delay = float(cfg.get("reward_w_delay", 0.5))
-        self._reward_w_residual = float(cfg.get("reward_w_residual", 1.0))
-        self._reward_w_overhead = float(cfg.get("reward_w_overhead", 0.5))
+        # Default weights for the (throughput + latency-reward) shaping.
+        self._reward_w_goodput = float(cfg.get("reward_w_goodput", 0.7))
+        self._reward_w_delay = float(cfg.get("reward_w_delay", 0.3))
+        self._reward_w_residual = float(cfg.get("reward_w_residual", 0.0))
+        self._reward_w_overhead = float(cfg.get("reward_w_overhead", 0.0))
         self._reward_w_arq = float(cfg.get("reward_w_arq", 0.0))
         self._reward_delay_binary = bool(cfg.get("reward_delay_binary", True))
         self._reward_residual_binary = bool(cfg.get("reward_residual_binary", True))
@@ -470,8 +520,7 @@ class FecEnv(gym.Env):
             )
         )
 
-        self._last_obs_vec = np.zeros((len(self._obs_keys) + self._obs_extra_dim,), dtype=np.float32)
-        self._prev_action = np.zeros((4,), dtype=np.int32)
+        self._last_obs_vec = np.zeros((len(self._obs_keys),), dtype=np.float32)
         # True once we've produced at least one valid policy observation via step().
         # With episode_step=1, reset() needs to return a meaningful observation;
         # we use the last step() observation as the next episode's reset obs.
@@ -498,13 +547,25 @@ class FecEnv(gym.Env):
         self.epi += 1
         self._ep_return = 0.0
         self._ep_term_sums = {}
-        # Do NOT clear _prev_action here: we want the next episode's reset observation
-        # to carry the last action context (ARQ dynamics depend on prior parameters).
         if seed is not None:
             try:
                 self._rng.seed(int(seed))
             except Exception:
                 pass
+
+        # Optional override: allow callers (e.g., bandit runner) to switch network
+        # parameters only at reset() boundaries, without enabling randomization.
+        if options and isinstance(options, dict):
+            if "rtt_ms" in options and options.get("rtt_ms") is not None:
+                self._base_rtt_ms = int(options.get("rtt_ms"))
+            if "loss_pct" in options and options.get("loss_pct") is not None:
+                self._base_loss_pct = int(options.get("loss_pct"))
+            if "loss_mode" in options and options.get("loss_mode") is not None:
+                self._base_loss_mode = str(options.get("loss_mode"))
+            if "bitrate_mbps" in options and options.get("bitrate_mbps") is not None:
+                self._bitrate_mbps = int(options.get("bitrate_mbps"))
+                # Keep reward normalization consistent with shaping capacity.
+                self._capacity_mbps = float(self._bitrate_mbps)
 
         # Curriculum: keep network fixed for a few warmup episodes, then randomize.
         if self._randomize_net_params_enabled and self.epi >= self._curriculum_warmup_episodes:
@@ -543,17 +604,18 @@ class FecEnv(gym.Env):
 
         if not (0 <= k_idx <= 54):
             raise ValueError(f"K index out of range: {k_idx}")
-        if not (0 <= r0_idx <= 10):
+        if not (0 <= r0_idx <= 20):
             raise ValueError(f"R0_pct index out of range: {r0_idx}")
-        if not (0 <= rstep_idx <= 8):
+        if not (0 <= rstep_idx <= 7):
             raise ValueError(f"RSTEP index out of range: {rstep_idx}")
-        if not (0 <= ddl_idx <= 20):
+        if not (0 <= ddl_idx <= 5):
             raise ValueError(f"ddl index out of range: {ddl_idx}")
 
         K = 10 + k_idx
-        R0_pct = 0.1 * float(r0_idx)
+        R0_pct = 0.05 * float(r0_idx)
         RSTEP = 1 + rstep_idx
-        ddl_ms = 300 + 15 * ddl_idx
+        ddl_ms_values = [100, 150, 200, 250, 300, 350]
+        ddl_ms = int(ddl_ms_values[int(ddl_idx)])
         act = Action(K=int(K), R0_pct=float(R0_pct), RSTEP=int(RSTEP), ddl_ms=int(ddl_ms))
 
         obs_dict, _reward_unused, _done_transfer, info = self._runner.step(
@@ -564,23 +626,45 @@ class FecEnv(gym.Env):
             loss_mode=self._loss_mode,
         )
 
+        # Derive policy-safe goodput metric (always present in obs).
+        err = None
+        if info and isinstance(info, dict):
+            err = info.get("error")
+        is_timeout = bool(isinstance(err, str) and err.lower().startswith("timeout"))
+        try:
+            goodput_mbps = float(obs_dict.get("goodput_arrival_mbps", obs_dict.get("goodput_decode_mbps", 0.0)))
+        except Exception:
+            goodput_mbps = 0.0
+        if is_timeout:
+            goodput_mbps = 0.0
+        # Keep both keys for compatibility in logs; policy observation uses "goodput".
+        obs_dict["goodput_mbps"] = float(goodput_mbps)
+        obs_dict["goodput"] = float(goodput_mbps)
+
+        # Append control-derived observation fields.
+        # fec_rate is defined as R0/K where R0=floor(K*R0_pct) used by the sender.
+        r0_used = max(0, int(float(R0_pct) * float(K)))
+        obs_dict["fec_rate"] = float(r0_used) / float(max(1, int(K)))
+        obs_dict["ddl_ms"] = float(ddl_ms)
+
         if not self._ignore_runner_errors and info and isinstance(info, dict) and info.get("error"):
             err = str(info.get("error"))
             if not err.lower().startswith("timeout"):
                 raise RuntimeError(f"QUIC-FEC harness failed: {err}")
-        # Compute reward (variant selectable via env_config)
-        reward, r_terms = self._compute_reward_satellite(obs_dict, ddl_ms)
-        # Update prev_action *before* building obs, so the returned observation
-        # contains the action that just produced the resulting transfer outcome.
-        self._prev_action = np.asarray([k_idx, r0_idx, rstep_idx, ddl_idx], dtype=np.int32)
-
-        # Build observation vector: base obs + previous action
-        obs_vec = self._augment_obs(self._obs_to_vec(obs_dict))
-        obs_vec = self._norm.transform(self._norm.update(obs_vec))
+        # Compute reward (variant selectable via env_config). If the harness timed out,
+        # override with a hard penalty to discourage actions that fail to complete.
+        if is_timeout:
+            reward = -1.0
+            r_terms = {"timeout": 1.0}
+        else:
+            reward, r_terms = self._compute_reward_satellite(obs_dict, ddl_ms)
+        # Build policy observation vector.
+        obs_vec = self._obs_to_vec(obs_dict)
+        if self._normalize_obs:
+            obs_vec = self._norm.transform(self._norm.update(obs_vec))
         self._last_obs_vec = obs_vec
         self._has_last_obs = True
 
-        r0_used = max(0, int(float(R0_pct) * float(K)))
         info = {
             **(info or {}),
             "net_params": {
@@ -622,7 +706,6 @@ class FecEnv(gym.Env):
 
             # Always log only the observations used by the policy.
             raw_obs_out = {k: obs_dict.get(k, 0.0) for k in self._obs_keys}
-            raw_obs_out["prev_action"] = [int(x) for x in self._prev_action.tolist()]
 
             # Return raw observations to the caller as well (useful for smoke tests).
             info["raw_obs"] = raw_obs_out
@@ -692,18 +775,6 @@ class FecEnv(gym.Env):
                 vals.append(0.0)
         return np.asarray(vals, dtype=np.float32)
 
-    def _augment_obs(self, base: np.ndarray) -> np.ndarray:
-        # Append previous action (indices) scaled into [0,1].
-        # Indices ranges:
-        # - K_idx:   0..54
-        # - R0_idx:  0..10
-        # - RSTEP:   0..8
-        # - ddl_idx: 0..20
-        pa = self._prev_action.astype(np.float32)
-        denom = np.asarray([54.0, 10.0, 8.0, 20.0], dtype=np.float32)
-        pa01 = np.clip(pa / np.maximum(denom, 1.0), 0.0, 1.0)
-        return np.concatenate([base.astype(np.float32), pa01], axis=0)
-
     def _randomize_net_params(self) -> None:
         rng = self._rng
         def pick(xs):
@@ -755,33 +826,25 @@ class FecEnv(gym.Env):
                 "arq_term": float(arq_term),
             }
 
-        # Q-ARC-like shaping (docs/main.pdf Eq. (25))
-        # g_tilde: normalize by physical capacity (avoid early saturation from est_bw)
-        g_tilde = float(np.clip(g / max(1e-6, float(self._capacity_mbps)), 0.0, 1.0))
+        # Throughput + latency reward shaping.
+        # tp_term: normalized by physical capacity.
+        c = max(1e-6, float(self._capacity_mbps))
+        tp_term = float(self._reward_w_goodput) * float(np.clip(g / c, 0.0, 1.0))
+        # lat_term: positive reward that decays with latency (scale=150ms).
+        lat_term = float(self._reward_w_delay) * float(1.0 / (1.0 + (float(d95) / 150.0) ** 2))
 
-        # d_tilde: delay penalty (binary by default, as suggested in the doc)
-        if self._reward_delay_binary:
-            d_tilde = float(d95 > d)
-        else:
-            d_tilde = float(np.clip(max(0.0, (d95 - d) / max(d, 1.0)), 0.0, 1.0))
-
-        # l_tilde: residual loss surrogate
+        # Keep residual/overhead/ARQ as penalties (optional knobs).
         if self._reward_residual_binary:
             l_tilde = float(e > 0.0)
         else:
             l_tilde = float(e / (1.0 + max(0.0, e)))
-
-        # r_tilde: overhead ratio surrogate (pct -> [0,1])
         r_tilde = float(np.clip(oh / 100.0, 0.0, 1.0))
-
-        # Optional ARQ penalty (scaled, non-saturating by default)
         arq_tilde = float(np.clip(a_mean / 30.0, 0.0, 1.0))
 
-        tp_term = self._reward_w_goodput * g_tilde
-        lat_term = -self._reward_w_delay * d_tilde
-        resid_term = -self._reward_w_residual * l_tilde
-        oh_term = -self._reward_w_overhead * r_tilde
-        arq_term = -self._reward_w_arq * arq_tilde
+        resid_term = -float(self._reward_w_residual) * float(l_tilde)
+        oh_term = -float(self._reward_w_overhead) * float(r_tilde)
+        arq_term = -float(self._reward_w_arq) * float(arq_tilde)
+
         r = float(tp_term + lat_term + resid_term + oh_term + arq_term)
         return r, {
             "tp_term": float(tp_term),
@@ -789,8 +852,8 @@ class FecEnv(gym.Env):
             "resid_term": float(resid_term),
             "oh_term": float(oh_term),
             "arq_term": float(arq_term),
-            "g_tilde": float(g_tilde),
-            "d_tilde": float(d_tilde),
+            "tp_norm": float(np.clip(g / c, 0.0, 1.0)),
+            "lat_reward": float(1.0 / (1.0 + (float(d95) / 150.0) ** 2)),
             "l_tilde": float(l_tilde),
             "r_tilde": float(r_tilde),
             "arq_tilde": float(arq_tilde),

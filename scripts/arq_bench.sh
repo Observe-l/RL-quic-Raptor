@@ -13,7 +13,7 @@ W=${W:-8}
 DDL_MS=${DDL_MS:-50}
 RSTEP=${RSTEP:-4}
 ALPHA=${ALPHA:-0.6}
-LOSS_MODE=${LOSS_MODE:-none}  # none | iid:5 | gemodel:0.5,20,80,0.1
+LOSS_MODE=${LOSS_MODE:-none}  # none | iid:5 | gemodel:p,r,h,k (h=GOOD loss%, k=BAD loss%)
 
 chmod +x "$ROOT/scripts"/*.sh
 "$ROOT/scripts/netns_reset.sh" "$NS"
@@ -28,7 +28,7 @@ sudo tc qdisc del dev veth0 root 2>/dev/null || true
 case "$LOSS_MODE" in
   none) sudo tc qdisc replace dev veth0 root netem loss 0%;;
   iid:*) pct=${LOSS_MODE#iid:}; sudo tc qdisc replace dev veth0 root netem loss ${pct}%;;
-  gemodel:*) params=${LOSS_MODE#gemodel:}; IFS=',' read -r p r h k <<<"$params"; sudo tc qdisc replace dev veth0 root netem loss gemodel ${p}% ${r}% ${h}% ${k}%;;
+  gemodel:*) params=${LOSS_MODE#gemodel:}; IFS=',' read -r p r h k <<<"$params"; sudo tc qdisc replace dev veth0 root netem loss gemodel ${p}% ${r}% ${k}% ${h}%;;
 esac
 
 REPS=${REPS:-1}

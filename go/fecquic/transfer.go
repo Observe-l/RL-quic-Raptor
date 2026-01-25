@@ -761,7 +761,7 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 			case <-progStop:
 				return
 			case <-t.C:
-				w := rxm.written.Load()
+				w := rxm.delivered.Load()
 				if w > 0 {
 					fmt.Fprintf(os.Stderr, "[server-progress] written=%d/%d\n", w, hdr.FileSize)
 				}
@@ -775,8 +775,8 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 		// on high-loss/high-parity runs where writes can stall while arrivals continue.
 		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
-		lastWritten := rxm.written.Load()
-		lastWriteChange := time.Now()
+		lastDelivered := rxm.delivered.Load()
+		lastDeliverChange := time.Now()
 		lastDgrams := rcvDgrams
 		lastDgramChange := time.Now()
 		// Make inactivity more tolerant for high-RTT/high-redundancy runs.
@@ -790,23 +790,25 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 			inactivity = 6 * time.Second
 		}
 		for {
-			if rxm.written.Load() >= hdr.FileSize {
+			if rxm.delivered.Load() >= hdr.FileSize {
 				return
 			}
 			select {
+			case <-rxm.doneCh:
+				return
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				w := rxm.written.Load()
-				if w != lastWritten {
-					lastWritten = w
-					lastWriteChange = time.Now()
+				w := rxm.delivered.Load()
+				if w != lastDelivered {
+					lastDelivered = w
+					lastDeliverChange = time.Now()
 				}
 				if rcvDgrams != lastDgrams {
 					lastDgrams = rcvDgrams
 					lastDgramChange = time.Now()
 				}
-				if time.Since(lastWriteChange) > inactivity && time.Since(lastDgramChange) > inactivity {
+				if time.Since(lastDeliverChange) > inactivity && time.Since(lastDgramChange) > inactivity {
 					return
 				}
 			}
@@ -815,8 +817,10 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 	// DATAGRAM receiver
 	go func() {
 		for {
-			if rxm.written.Load() >= hdr.FileSize {
+			select {
+			case <-rxm.doneCh:
 				return
+			default:
 			}
 			b, err := conn.ReceiveDatagram(cctx)
 			if err != nil {
@@ -827,7 +831,7 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 			}
 			rcvDgrams++
 			if rcvDgrams%500 == 0 {
-				fmt.Fprintf(os.Stderr, "[server-progress] dgrams=%d written=%d/%d\n", rcvDgrams, rxm.written.Load(), hdr.FileSize)
+				fmt.Fprintf(os.Stderr, "[server-progress] dgrams=%d written=%d/%d\n", rcvDgrams, rxm.delivered.Load(), hdr.FileSize)
 			}
 			var fh fecwire.FECHeader
 			if !fh.UnmarshalBinary(b) || fh.Scheme != fecwire.SchemeRaptorQ {
@@ -848,8 +852,10 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 	// Uni stream receiver (symbols framed as {FEC header}{payload})
 	go func() {
 		for {
-			if rxm.written.Load() >= hdr.FileSize {
+			select {
+			case <-rxm.doneCh:
 				return
+			default:
 			}
 			s, err := conn.AcceptUniStream(cctx)
 			if err != nil {
@@ -861,8 +867,10 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 			go func(us *quic.ReceiveStream) {
 				defer us.CancelRead(0)
 				for {
-					if rxm.written.Load() >= hdr.FileSize {
+					select {
+					case <-rxm.doneCh:
 						return
+					default:
 					}
 					hdrb := make([]byte, fecwire.HeaderLen)
 					if _, err := io.ReadFull(us, hdrb); err != nil {
@@ -889,6 +897,21 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 	}()
 	// wait for reception to complete
 	<-doneCh
+	// E2E completion time: transport + retransmissions + decode only.
+	// IMPORTANT: log this BEFORE closeAndFinalize(), which includes disk IO and SHA verification.
+	e2eDur := time.Since(recvStart)
+	e2eOk := 0
+	if rxm != nil && rxm.delivered.Load() >= hdr.FileSize {
+		e2eOk = 1
+	}
+	if e2eDur < 0 {
+		e2eDur = 0
+	}
+	var writtenNow uint64
+	if rxm != nil {
+		writtenNow = rxm.delivered.Load()
+	}
+	fmt.Fprintf(os.Stderr, "[server-e2e] e2e_ms=%d ok=%d written=%d/%d\n", e2eDur.Milliseconds(), e2eOk, writtenNow, hdr.FileSize)
 	cancelRx()
 	close(progStop)
 	finalPath, err := rxm.closeAndFinalize(hdr.SHA256)

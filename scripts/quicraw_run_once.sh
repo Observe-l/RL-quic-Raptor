@@ -13,10 +13,13 @@ PORT=${PORT:-45301}
 BITRATE_MBPS=${BITRATE_MBPS:-50}
 RTT_MS=${RTT_MS:-20}
 LOSS_PCT=${LOSS_PCT:-0}
+LOSS_MODE=${LOSS_MODE:-}
 RATE="${BITRATE_MBPS}mbit"
 
 FILE=${FILE:-"$ROOT/go/test_data/train_FD001.txt"}
 OUT_DIR=${OUT_DIR:-"$ROOT/go/test_data"}
+
+TIMEOUT_S=${TIMEOUT_S:-15}
 
 if ! sudo -n true 2>/dev/null; then
   echo "[error] sudo privileges are required. Run 'sudo -v' once and rerun." >&2
@@ -47,7 +50,21 @@ fi
 # Configure qdiscs: same as quicfec_run_once.sh
 half=$(( RTT_MS / 2 ))
 sudo tc qdisc del dev veth0 root 2>/dev/null || true
-NETEM_ARGS=(delay ${half}ms loss ${LOSS_PCT}%)
+NETEM_ARGS=(delay ${half}ms)
+case "$LOSS_MODE" in
+  none)
+    NETEM_ARGS+=(loss 0%) ;;
+  iid:*)
+    pct=${LOSS_MODE#iid:}
+    NETEM_ARGS+=(loss ${pct}%) ;;
+  gemodel:*)
+    params=${LOSS_MODE#gemodel:}
+    IFS=',' read -r p r h k <<<"$params"
+    # See quicfec_run_once.sh for parameter mapping rationale.
+    NETEM_ARGS+=(loss gemodel ${p}% ${r}% ${k}% ${h}%) ;;
+  ""|*)
+    NETEM_ARGS+=(loss ${LOSS_PCT}%) ;;
+esac
 sudo tc qdisc replace dev veth0 root handle 1: tbf rate ${RATE} burst 32kb latency 400ms
 sudo tc qdisc replace dev veth0 parent 1:1 handle 10: netem "${NETEM_ARGS[@]}"
 sudo ip netns exec "$NS" tc qdisc del dev veth1 root 2>/dev/null || true
@@ -62,7 +79,21 @@ sleep 0.1
 # Run client
 CLI_LOG=$(mktemp -t quic_raw_cli.XXXXXX.log)
 START=$(date +%s%N)
-"$BIN_DIR/quicraw-client" -addr 10.10.0.2:$PORT -file "$FILE" -timeout 60s >"$CLI_LOG" 2>&1 || true
+QUIC_FEC_CC_BYPASS=${QUIC_FEC_CC_BYPASS:-0} \
+QUIC_FEC_CC_ALGO=${QUIC_FEC_CC_ALGO:-} \
+TIMED_OUT=0
+if command -v timeout >/dev/null 2>&1; then
+  timeout --signal=KILL ${TIMEOUT_S}s \
+    "$BIN_DIR/quicraw-client" -addr 10.10.0.2:$PORT -file "$FILE" -timeout ${TIMEOUT_S}s -measure-delay=true -packet-bytes 1200 \
+    >"$CLI_LOG" 2>&1 || RC=$?
+else
+  "$BIN_DIR/quicraw-client" -addr 10.10.0.2:$PORT -file "$FILE" -timeout ${TIMEOUT_S}s -measure-delay=true -packet-bytes 1200 \
+    >"$CLI_LOG" 2>&1 || RC=$?
+fi
+RC=${RC:-0}
+if [[ "$RC" == "124" || "$RC" == "137" ]]; then
+  TIMED_OUT=1
+fi
 END=$(date +%s%N)
 
 # Wait for server to finish writing (bounded).
@@ -98,7 +129,19 @@ else
   S_MBPS=0
 fi
 
-echo "[run] proto=quic_raw bitrate=${BITRATE_MBPS}Mbps rtt=${RTT_MS}ms loss=${LOSS_PCT}% dur_ms=${DUR_MS} md5_ok=${MD5_OK} s_mbps=${S_MBPS}" >&2
+# Timeout => count as failure.
+if [[ "$TIMED_OUT" == "1" ]]; then
+  S_MBPS=0
+  MD5_OK=0
+fi
+
+echo "[run] proto=quic_raw bitrate=${BITRATE_MBPS}Mbps rtt=${RTT_MS}ms loss=${LOSS_PCT}% dur_ms=${DUR_MS} timed_out=${TIMED_OUT} md5_ok=${MD5_OK} s_mbps=${S_MBPS}" >&2
+
+# Emit AoI-style average one-way delay from server output.
+DELAY_LINE=$(grep -E '^\[delay\] ' "$SRV_LOG" | tail -n1 || true)
+if [[ -n "$DELAY_LINE" && "$TIMED_OUT" != "1" ]]; then
+  echo "$DELAY_LINE" >&2
+fi
 # keep logs on failure
 if [[ "$MD5_OK" != "1" ]]; then
   echo "[diag] md5 mismatch; server log: $SRV_LOG" >&2

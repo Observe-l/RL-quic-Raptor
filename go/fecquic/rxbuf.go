@@ -102,6 +102,11 @@ type rxManager struct {
 	out     *os.File
 	tmpPath string
 	written atomic.Uint64
+	// delivered counts bytes that are decoded / assembled and enqueued to the writer.
+	// This excludes disk IO time and is used for E2E completion timing.
+	delivered atomic.Uint64
+	doneCh    chan struct{}
+	doneOnce  sync.Once
 
 	// metrics
 	decBlocks    atomic.Int64
@@ -138,6 +143,7 @@ func newRXManager(fileSize uint64, K, L int, outDir, baseName string, rx RXOptio
 		decodeQ:   make(chan *rxBlock, 1024),
 		writeQ:    make(chan writeTask, 8192),
 		stopCh:    make(chan struct{}),
+		doneCh:    make(chan struct{}),
 		minSeen:   -1,
 		maxSeen:   -1,
 	}
@@ -159,6 +165,29 @@ func newRXManager(fileSize uint64, K, L int, outDir, baseName string, rx RXOptio
 	// init metrics aggregator
 	m.met = newServerMetrics(int(fileSize))
 	return m, nil
+}
+
+func (m *rxManager) noteDelivered(off int64, n int) {
+	if m == nil {
+		return
+	}
+	if n <= 0 {
+		return
+	}
+	if off < 0 {
+		return
+	}
+	max := int64(m.fileSize) - off
+	if max <= 0 {
+		return
+	}
+	if int64(n) > max {
+		n = int(max)
+	}
+	m.delivered.Add(uint64(n))
+	if m.delivered.Load() >= m.fileSize {
+		m.doneOnce.Do(func() { close(m.doneCh) })
+	}
 }
 
 func (m *rxManager) start(rx RXOptions) {
@@ -251,6 +280,7 @@ func (m *rxManager) start(rx RXOptions) {
 					// schedule a single contiguous write for this block
 					off := int64(int(b.id) * b.K * b.L)
 					m.writeQ <- writeTask{off: off, data: bytes}
+					m.noteDelivered(off, len(bytes))
 					m.decBlocks.Add(1)
 					// release memory and mark done
 					// capture stats before clearing
@@ -740,6 +770,7 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 
 	if sysBuf != nil {
 		m.writeQ <- writeTask{off: sysOff, data: sysBuf}
+		m.noteDelivered(sysOff, len(sysBuf))
 		m.decBlocks.Add(1)
 		if m.met != nil {
 			m.met.OnClusterDecoded(sysFirstSeen, time.Now(), sysAttempt, sysUsedRep)
