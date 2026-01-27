@@ -216,7 +216,7 @@ def _aligned_obs_vec_from_rl_observation(*, rl_obs: Optional[Dict[str, Any]], dd
     if failed or not isinstance(rl_obs, dict):
         goodput_mbps = 0.0
         decode_latency_p95_ms = 0.0
-        fec_overhead_pct_arrival = 0.0
+        fec_overhead = 0.0
         ctrl_tx_nack_msgs = 0.0
         arq_attempts_mean = 2.0
         residual_erasures = 1.0
@@ -234,7 +234,7 @@ def _aligned_obs_vec_from_rl_observation(*, rl_obs: Optional[Dict[str, Any]], dd
             _f("goodput_mbps", _f("goodput_arrival_mbps", _f("goodput_decode_mbps", 0.0))),
         )
         decode_latency_p95_ms = _f("decode_latency_p95_ms", 0.0)
-        fec_overhead_pct_arrival = _f("fec_overhead_pct_arrival", 0.0)
+        fec_overhead = _f("fec_overhead", _f("fec_overhead_pct_arrival", 0.0))
         ctrl_tx_nack_msgs = _f("ctrl_tx_nack_msgs", 0.0)
         arq_attempts_mean = _f("arq_attempts_mean", 0.0)
         residual_erasures = _f("residual_erasures", 0.0)
@@ -244,7 +244,7 @@ def _aligned_obs_vec_from_rl_observation(*, rl_obs: Optional[Dict[str, Any]], dd
         [
             float(goodput_mbps),
             float(decode_latency_p95_ms),
-            float(fec_overhead_pct_arrival),
+            float(fec_overhead),
             float(ctrl_tx_nack_msgs),
             float(arq_attempts_mean),
             float(residual_erasures),

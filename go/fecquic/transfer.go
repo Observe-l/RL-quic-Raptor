@@ -3,6 +3,7 @@ package fecquic
 import (
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -25,6 +26,9 @@ const (
 	DefaultK = 26
 	DefaultN = 32
 	DefaultL = 1200
+
+	txStatsMagic   = "QFST" // QFEC sender stats
+	txStatsVersion = 1
 )
 
 // SendOptions control ClientSendFile behavior.
@@ -629,6 +633,27 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
+	// Send sender-side symbol counters to the server so it can compute fec_overhead.
+	// This is done after ARQ drain so counts reflect all appended repairs.
+	{
+		txSourceSymbols := totalSymbols - totalRepairs
+		if txSourceSymbols < 0 {
+			txSourceSymbols = 0
+		}
+		if totalRepairs < 0 {
+			totalRepairs = 0
+		}
+		us, err := conn.OpenUniStreamSync(ctx)
+		if err == nil {
+			buf := make([]byte, 4+1+8+8)
+			copy(buf[:4], txStatsMagic)
+			buf[4] = byte(txStatsVersion)
+			binary.LittleEndian.PutUint64(buf[5:13], uint64(txSourceSymbols))
+			binary.LittleEndian.PutUint64(buf[13:21], uint64(totalRepairs))
+			_, _ = us.Write(buf)
+			_ = us.Close()
+		}
+	}
 	// Optional tail wait after ARQ drain
 	if opts.PostWait > 0 && !skipDrain {
 		time.Sleep(opts.PostWait)
@@ -646,12 +671,16 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	fmt.Fprintf(os.Stderr, "[client-stats] dgrams=%d bytes=%d dur_s=%.3f mbps=%.2f errs=%d dtle=%d enc_ms=%.1f send_ms=%.1f\n",
 		sentDgrams, sentBytes, dur, mbps, sendErrs, dtleCount, float64(encTime.Milliseconds()), float64(sendTime.Milliseconds()))
 	if opts.UseARQ {
-		overhead := 0.0
-		if totalSymbols > 0 {
-			overhead = float64(totalRepairs) / float64(totalSymbols) * 100.0
+		txSourceSymbols := totalSymbols - totalRepairs
+		if txSourceSymbols < 0 {
+			txSourceSymbols = 0
 		}
-		fmt.Fprintf(os.Stderr, "[arq-stats] clusters=%d attempts=%d symbols_total=%d repairs=%d overhead_pct=%.1f\n",
-			blockID, totalAttempts, totalSymbols, totalRepairs, overhead)
+		overhead := 0.0
+		if txSourceSymbols > 0 {
+			overhead = float64(totalRepairs) / float64(txSourceSymbols)
+		}
+		fmt.Fprintf(os.Stderr, "[arq-stats] clusters=%d attempts=%d tx_total_symbols=%d tx_source_symbols=%d tx_repairs=%d fec_overhead=%.3f\n",
+			blockID, totalAttempts, totalSymbols, txSourceSymbols, totalRepairs, overhead)
 	}
 	return nil
 }
@@ -852,11 +881,6 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 	// Uni stream receiver (symbols framed as {FEC header}{payload})
 	go func() {
 		for {
-			select {
-			case <-rxm.doneCh:
-				return
-			default:
-			}
 			s, err := conn.AcceptUniStream(cctx)
 			if err != nil {
 				if cctx.Err() != nil {
@@ -867,13 +891,35 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 			go func(us *quic.ReceiveStream) {
 				defer us.CancelRead(0)
 				for {
+					prefix := make([]byte, 4)
+					if _, err := io.ReadFull(us, prefix); err != nil {
+						return
+					}
+					// Sender stats stream: {magic(4)}{ver(1)}{tx_source(u64)}{tx_repair(u64)}
+					if string(prefix) == txStatsMagic {
+						st := make([]byte, 1+8+8)
+						if _, err := io.ReadFull(us, st); err != nil {
+							return
+						}
+						if len(st) >= 1 && int(st[0]) == txStatsVersion {
+							src := int64(binary.LittleEndian.Uint64(st[1:9]))
+							rep := int64(binary.LittleEndian.Uint64(st[9:17]))
+							if rxm != nil && rxm.met != nil {
+								rxm.met.SetTxSymbolCounts(src, rep)
+							}
+						}
+						return
+					}
+					// If transfer is already complete, ignore any late symbol streams.
 					select {
 					case <-rxm.doneCh:
 						return
 					default:
 					}
+					// Otherwise: treat as a symbol record. prefix is the start of the FEC header.
 					hdrb := make([]byte, fecwire.HeaderLen)
-					if _, err := io.ReadFull(us, hdrb); err != nil {
+					copy(hdrb[:4], prefix)
+					if _, err := io.ReadFull(us, hdrb[4:]); err != nil {
 						return
 					}
 					var fh fecwire.FECHeader
@@ -912,6 +958,14 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 		writtenNow = rxm.delivered.Load()
 	}
 	fmt.Fprintf(os.Stderr, "[server-e2e] e2e_ms=%d ok=%d written=%d/%d\n", e2eDur.Milliseconds(), e2eOk, writtenNow, hdr.FileSize)
+	// Wait briefly for the client to report sender-side tx symbol counts (used for fec_overhead).
+	// Without this grace period, the stats stream can arrive just after completion and be missed.
+	if rxm != nil && rxm.met != nil {
+		select {
+		case <-rxm.met.TxStatsDone():
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
 	cancelRx()
 	close(progStop)
 	finalPath, err := rxm.closeAndFinalize(hdr.SHA256)

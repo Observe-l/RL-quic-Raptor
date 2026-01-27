@@ -32,7 +32,7 @@ class RunResult:
     duration_transfer_ms: Optional[int]
     duration_arrival_ms: Optional[int]
     residual_erasures: Optional[int]
-    fec_overhead_pct_arrival: Optional[float]
+    fec_overhead: Optional[float]
     ctrl_tx_nack_msgs: Optional[int]
     arq_attempts_p95: Optional[float]
 
@@ -245,7 +245,7 @@ def _run_once(
         except Exception:
             residual_erasures = None
         try:
-            fec_overhead = float(obs.get("fec_overhead_pct_arrival"))
+            fec_overhead = float(obs.get("fec_overhead", obs.get("fec_overhead_pct_arrival")))
         except Exception:
             fec_overhead = None
         try:
@@ -286,7 +286,7 @@ def _run_once(
         duration_transfer_ms=duration_transfer_ms,
         duration_arrival_ms=duration_arrival_ms,
         residual_erasures=residual_erasures,
-        fec_overhead_pct_arrival=fec_overhead,
+        fec_overhead=fec_overhead,
         ctrl_tx_nack_msgs=ctrl_tx_nack,
         arq_attempts_p95=arq_attempts_p95,
     )
@@ -339,7 +339,7 @@ def _write_csv(path: Path, rows: List[RunResult]) -> None:
                 "duration_transfer_ms",
                 "duration_arrival_ms",
                 "residual_erasures",
-                "fec_overhead_pct_arrival",
+                "fec_overhead",
                 "ctrl_tx_nack_msgs",
                 "arq_attempts_p95",
             ],
@@ -364,7 +364,7 @@ def _write_csv(path: Path, rows: List[RunResult]) -> None:
                     "duration_transfer_ms": r.duration_transfer_ms,
                     "duration_arrival_ms": r.duration_arrival_ms,
                     "residual_erasures": r.residual_erasures,
-                    "fec_overhead_pct_arrival": r.fec_overhead_pct_arrival,
+                    "fec_overhead": r.fec_overhead,
                     "ctrl_tx_nack_msgs": r.ctrl_tx_nack_msgs,
                     "arq_attempts_p95": r.arq_attempts_p95,
                 }

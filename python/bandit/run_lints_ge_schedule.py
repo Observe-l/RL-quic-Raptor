@@ -315,7 +315,7 @@ def main() -> int:
         "--reward-w-overhead",
         type=float,
         default=0.5,
-        help="overhead penalty weight (uses fec_overhead_pct_arrival; default increased to make overhead matter)",
+        help="overhead penalty weight (uses fec_overhead = tx_repair_symbols/tx_source_symbols)",
     )
     ap.add_argument("--reward-variant", type=str, default="qarc_v1")
     # Delay shaping: use continuous penalty by default to avoid a hard threshold
@@ -459,7 +459,7 @@ def main() -> int:
 
     # Clarify metric semantics for overhead shaping.
     print(
-        "note: reward overhead term uses fec_overhead_pct_arrival = (rx_repair_symbols / rx_total_symbols) * 100 (unique arrivals)"
+        "note: reward overhead term uses fec_overhead = tx_repair_symbols / tx_source_symbols (sender-side ratio)"
     )
 
     env = FecEnv(env_cfg)

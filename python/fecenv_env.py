@@ -354,7 +354,7 @@ class QuicFecRunner:
             "duration_decode_ms": 2000.0 if timeout else 1500.0,
             "duration_transfer_ms": 2000.0 if timeout else 1500.0,
             "residual_erasures": 1,
-            "fec_overhead_pct_arrival": 0.0,
+            "fec_overhead": 0.0,
             "rx_total_symbols": 0,
             "rx_repair_symbols": 0,
             "rx_total_symbol_bytes": 0,
@@ -434,7 +434,7 @@ class FecEnv(gym.Env):
         # Layout (requested):
         #   goodput,
         #   decode_latency_p95_ms,
-        #   fec_overhead_pct_arrival,
+        #   fec_overhead,
         #   ctrl_tx_nack_msgs,
         #   arq_attempts_mean,
         #   residual_erasures,
@@ -443,7 +443,7 @@ class FecEnv(gym.Env):
         self._obs_keys: List[str] = [
             "goodput",
             "decode_latency_p95_ms",
-            "fec_overhead_pct_arrival",
+            "fec_overhead",
             "ctrl_tx_nack_msgs",
             "arq_attempts_mean",
             "residual_erasures",
@@ -818,7 +818,7 @@ class FecEnv(gym.Env):
         e = float(obs.get("residual_erasures", 0.0))
         d95 = float(obs.get("decode_latency_p95_ms", 0.0))
         d = float(max(1, int(ddl_ms)))
-        oh = float(obs.get("fec_overhead_pct_arrival", 0.0))
+        oh = float(obs.get("fec_overhead", 0.0))
         a_mean = float(obs.get("arq_attempts_mean", 0.0))
 
         if self._reward_variant == "legacy":
@@ -830,7 +830,9 @@ class FecEnv(gym.Env):
             lam_d = 0.3
             lat_term = -lam_d * max(0.0, (d95 - d) / max(d, 1.0))
             lam_o = 0.3
-            oh_term = -lam_o * max(0.0, (oh - 40.0) / 60.0)
+            # Legacy overhead term: treat fec_overhead as a ratio (repairs/source).
+            # Penalize overhead above ~0.5, saturating by ~2.0.
+            oh_term = -lam_o * max(0.0, (oh - 0.5) / 1.5)
             arq_term = -min(0.3, 0.08 * a_mean)
             r = tp_term + resid_term + lat_term + oh_term + arq_term
             return float(r), {
@@ -853,7 +855,8 @@ class FecEnv(gym.Env):
             l_tilde = float(e > 0.0)
         else:
             l_tilde = float(e / (1.0 + max(0.0, e)))
-        r_tilde = float(np.clip(oh / 100.0, 0.0, 1.0))
+        # Overhead is a ratio (repairs/source). Use a smooth saturating penalty in [0,1).
+        r_tilde = float(np.clip(oh / (1.0 + max(0.0, oh)), 0.0, 1.0))
         arq_tilde = float(np.clip(a_mean / 30.0, 0.0, 1.0))
 
         resid_term = -float(self._reward_w_residual) * float(l_tilde)

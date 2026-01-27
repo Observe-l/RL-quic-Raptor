@@ -315,13 +315,15 @@ if [[ -n "$RL_OBS" ]]; then
   #   We extract the congestion-controller estimate emitted by the client and merge it.
   # Preserve the server estimator under estimated_available_bw_arrival_mbps.
   CC_EST=$(grep -E '^\[cc-estimate\] ' "$CLI_LOG" | tail -n1 || true)
-  MERGED_LINE=$(RL_OBS_LINE="$RL_OBS" CC_EST_LINE="$CC_EST" python3 - <<'PY'
+  ARQ_STATS=$(grep -E '^\[arq-stats\] ' "$CLI_LOG" | tail -n1 || true)
+  MERGED_LINE=$(RL_OBS_LINE="$RL_OBS" CC_EST_LINE="$CC_EST" ARQ_STATS_LINE="$ARQ_STATS" python3 - <<'PY'
 import json
 import os
 import sys
 
 line = os.environ.get('RL_OBS_LINE', '')
 cc = os.environ.get('CC_EST_LINE', '')
+arq = os.environ.get('ARQ_STATS_LINE', '')
 
 if not line.startswith('[rl-observation] '):
     sys.stdout.write(line)
@@ -348,6 +350,32 @@ def parse_cc_line(s: str):
   except Exception:
     return None
 
+def parse_kv_line(prefix: str, s: str):
+  s = (s or '').strip()
+  if not s.startswith(prefix):
+    return None
+  rest = s[len(prefix):].strip()
+  out = {}
+  for tok in rest.split():
+    if '=' not in tok:
+      continue
+    k, v = tok.split('=', 1)
+    k = k.strip()
+    v = v.strip()
+    if not k:
+      continue
+    # Heuristic: try int, then float, else string.
+    vv = None
+    try:
+      vv = int(v)
+    except Exception:
+      try:
+        vv = float(v)
+      except Exception:
+        vv = v
+    out[k] = vv
+  return out
+
 ccj = parse_cc_line(cc)
 if isinstance(ccj, dict):
   # Prefer BBRv2's delivery-rate sample (bw_mbps). Keep pacing bandwidth too.
@@ -373,6 +401,36 @@ if isinstance(ccj, dict):
   mode = ccj.get('mode', None)
   if mode is not None:
     payload['cc_mode'] = mode
+
+# Merge sender-side FEC tx counters / overhead from the client.
+# This is the source of truth for fec_overhead and avoids relying on the
+# server receiving a late stats stream before shutdown.
+arqj = parse_kv_line('[arq-stats]', arq)
+if isinstance(arqj, dict) and arqj:
+  # Prefer these sender-side keys when present.
+  # Keep server-side values if the client didn't report a field.
+  if 'tx_total_symbols' in arqj:
+    payload['tx_total_symbols'] = int(arqj['tx_total_symbols'])
+  if 'tx_source_symbols' in arqj:
+    payload['tx_source_symbols'] = int(arqj['tx_source_symbols'])
+  # The Go client prints tx_repairs (not tx_repair_symbols).
+  if 'tx_repairs' in arqj:
+    payload['tx_repair_symbols'] = int(arqj['tx_repairs'])
+  if 'fec_overhead' in arqj:
+    try:
+      payload['fec_overhead'] = float(arqj['fec_overhead'])
+    except Exception:
+      pass
+  if 'attempts' in arqj:
+    try:
+      payload['arq_attempts_total'] = int(arqj['attempts'])
+    except Exception:
+      pass
+  if 'clusters' in arqj:
+    try:
+      payload['arq_clusters_total'] = int(arqj['clusters'])
+    except Exception:
+      pass
 
 sys.stdout.write('[rl-observation] ' + json.dumps(payload, separators=(',', ':')))
 PY

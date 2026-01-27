@@ -25,10 +25,15 @@ type Observation struct {
 	// This matches the common expectation of "raptorq decode time".
 	DurationDecodeMs int64 `json:"duration_decode_ms"`
 	ResidualErasures int32 `json:"residual_erasures"`
-	// FECOverheadPctArrival is an arrival-side redundancy percentage based on UNIQUE symbol arrivals:
-	//   100 * rx_repair_symbols / rx_total_symbols.
-	// It excludes duplicates/retransmissions and does not represent link-level tx overhead.
-	FECOverheadPctArrival float64 `json:"fec_overhead_pct_arrival"`
+	// FECOverhead is the sender-side symbol overhead ratio:
+	//   fec_overhead = (tx_total_symbols - tx_source_symbols) / tx_source_symbols
+	//               = tx_repair_symbols / tx_source_symbols.
+	// This is a sender-side accounting metric (not arrival-side) and ignores link-layer headers.
+	FECOverhead float64 `json:"fec_overhead"`
+	// Sender-side accounting (symbols sent by client)
+	TxTotalSymbols  int64 `json:"tx_total_symbols"`
+	TxRepairSymbols int64 `json:"tx_repair_symbols"`
+	TxSourceSymbols int64 `json:"tx_source_symbols"`
 	// Arrival-side accounting (unique symbols at receiver)
 	RxTotalSymbols      int64 `json:"rx_total_symbols"`
 	RxRepairSymbols     int64 `json:"rx_repair_symbols"`
@@ -56,6 +61,9 @@ type Observation struct {
 type serverMetrics struct {
 	mu sync.Mutex
 
+	txStatsOnce sync.Once
+	txStatsCh   chan struct{}
+
 	fileBytes  int
 	t0First    time.Time
 	tLastUniq  time.Time
@@ -82,11 +90,57 @@ type serverMetrics struct {
 	totalSymbolBytes  int64
 	repairSymbolBytes int64
 
+	// sender-side symbol totals (reported by client)
+	txSourceSymbols int64
+	txRepairSymbols int64
+	txTotalSymbols  int64
+
 	// control-plane accounting (server -> client)
 	ctrlTxBytes       int64
 	ctrlTxAckMsgs     int64
 	ctrlTxNackMsgs    int64
 	ctrlTxDroppedMsgs int64
+}
+
+// TxStatsDone is closed when sender-side symbol counts are received.
+func (m *serverMetrics) TxStatsDone() <-chan struct{} {
+	if m == nil {
+		ch := make(chan struct{})
+		close(ch)
+		return ch
+	}
+	m.mu.Lock()
+	ch := m.txStatsCh
+	m.mu.Unlock()
+	if ch == nil {
+		nilCh := make(chan struct{})
+		close(nilCh)
+		return nilCh
+	}
+	return ch
+}
+
+// SetTxSymbolCounts records sender-side symbol counts reported by the client.
+// src and repair are counts of transmitted symbols (not bytes).
+func (m *serverMetrics) SetTxSymbolCounts(src, repair int64) {
+	if m == nil {
+		return
+	}
+	if src < 0 {
+		src = 0
+	}
+	if repair < 0 {
+		repair = 0
+	}
+	m.mu.Lock()
+	m.txSourceSymbols = src
+	m.txRepairSymbols = repair
+	m.txTotalSymbols = src + repair
+	ch := m.txStatsCh
+	m.mu.Unlock()
+	if ch != nil {
+		m.txStatsOnce.Do(func() { close(ch) })
+	}
 }
 
 type arrBucket struct {
@@ -100,6 +154,7 @@ func newServerMetrics(fileBytes int) *serverMetrics {
 		bucketDur:  200 * time.Millisecond,
 		buckets:    make([]arrBucket, 10),
 		lastBucket: -1,
+		txStatsCh:  make(chan struct{}),
 	}
 }
 
@@ -243,10 +298,10 @@ func (m *serverMetrics) Snapshot(now time.Time) Observation {
 			}
 		}
 	}
-	// arrival-side overhead
-	var overPct float64
-	if m.totalSymbols > 0 {
-		overPct = float64(m.repairSymbols) / float64(m.totalSymbols) * 100.0
+	// sender-side overhead ratio
+	var overRatio float64
+	if m.txSourceSymbols > 0 {
+		overRatio = float64(m.txRepairSymbols) / float64(m.txSourceSymbols)
 	}
 	rxSourceSymbols := m.totalSymbols - m.repairSymbols
 	if rxSourceSymbols < 0 {
@@ -310,30 +365,33 @@ func (m *serverMetrics) Snapshot(now time.Time) Observation {
 		}
 	}
 	return Observation{
-		GoodputDecodeMbps:     goodput,
-		GoodputArrivalMbps:    goodputArrival,
-		DurationTransferMs:    durTransferMs,
-		DurationArrivalMs:     durArrivalMs,
-		DurationDecodeMs:      (m.decodeComputeTotalNs + 999_999) / 1_000_000, // ceil(ns->ms)
-		ResidualErasures:      0,                                              // non-residual path only; finalize checks integrity
-		FECOverheadPctArrival: overPct,
-		RxTotalSymbols:        m.totalSymbols,
-		RxRepairSymbols:       m.repairSymbols,
-		RxSourceSymbols:       rxSourceSymbols,
-		RxTotalSymbolBytes:    m.totalSymbolBytes,
-		RxRepairSymbolBytes:   m.repairSymbolBytes,
-		RxSourceSymbolBytes:   rxSourceBytes,
-		CtrlTxBytes:           m.ctrlTxBytes,
-		CtrlTxAckMsgs:         m.ctrlTxAckMsgs,
-		CtrlTxNackMsgs:        m.ctrlTxNackMsgs,
-		CtrlTxDroppedMsgs:     m.ctrlTxDroppedMsgs,
-		ARQAttemptsMean:       meanAttempts,
-		ARQAttemptsP95:        p95Attempts,
-		RxUniqueAtDDLMean:     meanDDL,
-		RxUniqueAtDDLP95:      p95DDL,
-		DecodeLatencyP50Ms:    p50Dec,
-		DecodeLatencyP95Ms:    p95Dec,
-		DecodeLatencyMeanMs:   meanDec,
+		GoodputDecodeMbps:   goodput,
+		GoodputArrivalMbps:  goodputArrival,
+		DurationTransferMs:  durTransferMs,
+		DurationArrivalMs:   durArrivalMs,
+		DurationDecodeMs:    (m.decodeComputeTotalNs + 999_999) / 1_000_000, // ceil(ns->ms)
+		ResidualErasures:    0,                                              // non-residual path only; finalize checks integrity
+		FECOverhead:         overRatio,
+		TxTotalSymbols:      m.txTotalSymbols,
+		TxRepairSymbols:     m.txRepairSymbols,
+		TxSourceSymbols:     m.txSourceSymbols,
+		RxTotalSymbols:      m.totalSymbols,
+		RxRepairSymbols:     m.repairSymbols,
+		RxSourceSymbols:     rxSourceSymbols,
+		RxTotalSymbolBytes:  m.totalSymbolBytes,
+		RxRepairSymbolBytes: m.repairSymbolBytes,
+		RxSourceSymbolBytes: rxSourceBytes,
+		CtrlTxBytes:         m.ctrlTxBytes,
+		CtrlTxAckMsgs:       m.ctrlTxAckMsgs,
+		CtrlTxNackMsgs:      m.ctrlTxNackMsgs,
+		CtrlTxDroppedMsgs:   m.ctrlTxDroppedMsgs,
+		ARQAttemptsMean:     meanAttempts,
+		ARQAttemptsP95:      p95Attempts,
+		RxUniqueAtDDLMean:   meanDDL,
+		RxUniqueAtDDLP95:    p95DDL,
+		DecodeLatencyP50Ms:  p50Dec,
+		DecodeLatencyP95Ms:  p95Dec,
+		DecodeLatencyMeanMs: meanDec,
 		// Use active bucket count to avoid dilution from idle buckets (common for short transfers).
 		ArrivalSymbolRateKppsP95: func() float64 {
 			if active <= 0 || bucketSec <= 0 {

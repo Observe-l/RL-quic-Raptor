@@ -16,7 +16,9 @@ class ContextConfig:
     # Normalization references (bandit.md suggests aligning scales)
     goodput_ref_mbps: float = 20.0
     delay_ref_ms: float = 600.0
-    overhead_ref_pct: float = 100.0
+    # Overhead is now a ratio (repairs/source). Keep the field name for
+    # checkpoint compatibility, but default the scale to 1.0.
+    overhead_ref_pct: float = 1.0
     nack_ref: float = 50.0
     residual_ref: float = 5.0
     arq_ref: float = 10.0
@@ -69,12 +71,17 @@ class ContextBuilder:
         delay_violate_rate = float(np.mean(self._delay_violate_hist)) if self._delay_violate_hist else 0.0
         residual_mean = float(np.mean(self._residual_value_hist)) if self._residual_value_hist else 0.0
 
+        # Backward-compat: older checkpoints used percent scaling (100.0).
+        overhead_ref = float(cfg.overhead_ref_pct)
+        if overhead_ref > 10.0:
+            overhead_ref = overhead_ref / 100.0
+
         x = np.asarray(
             [
                 # 6 x EWMA metrics
                 self._ewma_goodput / max(1e-6, cfg.goodput_ref_mbps),
                 self._ewma_d95 / max(1e-6, cfg.delay_ref_ms),
-                self._ewma_overhead / max(1e-6, cfg.overhead_ref_pct),
+                self._ewma_overhead / max(1e-6, overhead_ref),
                 self._ewma_nack / max(1e-6, cfg.nack_ref),
                 self._ewma_arq / max(1e-6, cfg.arq_ref),
                 self._ewma_residual / max(1e-6, cfg.residual_ref),
@@ -99,7 +106,7 @@ class ContextBuilder:
                 Expected obs layout (from `FecEnv._obs_keys`):
                     0: goodput
                     1: decode_latency_p95_ms
-                    2: fec_overhead_pct_arrival
+                    2: fec_overhead
                     3: ctrl_tx_nack_msgs
                     4: arq_attempts_mean
                     5: residual_erasures
@@ -164,7 +171,7 @@ class ContextBuilder:
                 [
                     float(raw_obs.get("goodput", raw_obs.get("goodput_mbps", raw_obs.get("goodput_arrival_mbps", raw_obs.get("goodput_decode_mbps", 0.0))))),
                     float(raw_obs.get("decode_latency_p95_ms", 0.0)),
-                    float(raw_obs.get("fec_overhead_pct_arrival", 0.0)),
+                    float(raw_obs.get("fec_overhead", raw_obs.get("fec_overhead_pct_arrival", 0.0))),
                     float(raw_obs.get("ctrl_tx_nack_msgs", 0.0)),
                     float(raw_obs.get("arq_attempts_mean", 0.0)),
                     float(raw_obs.get("residual_erasures", 0.0)),

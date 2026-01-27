@@ -45,7 +45,7 @@ def _aligned_obs_vec_from_rl_observation(*, rl_obs: Dict[str, Any], ddl_ms: int,
     """Construct the exact training observation vector.
 
     Layout must match `python/fecenv_env.py`:
-      [goodput, decode_latency_p95_ms, fec_overhead_pct_arrival,
+            [goodput, decode_latency_p95_ms, fec_overhead,
        ctrl_tx_nack_msgs, arq_attempts_mean, residual_erasures,
        fec_rate, ddl_ms]
     """
@@ -54,7 +54,7 @@ def _aligned_obs_vec_from_rl_observation(*, rl_obs: Dict[str, Any], ddl_ms: int,
         # Mirror QuicFecRunner._default_obs(timeout=True) for the fields used in obs.
         goodput_mbps = 0.0
         decode_latency_p95_ms = 0.0
-        fec_overhead_pct_arrival = 0.0
+        fec_overhead = 0.0
         ctrl_tx_nack_msgs = 0.0
         arq_attempts_mean = 2.0
         residual_erasures = 1.0
@@ -69,9 +69,9 @@ def _aligned_obs_vec_from_rl_observation(*, rl_obs: Dict[str, Any], ddl_ms: int,
         except Exception:
             decode_latency_p95_ms = 0.0
         try:
-            fec_overhead_pct_arrival = float(rl_obs.get("fec_overhead_pct_arrival", 0.0))
+            fec_overhead = float(rl_obs.get("fec_overhead", rl_obs.get("fec_overhead_pct_arrival", 0.0)))
         except Exception:
-            fec_overhead_pct_arrival = 0.0
+            fec_overhead = 0.0
         try:
             ctrl_tx_nack_msgs = float(rl_obs.get("ctrl_tx_nack_msgs", 0.0))
         except Exception:
@@ -93,7 +93,7 @@ def _aligned_obs_vec_from_rl_observation(*, rl_obs: Dict[str, Any], ddl_ms: int,
         [
             goodput_mbps,
             decode_latency_p95_ms,
-            fec_overhead_pct_arrival,
+            fec_overhead,
             ctrl_tx_nack_msgs,
             arq_attempts_mean,
             residual_erasures,
