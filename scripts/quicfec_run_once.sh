@@ -197,6 +197,14 @@ sleep 0.1
 # Run client (logs in /tmp/quic_fec_cli.*)
 CLI_LOG=$(mktemp -t quic_fec_cli.XXXXXX.log)
 export QUIC_FEC_CC_BYPASS=${QUIC_FEC_CC_BYPASS:-1}
+
+# Byte counters on host veth0 (network-layer; includes headers). These are used
+# to estimate overhead (extra transmitted bytes over the file payload).
+TX0=0; RX0=0
+if [[ -r /sys/class/net/veth0/statistics/tx_bytes ]]; then
+  TX0=$(cat /sys/class/net/veth0/statistics/tx_bytes 2>/dev/null || echo 0)
+  RX0=$(cat /sys/class/net/veth0/statistics/rx_bytes 2>/dev/null || echo 0)
+fi
 START=$(date +%s%N)
 pace_arg=""
 # Pacing:
@@ -242,6 +250,16 @@ if [[ "$RC" == "124" || "$RC" == "137" ]]; then
   TIMED_OUT=1
 fi
 END=$(date +%s%N)
+
+TX1=$TX0; RX1=$RX0
+if [[ -r /sys/class/net/veth0/statistics/tx_bytes ]]; then
+  TX1=$(cat /sys/class/net/veth0/statistics/tx_bytes 2>/dev/null || echo "$TX0")
+  RX1=$(cat /sys/class/net/veth0/statistics/rx_bytes 2>/dev/null || echo "$RX0")
+fi
+TX_BYTES=$(( TX1 - TX0 ))
+RX_BYTES=$(( RX1 - RX0 ))
+if [[ "$TX_BYTES" -lt 0 ]]; then TX_BYTES=0; fi
+if [[ "$RX_BYTES" -lt 0 ]]; then RX_BYTES=0; fi
 
 # Wait for server to emit the observation before stopping it (cap by OBS_WAIT_SECS)
 tries=0
@@ -405,7 +423,7 @@ if [[ -n "${LOSS_MODE:-}" ]]; then
   LOSS_DESC="${LOSS_MODE}"
 fi
 
-echo "[run] proto=quic_fec bitrate=${BITRATE_MBPS}Mbps rtt=${RTT_MS}ms loss=${LOSS_DESC} dur_ms=${DUR_MS} dur_ms_client=${DUR_MS_CLIENT} timed_out=${TIMED_OUT} md5_ok=${MD5_OK} s_mbps=${S_MBPS}" >&2
+echo "[run] proto=quic_fec bitrate=${BITRATE_MBPS}Mbps rtt=${RTT_MS}ms loss=${LOSS_DESC} dur_ms=${DUR_MS} dur_ms_client=${DUR_MS_CLIENT} timed_out=${TIMED_OUT} md5_ok=${MD5_OK} s_mbps=${S_MBPS} file_bytes=${FILE_SIZE} tx_bytes=${TX_BYTES} rx_bytes=${RX_BYTES}" >&2
 
 # Cleanup temp logs
 # - Keep logs when a failure occurs (no RL_OBS) or residual_erasures=1.

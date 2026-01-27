@@ -276,7 +276,7 @@ def main() -> int:
             assert terminated or truncated  # env is configured with episode_step=1
 
             # Convert ddl_idx back to ddl_ms for context update
-            ddl_ms_values = [100, 150, 200, 250, 300, 350]
+            ddl_ms_values = list(action_set.ddl_ms_values)
             ddl_ms = int(ddl_ms_values[int(a.ddl_idx)])
             ctx.update_from_obs(obs=obs, ddl_ms=int(ddl_ms))
 

@@ -23,8 +23,11 @@ type Observation struct {
 	DurationArrivalMs int64 `json:"duration_arrival_ms"`
 	// DurationDecodeMs is the decoder compute time (sum over blocks), in milliseconds.
 	// This matches the common expectation of "raptorq decode time".
-	DurationDecodeMs      int64   `json:"duration_decode_ms"`
-	ResidualErasures      int32   `json:"residual_erasures"`
+	DurationDecodeMs int64 `json:"duration_decode_ms"`
+	ResidualErasures int32 `json:"residual_erasures"`
+	// FECOverheadPctArrival is an arrival-side redundancy percentage based on UNIQUE symbol arrivals:
+	//   100 * rx_repair_symbols / rx_total_symbols.
+	// It excludes duplicates/retransmissions and does not represent link-level tx overhead.
 	FECOverheadPctArrival float64 `json:"fec_overhead_pct_arrival"`
 	// Arrival-side accounting (unique symbols at receiver)
 	RxTotalSymbols      int64 `json:"rx_total_symbols"`

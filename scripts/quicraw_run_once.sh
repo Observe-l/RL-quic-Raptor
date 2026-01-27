@@ -82,6 +82,13 @@ START=$(date +%s%N)
 QUIC_FEC_CC_BYPASS=${QUIC_FEC_CC_BYPASS:-0} \
 QUIC_FEC_CC_ALGO=${QUIC_FEC_CC_ALGO:-} \
 TIMED_OUT=0
+
+# Byte counters on host veth0 (network-layer; includes headers).
+TX0=0; RX0=0
+if [[ -r /sys/class/net/veth0/statistics/tx_bytes ]]; then
+  TX0=$(cat /sys/class/net/veth0/statistics/tx_bytes 2>/dev/null || echo 0)
+  RX0=$(cat /sys/class/net/veth0/statistics/rx_bytes 2>/dev/null || echo 0)
+fi
 if command -v timeout >/dev/null 2>&1; then
   timeout --signal=KILL ${TIMEOUT_S}s \
     "$BIN_DIR/quicraw-client" -addr 10.10.0.2:$PORT -file "$FILE" -timeout ${TIMEOUT_S}s -measure-delay=true -packet-bytes 1200 \
@@ -95,6 +102,16 @@ if [[ "$RC" == "124" || "$RC" == "137" ]]; then
   TIMED_OUT=1
 fi
 END=$(date +%s%N)
+
+TX1=$TX0; RX1=$RX0
+if [[ -r /sys/class/net/veth0/statistics/tx_bytes ]]; then
+  TX1=$(cat /sys/class/net/veth0/statistics/tx_bytes 2>/dev/null || echo "$TX0")
+  RX1=$(cat /sys/class/net/veth0/statistics/rx_bytes 2>/dev/null || echo "$RX0")
+fi
+TX_BYTES=$(( TX1 - TX0 ))
+RX_BYTES=$(( RX1 - RX0 ))
+if [[ "$TX_BYTES" -lt 0 ]]; then TX_BYTES=0; fi
+if [[ "$RX_BYTES" -lt 0 ]]; then RX_BYTES=0; fi
 
 # Wait for server to finish writing (bounded).
 IN_SIZE=$(stat -c%s "$FILE")
@@ -135,7 +152,7 @@ if [[ "$TIMED_OUT" == "1" ]]; then
   MD5_OK=0
 fi
 
-echo "[run] proto=quic_raw bitrate=${BITRATE_MBPS}Mbps rtt=${RTT_MS}ms loss=${LOSS_PCT}% dur_ms=${DUR_MS} timed_out=${TIMED_OUT} md5_ok=${MD5_OK} s_mbps=${S_MBPS}" >&2
+echo "[run] proto=quic_raw bitrate=${BITRATE_MBPS}Mbps rtt=${RTT_MS}ms loss=${LOSS_PCT}% dur_ms=${DUR_MS} timed_out=${TIMED_OUT} md5_ok=${MD5_OK} s_mbps=${S_MBPS} file_bytes=${FILE_SIZE} tx_bytes=${TX_BYTES} rx_bytes=${RX_BYTES}" >&2
 
 # Emit AoI-style average one-way delay from server output.
 DELAY_LINE=$(grep -E '^\[delay\] ' "$SRV_LOG" | tail -n1 || true)

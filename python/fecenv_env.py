@@ -405,14 +405,30 @@ class FecEnv(gym.Env):
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         cfg = config or {}
+
+        # DDL discretization (ms).
+        # This controls both the action space cardinality and the mapping from ddl_idx -> ddl_ms.
+        # Default kept for backward compatibility with older checkpoints.
+        default_ddl_ms_values = [100, 150, 200, 250, 300, 350]
+        ddl_ms_values_cfg = cfg.get("ddl_ms_values", default_ddl_ms_values)
+        try:
+            ddl_ms_values = [int(x) for x in list(ddl_ms_values_cfg)]
+        except Exception:
+            ddl_ms_values = list(default_ddl_ms_values)
+        ddl_ms_values = [int(x) for x in ddl_ms_values if int(x) > 0]
+        if not ddl_ms_values:
+            ddl_ms_values = list(default_ddl_ms_values)
+        # Keep deterministic mapping.
+        self._ddl_ms_values: List[int] = sorted({int(x) for x in ddl_ms_values})
+
         # Discrete action space (MultiDiscrete), matching the requirement that
         # controls are chosen from a finite set (not a clipped continuous Box).
         # Order: [K_idx, R0_pct_idx, RSTEP_idx, ddl_idx]
         #   K: 10..64                                -> 55 values
         #   R0_pct: 0.0..1.0 step 0.05               -> 21 values
         #   RSTEP: 1..8                              -> 8 values
-        #   ddl_ms: {100,150,200,250,300,350}        -> 6 values
-        self.action_space = spaces.MultiDiscrete([55, 21, 8, 6])
+        #   ddl_ms: configured via ddl_ms_values     -> len(ddl_ms_values) values
+        self.action_space = spaces.MultiDiscrete([55, 21, 8, int(len(self._ddl_ms_values))])
         # Policy observation keys.
         # Keep this strictly limited to the learning signal (no debug/leakage).
         # Layout (requested):
@@ -608,14 +624,13 @@ class FecEnv(gym.Env):
             raise ValueError(f"R0_pct index out of range: {r0_idx}")
         if not (0 <= rstep_idx <= 7):
             raise ValueError(f"RSTEP index out of range: {rstep_idx}")
-        if not (0 <= ddl_idx <= 5):
+        if not (0 <= ddl_idx < int(len(self._ddl_ms_values))):
             raise ValueError(f"ddl index out of range: {ddl_idx}")
 
         K = 10 + k_idx
         R0_pct = 0.05 * float(r0_idx)
         RSTEP = 1 + rstep_idx
-        ddl_ms_values = [100, 150, 200, 250, 300, 350]
-        ddl_ms = int(ddl_ms_values[int(ddl_idx)])
+        ddl_ms = int(self._ddl_ms_values[int(ddl_idx)])
         act = Action(K=int(K), R0_pct=float(R0_pct), RSTEP=int(RSTEP), ddl_ms=int(ddl_ms))
 
         obs_dict, _reward_unused, _done_transfer, info = self._runner.step(

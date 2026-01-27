@@ -267,8 +267,8 @@ def main() -> int:
         description="LinTS runner with external GE schedule (per-episode net params) and block-topk checkpointing"
     )
 
-    ap.add_argument("--steps", type=int, default=50000, help="number of bandit steps (transfers)")
-    ap.add_argument("--episode-steps", type=int, default=50, help="steps per episode (per GE sender)")
+    ap.add_argument("--steps", type=int, default=1000, help="number of bandit steps (transfers)")
+    ap.add_argument("--episode-steps", type=int, default=10, help="steps per episode (per GE sender)")
     ap.add_argument("--block-steps", type=int, default=1000, help="checkpointing block size in steps")
     ap.add_argument("--save-topk", type=int, default=3, help="save top-k models within each block")
     ap.add_argument("--warmup", type=int, default=20, help="random warmup steps before LinTS")
@@ -305,12 +305,18 @@ def main() -> int:
         help="cap gemodel k below 100%% to avoid permanent blackhole states",
     )
 
-    ap.add_argument("--rtt-ms", type=int, default=25)
-    ap.add_argument("--bitrate-mbps", type=int, default=50)
+    ap.add_argument("--rtt-ms", type=int, default=50)
+    ap.add_argument("--bitrate-mbps", type=int, default=10)
     ap.add_argument("--timeout-sec", type=int, default=15)
-    ap.add_argument("--train-file-bytes", type=int, default=3 * 1024 * 1024)
+    ap.add_argument("--train-file-bytes", type=int, default= 512 * 1024)
 
     ap.add_argument("--reward-w-arq", type=float, default=0.1)
+    ap.add_argument(
+        "--reward-w-overhead",
+        type=float,
+        default=0.5,
+        help="overhead penalty weight (uses fec_overhead_pct_arrival; default increased to make overhead matter)",
+    )
     ap.add_argument("--reward-variant", type=str, default="qarc_v1")
     # Delay shaping: use continuous penalty by default to avoid a hard threshold
     # that can dominate the reward when d95 hovers around ddl.
@@ -361,29 +367,6 @@ def main() -> int:
     senders = _load_senders(str(args.ge_params))
     ge_key = str(args.ge_key)
 
-    # Env configured so that we only reset (and switch net params) every episode_steps.
-    env_cfg: Dict[str, Any] = {
-        "episode_step": int(episode_steps),
-        "rtt_ms": int(args.rtt_ms),
-        "loss_pct": 0,
-        # Will be overridden per-episode via reset(options).
-        "loss_mode": "iid:0",
-        "bitrate_mbps": int(args.bitrate_mbps),
-        "timeout_sec": int(args.timeout_sec),
-        "train_file_bytes": int(args.train_file_bytes),
-        "reward_variant": str(args.reward_variant),
-        "reward_w_arq": float(args.reward_w_arq),
-        "reward_delay_binary": bool(int(args.reward_delay_binary)),
-        "reward_residual_binary": bool(int(args.reward_residual_binary)),
-        "log_obs_vec": False,
-        # Avoid curriculum overriding our externally supplied schedule.
-        "randomize_net_params_enabled": False,
-        # Bandit should only consume the environment observation (no debug info).
-        "normalize_obs": False,
-    }
-
-    env = FecEnv(env_cfg)
-
     # Logging
     dest_dir = args.result_dir or os.environ.get("QUICFEC_RESULT_DIR")
     if not dest_dir:
@@ -417,7 +400,9 @@ def main() -> int:
             load_prefix = None
 
     if loaded_from is None:
-        action_set = ActionSet()
+        # New DDL discretization for training.
+        ddl_ms_values = [25, 50, 75, 100, 125, 150, 175, 200]
+        action_set = ActionSet(ddl_ms_values=ddl_ms_values)
         ctx_cfg = ContextConfig(ewma_alpha=float(args.ctx_alpha), window=int(args.ctx_window))
         ctx = ContextBuilder(ctx_cfg)
 
@@ -433,6 +418,51 @@ def main() -> int:
             seed=int(args.seed),
         )
         agent = LinTS(dim=dim, cfg=lints_cfg)
+
+    # Action set summary (bandit decides the action space; env must follow).
+    try:
+        n_actions = int(len(action_set))
+        k_n = int(len(action_set.k_values))
+        r0_n = int(len(action_set.r0_pct_values))
+        rs_n = int(len(action_set.rstep_values))
+        ddl_n = int(len(action_set.ddl_ms_values))
+        print(
+            f"[bandit] action_set: n={n_actions} = K({k_n})*R0pct({r0_n})*RSTEP({rs_n})*DDL({ddl_n}); "
+            f"ddl_ms_values={list(action_set.ddl_ms_values)}"
+        )
+    except Exception:
+        pass
+
+    # Env configured so that we only reset (and switch net params) every episode_steps.
+    # IMPORTANT: DDL discretization must match the action_set used by the bandit.
+    env_cfg: Dict[str, Any] = {
+        "episode_step": int(episode_steps),
+        "rtt_ms": int(args.rtt_ms),
+        "loss_pct": 0,
+        # Will be overridden per-episode via reset(options).
+        "loss_mode": "iid:0",
+        "bitrate_mbps": int(args.bitrate_mbps),
+        "timeout_sec": int(args.timeout_sec),
+        "train_file_bytes": int(args.train_file_bytes),
+        "ddl_ms_values": list(action_set.ddl_ms_values),
+        "reward_variant": str(args.reward_variant),
+        "reward_w_arq": float(args.reward_w_arq),
+        "reward_w_overhead": float(args.reward_w_overhead),
+        "reward_delay_binary": bool(int(args.reward_delay_binary)),
+        "reward_residual_binary": bool(int(args.reward_residual_binary)),
+        "log_obs_vec": False,
+        # Avoid curriculum overriding our externally supplied schedule.
+        "randomize_net_params_enabled": False,
+        # Bandit should only consume the environment observation (no debug info).
+        "normalize_obs": False,
+    }
+
+    # Clarify metric semantics for overhead shaping.
+    print(
+        "note: reward overhead term uses fec_overhead_pct_arrival = (rx_repair_symbols / rx_total_symbols) * 100 (unique arrivals)"
+    )
+
+    env = FecEnv(env_cfg)
 
     # Breakpoint semantics: --steps is treated as the *target total step index*.
     # If we resume from step_t, run [start_t, total_steps).
@@ -601,8 +631,8 @@ def main() -> int:
 
             obs, reward, terminated, truncated, info = env.step(env_action)
 
-            ddl_ms_values = [100, 150, 200, 250, 300, 350]
-            ddl_ms = int(ddl_ms_values[int(a.ddl_idx)])
+            ddl_ms_levels = list(action_set.ddl_ms_values)
+            ddl_ms = int(ddl_ms_levels[int(a.ddl_idx)])
             ctx.update_from_obs(obs=obs, ddl_ms=int(ddl_ms))
 
             if int(t) >= warmup:

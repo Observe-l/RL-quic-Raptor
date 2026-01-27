@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import csv
 import json
 import os
@@ -29,7 +30,7 @@ if str(_PY_ROOT) not in sys.path:
     sys.path.insert(0, str(_PY_ROOT))
 
 from bandit.action_set import ActionSet  # noqa: E402
-from bandit.context import ContextBuilder  # noqa: E402
+from bandit.context import ContextBuilder, ContextConfig  # noqa: E402
 from bandit.features import phi as phi_fn  # noqa: E402
 from bandit.model_io import load_checkpoint  # noqa: E402
 from bandit.run_lints_ge_schedule import _ge_to_tc_gemodel_loss_mode  # noqa: E402
@@ -165,6 +166,98 @@ def _bandit_select_action_mean(*, agent, action_set: ActionSet, ctx: ContextBuil
     return a_idx, {"x": x.tolist(), "a_idx": a_idx, "score": float(scores[a_idx])}
 
 
+def _bandit_select_action_ts(*, agent, action_set: ActionSet, ctx: ContextBuilder) -> Tuple[int, Dict[str, Any]]:
+    """Select action using Thompson sampling (matches training runner behavior)."""
+
+    x = ctx.get_context()
+    Phi = np.zeros((len(action_set), agent.dim), dtype=np.float32)
+    for i, _a in action_set.iter_actions():
+        Phi[i, :] = phi_fn(x=x, a_onehot=action_set.get_onehot(i))
+
+    a_idx, theta = agent.select(Phi)
+    dbg: Dict[str, Any] = {"x": x.tolist(), "a_idx": int(a_idx)}
+    try:
+        if theta is not None:
+            dbg["theta_norm"] = float(np.linalg.norm(theta))
+    except Exception:
+        pass
+    return int(a_idx), dbg
+
+
+def _ckpt_signature(prefix: str) -> Dict[str, Any]:
+    """Return a lightweight signature for a checkpoint prefix (.json/.npz)."""
+
+    prefix = os.path.abspath(str(prefix))
+    out: Dict[str, Any] = {"prefix": prefix}
+    for ext in (".json", ".npz"):
+        p = prefix + ext
+        try:
+            st = os.stat(p)
+            rec: Dict[str, Any] = {"path": p, "size": int(st.st_size), "mtime": float(st.st_mtime)}
+            with open(p, "rb") as f:
+                head = f.read(4096)
+            rec["sha256_head4k"] = hashlib.sha256(head).hexdigest()
+            out[ext[1:]] = rec
+        except FileNotFoundError:
+            out[ext[1:]] = {"path": p, "missing": True}
+        except Exception as e:
+            out[ext[1:]] = {"path": p, "error": str(e)}
+    return out
+
+
+def _verify_loaded_checkpoint(*, agent, ctx_cfg: ContextConfig, action_set: ActionSet) -> Dict[str, Any]:
+    """Validate checkpoint consistency with feature construction used by compare."""
+
+    n_actions = int(len(action_set))
+    try:
+        ddl_ms_values = list(action_set.ddl_ms_values)
+    except Exception as e:
+        raise RuntimeError("invalid checkpoint: action_set.ddl_ms_values missing") from e
+    if n_actions <= 0:
+        raise RuntimeError("invalid checkpoint: action_set is empty")
+    if not ddl_ms_values:
+        raise RuntimeError("invalid checkpoint: action_set.ddl_ms_values missing/empty")
+
+    # Feature dim sanity: 1 + d + m + d*m
+    ctx = ContextBuilder(cfg=ctx_cfg)
+    x = np.asarray(ctx.get_context(), dtype=np.float64).reshape(-1)
+    d = int(x.size)
+    m = int(getattr(action_set, "onehot_dim", 0))
+    dim_expected = 1 + d + m + d * m
+    dim_agent = int(getattr(agent, "dim", 0))
+    if dim_agent != dim_expected:
+        raise RuntimeError(
+            f"checkpoint feature dim mismatch: agent.dim={dim_agent} expected={dim_expected} (d={d}, m={m})"
+        )
+
+    # Phi sanity
+    ph = np.asarray(phi_fn(x=x.astype(np.float32), a_onehot=action_set.get_onehot(0))).reshape(-1)
+    if int(ph.size) != int(dim_agent):
+        raise RuntimeError(f"phi dim mismatch: phi.size={int(ph.size)} agent.dim={dim_agent}")
+
+    # ddl_idx mapping sanity for a few actions
+    idxs = sorted({0, n_actions - 1, n_actions // 2})
+    for i in idxs:
+        spec = action_set.get_action(int(i))
+        env_action = np.asarray(spec.to_env_action(), dtype=np.int64).reshape(-1)
+        if env_action.size != 4:
+            raise RuntimeError(f"env_action must have 4 dims, got {env_action}")
+        ddl_idx = int(env_action[3])
+        if not (0 <= ddl_idx < int(len(ddl_ms_values))):
+            raise RuntimeError(
+                f"ddl_idx out of range for action {i}: ddl_idx={ddl_idx} len(ddl_ms_values)={len(ddl_ms_values)}"
+            )
+
+    return {
+        "n_actions": n_actions,
+        "ddl_ms_values": [int(x) for x in ddl_ms_values],
+        "d": d,
+        "m": m,
+        "dim_expected": dim_expected,
+        "agent_dim": dim_agent,
+    }
+
+
 def _action_to_env_vars(*, action_set: ActionSet, a_idx: int, symbol_bytes: int) -> Dict[str, str]:
     spec = action_set.get_action(a_idx)
     env_action = spec.to_env_action()
@@ -174,7 +267,11 @@ def _action_to_env_vars(*, action_set: ActionSet, a_idx: int, symbol_bytes: int)
     r0_pct = 0.05 * float(r0_idx)
     R0 = int(float(K) * r0_pct)
     RSTEP = 1 + rstep_idx
-    ddl_ms_values = [100, 150, 200, 250, 300, 350]
+
+    # DDL discretization comes from the bandit checkpoint's ActionSet.
+    ddl_ms_values = list(action_set.ddl_ms_values)
+    if not (0 <= int(ddl_idx) < int(len(ddl_ms_values))):
+        raise IndexError(f"ddl_idx out of range: ddl_idx={int(ddl_idx)} len(ddl_ms_values)={int(len(ddl_ms_values))}")
     DDL_MS = int(ddl_ms_values[int(ddl_idx)])
 
     return {
@@ -545,7 +642,19 @@ def main() -> int:
     ap.add_argument("--timeout-s", type=int, default=180, help="Python-side subprocess timeout; must exceed transfer timeout")
 
     ap.add_argument("--reps", type=int, default=10)
-    ap.add_argument("--warmup-a-idx", type=int, default=2845)
+
+    ap.add_argument(
+        "--bandit-policy",
+        type=str,
+        default="mean",
+        choices=["mean", "ts"],
+        help="Bandit action selection policy: mean=argmax(theta_hat), ts=Thompson sampling (matches training)",
+    )
+    ap.add_argument("--seed", type=int, default=0, help="seed for warmup random actions (policy=ts uses checkpoint RNG)")
+    # Legacy warmup behavior: one fixed warmup action (old default was 2845 for the old 6-DDL action set).
+    # Use -1 to disable fixed warmup index and instead do random warmup steps (recommended).
+    ap.add_argument("--warmup-a-idx", type=int, default=-1)
+    ap.add_argument("--warmup-steps", type=int, default=20, help="number of random warmup transfers when --warmup-a-idx < 0")
 
     ap.add_argument("--delay-file-bytes", type=int, default=128 * 1024)
     ap.add_argument("--goodput-file-bytes", type=int, default=3 * 1024 * 1024)
@@ -563,6 +672,13 @@ def main() -> int:
         default="both",
         choices=["delay", "goodput", "both"],
         help="Which experiments to run: delay (128KB), goodput (3MB), or both.",
+    )
+
+    ap.add_argument(
+        "--verify-only",
+        type=int,
+        default=0,
+        help="1: only verify checkpoint loading/consistency and exit (no experiments, no sudo needed)",
     )
 
     ap.add_argument("--out-dir", type=str, default="")
@@ -586,6 +702,19 @@ def main() -> int:
 
     # Load bandit checkpoint
     agent, _cfg, _ctx0, ctx_cfg, action_set, _t0 = load_checkpoint(path_prefix=model_prefix)
+
+    # Print action set summary to make mismatches obvious.
+    ddl_vals = list(action_set.ddl_ms_values)
+    print(f"[bandit] action_set_n={len(action_set)} ddl_ms_values={ddl_vals}")
+
+    # Verify checkpoint identity & consistency.
+    sig = _ckpt_signature(model_prefix)
+    print(f"[bandit] checkpoint_signature={json.dumps(sig, ensure_ascii=False)}")
+    ver = _verify_loaded_checkpoint(agent=agent, ctx_cfg=ctx_cfg, action_set=action_set)
+    print(f"[bandit] checkpoint_consistency=ok details={json.dumps(ver, ensure_ascii=False)}")
+
+    if int(args.verify_only) != 0:
+        return 0
 
     ts = _now_ts()
     out_dir = Path(args.out_dir) if args.out_dir else (_REPO_ROOT / "python" / "results" / f"paper-ge-steady-rp-{ts}")
@@ -617,47 +746,70 @@ def main() -> int:
             ctx = ContextBuilder(cfg=ctx_cfg)
             ctx.reset()
 
-            # Bandit warmup (excluded from stats): run a_idx=warmup-a-idx once.
-            warmup_idx = int(args.warmup_a_idx)
-            warmup_env = _action_to_env_vars(action_set=action_set, a_idx=warmup_idx, symbol_bytes=int(args.symbol_bytes))
-            warmup_ddl_ms = int(warmup_env.get("DDL_MS", "150"))
-            m, stderr = _run_one(
-                method="bandit",
-                task=task,
-                loss_mode=loss_mode,
-                bitrate_mbps=int(args.bitrate_mbps),
-                rtt_ms=int(args.rtt_ms),
-                timeout_transfer_s=int(args.timeout_transfer_s),
-                timeout_s=int(args.timeout_s),
-                file_path=file_path,
-                fec_env=warmup_env,
-            )
-            rl_obs = _extract_last_rl_observation(stderr)
-            failed = bool(int(m["timed_out"]) or int(m["md5_ok"]) != 1)
-            obs_vec = _aligned_obs_vec_from_rl_observation(rl_obs=rl_obs, ddl_ms=warmup_ddl_ms, failed=failed)
-            ctx.update_from_obs(obs=obs_vec, ddl_ms=warmup_ddl_ms)
-            rows.append(
-                Row(
-                    task=task,
+            # Bandit warmup (excluded from stats).
+            # If --warmup-a-idx >= 0: run that fixed action once (legacy).
+            # Else: run --warmup-steps random actions (closer to training warmup behavior).
+            warmup_fixed_idx = int(args.warmup_a_idx)
+            warmup_steps = int(args.warmup_steps)
+            if warmup_steps < 0:
+                warmup_steps = 0
+
+            warmup_indices: List[int] = []
+            if warmup_fixed_idx >= 0:
+                if not (0 <= int(warmup_fixed_idx) < int(len(action_set))):
+                    raise ValueError(f"--warmup-a-idx out of range: {warmup_fixed_idx} (action_set_n={len(action_set)})")
+                warmup_indices = [int(warmup_fixed_idx)]
+            else:
+                task_seed = 0
+                for ch in str(task).encode("utf-8", errors="ignore"):
+                    task_seed = (task_seed * 131 + int(ch)) % 2_147_483_647
+                rs = np.random.RandomState(int(args.seed) + 1337 * int(sender_id) + 17 * int(task_seed))
+                for _ in range(int(warmup_steps)):
+                    warmup_indices.append(int(rs.randint(0, len(action_set))))
+
+            for w_i, warmup_idx in enumerate(warmup_indices):
+                warmup_env = _action_to_env_vars(action_set=action_set, a_idx=int(warmup_idx), symbol_bytes=int(args.symbol_bytes))
+                warmup_ddl_ms = int(warmup_env.get("DDL_MS", "150"))
+                m, stderr = _run_one(
                     method="bandit",
-                    sender_id=int(sender_id),
-                    loss_mode=str(loss_mode),
-                    rep=-1,
-                    is_warmup=1,
-                    timed_out=int(m["timed_out"]),
-                    md5_ok=int(m["md5_ok"]),
-                    success=1 if (int(m["timed_out"]) == 0 and int(m["md5_ok"]) == 1) else 0,
-                    dur_ms=int(m["dur_ms"]),
-                    goodput_mbps=float(m["goodput_mbps"]),
-                    a_idx=int(warmup_idx),
-                    extra={"warmup": True},
+                    task=task,
+                    loss_mode=loss_mode,
+                    bitrate_mbps=int(args.bitrate_mbps),
+                    rtt_ms=int(args.rtt_ms),
+                    timeout_transfer_s=int(args.timeout_transfer_s),
+                    timeout_s=int(args.timeout_s),
+                    file_path=file_path,
+                    fec_env=warmup_env,
                 )
-            )
+                rl_obs = _extract_last_rl_observation(stderr)
+                failed = bool(int(m["timed_out"]) or int(m["md5_ok"]) != 1)
+                obs_vec = _aligned_obs_vec_from_rl_observation(rl_obs=rl_obs, ddl_ms=warmup_ddl_ms, failed=failed)
+                ctx.update_from_obs(obs=obs_vec, ddl_ms=warmup_ddl_ms)
+                rows.append(
+                    Row(
+                        task=task,
+                        method="bandit",
+                        sender_id=int(sender_id),
+                        loss_mode=str(loss_mode),
+                        rep=-(int(w_i) + 1),
+                        is_warmup=1,
+                        timed_out=int(m["timed_out"]),
+                        md5_ok=int(m["md5_ok"]),
+                        success=1 if (int(m["timed_out"]) == 0 and int(m["md5_ok"]) == 1) else 0,
+                        dur_ms=int(m["dur_ms"]),
+                        goodput_mbps=float(m["goodput_mbps"]),
+                        a_idx=int(warmup_idx),
+                        extra={"warmup": True, "warmup_step": int(w_i), "policy": str(args.bandit_policy)},
+                    )
+                )
 
             # Measured runs
             for rep in range(int(args.reps)):
                 # Bandit
-                a_idx, dbg = _bandit_select_action_mean(agent=agent, action_set=action_set, ctx=ctx)
+                if str(args.bandit_policy) == "ts":
+                    a_idx, dbg = _bandit_select_action_ts(agent=agent, action_set=action_set, ctx=ctx)
+                else:
+                    a_idx, dbg = _bandit_select_action_mean(agent=agent, action_set=action_set, ctx=ctx)
                 fec_env = _action_to_env_vars(action_set=action_set, a_idx=a_idx, symbol_bytes=int(args.symbol_bytes))
                 ddl_ms = int(fec_env.get("DDL_MS", "150"))
 
@@ -691,7 +843,7 @@ def main() -> int:
                         dur_ms=int(m["dur_ms"]),
                         goodput_mbps=float(m["goodput_mbps"]),
                         a_idx=int(a_idx),
-                        extra={"bandit": dbg},
+                        extra={"bandit": dbg, "policy": str(args.bandit_policy)},
                     )
                 )
 
@@ -865,7 +1017,10 @@ def main() -> int:
         "timeout_transfer_s": int(args.timeout_transfer_s),
         "timeout_s": int(args.timeout_s),
         "reps": int(args.reps),
+        "bandit_policy": str(args.bandit_policy),
+        "seed": int(args.seed),
         "warmup_a_idx": int(args.warmup_a_idx),
+        "warmup_steps": int(args.warmup_steps),
         "delay_file_bytes": int(args.delay_file_bytes),
         "goodput_file_bytes": int(args.goodput_file_bytes),
         "symbol_bytes": int(args.symbol_bytes),

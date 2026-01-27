@@ -24,7 +24,7 @@ class ActionSet:
 
     Notes on discretization:
     - The existing env uses MultiDiscrete indices:
-            K = 10 + k_idx, R0_pct = 0.05*r0_idx, RSTEP = 1+rstep_idx, ddl_ms in {100,150,200,250,300,350}.
+        K = 10 + k_idx, R0_pct = 0.05*r0_idx, RSTEP = 1+rstep_idx, ddl_ms in ddl_ms_values.
     """
 
     def __init__(
@@ -37,9 +37,8 @@ class ActionSet:
     ):
         # Defaults: representable, moderately sized, aligned with bandit.md intent.
         if k_values is None:
-            k_values = list(range(10, 65, 4))  # 10..62 step 4
-            if 64 not in k_values:
-                k_values = list(k_values) + [64]
+            # User-requested discretization: K in [10, 64] step 2.
+            k_values = list(range(10, 65, 2))
         if r0_pct_values is None:
             # Env supports 0.0..1.0 step 0.05; choose a smaller subset.
             r0_pct_values = [0.05, 0.1, 0.15, 0.2, 0.25]
@@ -54,8 +53,8 @@ class ActionSet:
         self.ddl_ms_values = sorted({int(x) for x in ddl_ms_values})
 
         self.actions: List[ActionSpec] = []
-        ddl_levels = [100, 150, 200, 250, 300, 350]
-        ddl_to_idx = {v: i for i, v in enumerate(ddl_levels)}
+        ddl_levels = list(self.ddl_ms_values)
+        ddl_to_idx = {int(v): int(i) for i, v in enumerate(ddl_levels)}
         for K in self.k_values:
             k_idx = int(K) - 10
             if not (0 <= k_idx <= 54):
@@ -66,11 +65,12 @@ class ActionSet:
                 for RSTEP in self.rstep_values:
                     rstep_idx = int(np.clip(int(RSTEP) - 1, 0, 7))
                     for ddl_ms in self.ddl_ms_values:
+                        # Strict mapping: ddl_idx must be defined by the action set.
                         ddl_idx = ddl_to_idx.get(int(ddl_ms))
                         if ddl_idx is None:
-                            # Backward-compat: map unsupported values to nearest level.
-                            target = int(ddl_ms)
-                            ddl_idx = int(min(range(len(ddl_levels)), key=lambda i: abs(int(ddl_levels[i]) - target)))
+                            raise ValueError(
+                                f"ddl_ms {int(ddl_ms)} not present in ddl_ms_values={ddl_levels}"
+                            )
                         self.actions.append(ActionSpec(k_idx=k_idx, r0_idx=r0_idx, rstep_idx=rstep_idx, ddl_idx=ddl_idx))
 
         if not self.actions:
