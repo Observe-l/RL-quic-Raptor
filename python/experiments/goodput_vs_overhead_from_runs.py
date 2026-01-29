@@ -107,6 +107,50 @@ def _load_runs(runs_csv: Path) -> List[Run]:
     return out
 
 
+def _load_flec_runs(flec_jsonl: Path) -> List[Run]:
+    """Load per-trial flec jsonl and map into the same Run schema."""
+
+    out: List[Run] = []
+    with flec_jsonl.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = (line or "").strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(d, dict):
+                continue
+            try:
+                sender_id = int(d.get("sender", 0) or 0)
+                ok = int(d.get("ok", 0) or 0)
+                e2e_s = d.get("e2e_s", None)
+                dur_ms = int(float(e2e_s) * 1000.0) if e2e_s is not None else 0
+                file_bytes = int(d.get("tx_data_bytes", 0) or 0)
+                tx_total = int(d.get("tx_total_bytes", 0) or 0)
+                overhead = d.get("overhead", None)
+                overhead_ratio = (
+                    float(overhead)
+                    if overhead is not None
+                    else (float(tx_total - file_bytes) / float(file_bytes) if file_bytes > 0 and tx_total > 0 else 0.0)
+                )
+            except Exception:
+                continue
+
+            out.append(
+                Run(
+                    sender_id=int(sender_id),
+                    method="flec",
+                    success=int(ok),
+                    dur_ms=int(dur_ms),
+                    file_bytes=int(file_bytes),
+                    overhead_ratio=float(overhead_ratio),
+                )
+            )
+    return out
+
+
 _FEC_METHOD_RE = re.compile(r"^fec_k(?P<k>\d+)_r0_(?P<r0>\d+)_rstep_(?P<rstep>\d+)$")
 
 
@@ -128,6 +172,12 @@ def main() -> int:
         type=str,
         default="python/results/paper-overhead/runs.csv",
         help="Path to runs.csv (output of overhead_vs_completion_scatter.py)",
+    )
+    ap.add_argument(
+        "--flec-jsonl",
+        type=str,
+        default="",
+        help="Optional: overlay flec points from jsonl (fields: sender,ok,e2e_s,tx_total_bytes,tx_data_bytes,overhead).",
     )
     ap.add_argument("--out-dir", type=str, default="", help="Output directory (default: alongside runs.csv)")
     ap.add_argument(
@@ -159,6 +209,12 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     runs = _load_runs(runs_csv)
+
+    flec_path = Path(str(args.flec_jsonl)).expanduser() if str(args.flec_jsonl).strip() else None
+    if flec_path is not None:
+        if not flec_path.exists():
+            raise FileNotFoundError(str(flec_path))
+        runs.extend(_load_flec_runs(flec_path))
 
     # Filter rows and compute goodput.
     filtered: List[Run] = []
@@ -226,14 +282,17 @@ def main() -> int:
     method_labels = {
         "bandit": "QUIC-FEC-Bandit",
         "quic_bbrv2": "QUIC",
+        "flec": "FLEC",
     }
     method_colors = {
         "bandit": "#1f77b4",
         "quic_bbrv2": "#ff7f0e",
+        "flec": "#9467bd",
     }
     method_markers = {
         "bandit": "o",
         "quic_bbrv2": "^",
+        "flec": "x",
     }
 
     # Add any fec_* methods with stable colors/markers.

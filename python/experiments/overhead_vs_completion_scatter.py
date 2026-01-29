@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -30,6 +31,9 @@ from bandit.action_set import ActionSet  # noqa: E402
 from bandit.context import ContextBuilder  # noqa: E402
 from bandit.features import phi as phi_fn  # noqa: E402
 from bandit.model_io import load_checkpoint  # noqa: E402
+
+
+_FEC_METHOD_RE = re.compile(r"^fec_k(?P<k>\d+)_r0_(?P<r0>\d+)_rstep_(?P<rstep>\d+)$")
 
 
 def _now_ts() -> str:
@@ -318,6 +322,95 @@ class RunRow:
     overhead_ratio: float
 
 
+def _load_runrows_from_runs_csv(runs_csv: Path) -> List[RunRow]:
+    out: List[RunRow] = []
+    with runs_csv.open("r", encoding="utf-8", newline="") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            try:
+                out.append(
+                    RunRow(
+                        sender_id=int(row.get("sender_id", "0") or "0"),
+                        loss_mode=str(row.get("loss_mode", "")),
+                        proto_ddl_ms=int(row.get("proto_ddl_ms", "0") or "0"),
+                        method=str(row.get("method", "")),
+                        rep=int(row.get("rep", "0") or "0"),
+                        timed_out=int(row.get("timed_out", "0") or "0"),
+                        md5_ok=int(row.get("md5_ok", "0") or "0"),
+                        success=int(row.get("success", "0") or "0"),
+                        dur_ms=int(row.get("dur_ms", "0") or "0"),
+                        tx_bytes=int(row.get("tx_bytes", "0") or "0"),
+                        rx_bytes=int(row.get("rx_bytes", "0") or "0"),
+                        file_bytes=int(row.get("file_bytes", "0") or "0"),
+                        overhead_ratio=float(row.get("overhead_ratio", "0") or "0"),
+                    )
+                )
+            except Exception:
+                continue
+    return out
+
+
+def _load_flec_runrows_from_jsonl(flec_jsonl: Path) -> List[RunRow]:
+    """Map flec jsonl into RunRow schema.
+
+    Expected keys per line: sender, trial, ok, e2e_s, tx_total_bytes, tx_data_bytes, overhead.
+    """
+
+    out: List[RunRow] = []
+    with flec_jsonl.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = (line or "").strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(d, dict):
+                continue
+            try:
+                sender_id = int(d.get("sender", 0) or 0)
+                rep = int(d.get("trial", 0) or 0)
+                ok = int(d.get("ok", 0) or 0)
+                e2e_s = d.get("e2e_s", None)
+                dur_ms = int(float(e2e_s) * 1000.0) if e2e_s is not None else 0
+                tx_total = int(d.get("tx_total_bytes", 0) or 0)
+                file_bytes = int(d.get("tx_data_bytes", 0) or 0)
+                overhead = d.get("overhead", None)
+                overhead_ratio = (
+                    float(overhead)
+                    if overhead is not None
+                    else (float(tx_total - file_bytes) / float(file_bytes) if file_bytes > 0 and tx_total > 0 else 0.0)
+                )
+                p_pct = d.get("p_pct", None)
+                r_pct = d.get("r_pct", None)
+                if p_pct is not None and r_pct is not None:
+                    loss_mode = f"flec:p={float(p_pct):.6f},r={float(r_pct):.6f}"
+                else:
+                    loss_mode = "flec"
+            except Exception:
+                continue
+
+            out.append(
+                RunRow(
+                    sender_id=int(sender_id),
+                    loss_mode=str(loss_mode),
+                    proto_ddl_ms=0,
+                    method="flec",
+                    rep=int(rep),
+                    timed_out=0 if ok == 1 else 1,
+                    md5_ok=int(ok),
+                    success=int(ok),
+                    dur_ms=int(dur_ms),
+                    tx_bytes=int(tx_total),
+                    rx_bytes=0,
+                    file_bytes=int(file_bytes),
+                    overhead_ratio=float(overhead_ratio),
+                )
+            )
+    return out
+
+
 def _fixed_fec_env(*, ddl_ms: int, symbol_bytes: int, k: int, r0: int, rstep: int) -> Dict[str, str]:
     return {
         "K": str(int(k)),
@@ -460,8 +553,20 @@ def main() -> int:
     ap.add_argument(
         "--bandit-model-prefix",
         type=str,
-        required=True,
+        required=False,
         help="Bandit checkpoint prefix (no .json/.npz), e.g. python/results/.../model_tXXXX_r0pYYYY",
+    )
+    ap.add_argument(
+        "--base-runs-csv",
+        type=str,
+        default="",
+        help="Plot-only mode: load existing runs.csv instead of running experiments.",
+    )
+    ap.add_argument(
+        "--flec-jsonl",
+        type=str,
+        default="",
+        help="Optional: overlay flec runs from jsonl (fields: sender,trial,ok,e2e_s,tx_total_bytes,tx_data_bytes,overhead).",
     )
     ap.add_argument("--ge-params", type=str, default=str(_REPO_ROOT / "python" / "bandit" / "quic_fec_params.json"))
     ap.add_argument("--ge-key", type=str, default="GE_steady_rp")
@@ -504,9 +609,13 @@ def main() -> int:
 
     args = ap.parse_args()
 
-    _require_sudo_cached()
+    plot_only = bool(str(getattr(args, "base_runs_csv", "")).strip())
+    if not plot_only:
+        _require_sudo_cached()
 
-    model_prefix = str(args.bandit_model_prefix)
+    model_prefix = str(args.bandit_model_prefix or "")
+    if not plot_only and not model_prefix.strip():
+        raise SystemExit("--bandit-model-prefix is required unless --base-runs-csv is set")
     if model_prefix.endswith(".json"):
         model_prefix = model_prefix[:-5]
     if model_prefix.endswith(".npz"):
@@ -529,30 +638,62 @@ def main() -> int:
     fixed2 = _parse_fixed(args.fixed2)
 
     params_path = Path(args.ge_params)
-    sender_ids = _load_sender_ids(params_path=params_path, sender_ids_arg=str(args.sender_ids), ge_key=str(args.ge_key))
-
-    file_path = _REPO_ROOT / "go" / "test_data" / f"paper_delay_{int(args.file_bytes)}B.bin"
-    _ensure_file_of_size(file_path=file_path, file_bytes=int(args.file_bytes))
 
     ts = _now_ts()
     out_dir = Path(args.out_dir) if args.out_dir else (_REPO_ROOT / "python" / "results" / f"paper-overhead-vs-completion-{ts}")
-
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load bandit checkpoint (we use ctx_cfg/action_set from the checkpoint, but start with a fresh ctx per sender).
-    agent, _cfg, _ctx0, ctx_cfg, action_set, _t0 = load_checkpoint(path_prefix=model_prefix)
-
-    method_f1 = f"fec_k{int(fixed1[0])}_r0_{int(fixed1[1])}_rstep_{int(fixed1[2])}"
-    method_f2 = f"fec_k{int(fixed2[0])}_r0_{int(fixed2[1])}_rstep_{int(fixed2[2])}"
-    methods: List[str] = ["bandit", "quic_bbrv2", method_f1, method_f2]
-
     rows: List[RunRow] = []
+
+    if plot_only:
+        base_runs_csv = Path(str(args.base_runs_csv)).expanduser()
+        if not base_runs_csv.exists():
+            raise FileNotFoundError(str(base_runs_csv))
+        rows.extend(_load_runrows_from_runs_csv(base_runs_csv))
+
+        flec_path_s = str(getattr(args, "flec_jsonl", "")).strip()
+        if flec_path_s:
+            flec_path = Path(flec_path_s).expanduser()
+            if not flec_path.exists():
+                raise FileNotFoundError(str(flec_path))
+            rows.extend(_load_flec_runrows_from_jsonl(flec_path))
+
+        sender_ids = sorted({int(r.sender_id) for r in rows})
+
+        # Prefer a stable method order.
+        all_methods = sorted({str(r.method) for r in rows})
+        methods: List[str] = []
+        for m in ["bandit", "quic_bbrv2"]:
+            if m in all_methods:
+                methods.append(m)
+        methods.extend(sorted([m for m in all_methods if m.startswith("fec_")]))
+        if "flec" in all_methods:
+            methods.append("flec")
+        for m in all_methods:
+            if m not in methods:
+                methods.append(m)
+
+        print(f"[plot-only] base_runs_csv={base_runs_csv}")
+    else:
+        sender_ids = _load_sender_ids(params_path=params_path, sender_ids_arg=str(args.sender_ids), ge_key=str(args.ge_key))
+
+        file_path = _REPO_ROOT / "go" / "test_data" / f"paper_delay_{int(args.file_bytes)}B.bin"
+        _ensure_file_of_size(file_path=file_path, file_bytes=int(args.file_bytes))
+
+        # Load bandit checkpoint (we use ctx_cfg/action_set from the checkpoint, but start with a fresh ctx per sender).
+        agent, _cfg, _ctx0, ctx_cfg, action_set, _t0 = load_checkpoint(path_prefix=model_prefix)
+
+        method_f1 = f"fec_k{int(fixed1[0])}_r0_{int(fixed1[1])}_rstep_{int(fixed1[2])}"
+        method_f2 = f"fec_k{int(fixed2[0])}_r0_{int(fixed2[1])}_rstep_{int(fixed2[2])}"
+        methods = ["bandit", "quic_bbrv2", method_f1, method_f2]
 
     print(f"[ddl-override] {proto_ddl_ms}ms" if int(proto_ddl_ms) > 0 else "[ddl-override] disabled")
     print(f"[ddl-thresholds] {ddl_list}")
     print(f"[senders] {sender_ids}")
 
     for sender_id in sender_ids:
+        if plot_only:
+            continue
         ge = _load_sender_ge(params_path=params_path, sender_id=int(sender_id), ge_key=str(args.ge_key))
         loss_mode = _ge_to_tc_gemodel_loss_mode(ge, h_loss_pct=float(args.ge_h_pct), k_loss_pct=float(args.ge_k_pct))
         print(f"\n[sender] {int(sender_id)} loss_mode={loss_mode}")
@@ -849,48 +990,72 @@ def main() -> int:
                 }
             )
 
-    meta = {
-        "bandit_model_prefix": model_prefix,
-        "ge_params": str(params_path),
-        "ge_key": str(args.ge_key),
-        "sender_ids": sender_ids,
-        "bitrate_mbps": int(args.bitrate_mbps),
-        "rtt_ms": int(args.rtt_ms),
-        "timeout_transfer_s": int(args.timeout_transfer_s),
-        "timeout_s": int(args.timeout_s),
-        "file_bytes": int(args.file_bytes),
-        "reps": int(args.reps),
+    meta: Dict[str, Any] = {
         "ddl_ms": ddl_list,
-        "ddl_override_ms": int(proto_ddl_ms),
-        "fixed_ddl_ms": int(args.fixed_ddl_ms),
-        "symbol_bytes": int(args.symbol_bytes),
-        "warmup_a_idx": int(args.warmup_a_idx),
         "methods": methods,
-        "fixed1": {"k": int(fixed1[0]), "r0": int(fixed1[1]), "rstep": int(fixed1[2])},
-        "fixed2": {"k": int(fixed2[0]), "r0": int(fixed2[1]), "rstep": int(fixed2[2])},
         "overhead_definition": "(tx_bytes - file_bytes)/file_bytes using host veth0 tx_bytes delta; includes headers",
         "complete_definition": "success && dur_ms <= ddl_ms (ddl thresholds used only in post-processing)",
+        "plot_only": bool(plot_only),
     }
+    if plot_only:
+        meta.update(
+            {
+                "base_runs_csv": str(getattr(args, "base_runs_csv", "")),
+                "flec_jsonl": str(getattr(args, "flec_jsonl", "")),
+            }
+        )
+    else:
+        meta.update(
+            {
+                "bandit_model_prefix": model_prefix,
+                "ge_params": str(params_path),
+                "ge_key": str(args.ge_key),
+                "sender_ids": sender_ids,
+                "bitrate_mbps": int(args.bitrate_mbps),
+                "rtt_ms": int(args.rtt_ms),
+                "timeout_transfer_s": int(args.timeout_transfer_s),
+                "timeout_s": int(args.timeout_s),
+                "file_bytes": int(args.file_bytes),
+                "reps": int(args.reps),
+                "ddl_override_ms": int(proto_ddl_ms),
+                "fixed_ddl_ms": int(args.fixed_ddl_ms),
+                "symbol_bytes": int(args.symbol_bytes),
+                "warmup_a_idx": int(args.warmup_a_idx),
+                "fixed1": {"k": int(fixed1[0]), "r0": int(fixed1[1]), "rstep": int(fixed1[2])},
+                "fixed2": {"k": int(fixed2[0]), "r0": int(fixed2[1]), "rstep": int(fixed2[2])},
+            }
+        )
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
-    method_labels = {
+    method_labels: Dict[str, str] = {
         "bandit": "QUIC-FEC-Bandit",
         "quic_bbrv2": "QUIC",
-        str(method_f1): f"QUIC-FEC(K={int(fixed1[0])},R0={int(fixed1[1])},Rstep={int(fixed1[2])})",
-        str(method_f2): f"QUIC-FEC(K={int(fixed2[0])},R0={int(fixed2[1])},Rstep={int(fixed2[2])})",
+        "flec": "FLEC",
     }
-    method_colors = {
+    method_colors: Dict[str, str] = {
         "bandit": "#1f77b4",
         "quic_bbrv2": "#ff7f0e",
-        str(method_f1): "#2ca02c",
-        str(method_f2): "#d62728",
+        "flec": "#9467bd",
     }
-    method_markers = {
+    method_markers: Dict[str, str] = {
         "bandit": "o",
         "quic_bbrv2": "^",
-        str(method_f1): "s",
-        str(method_f2): "D",
+        "flec": "x",
     }
+
+    fec_methods = sorted({str(m) for m in methods if str(m).startswith("fec_")})
+    fec_palette = ["#2ca02c", "#d62728", "#17becf", "#bcbd22", "#8c564b", "#e377c2"]
+    fec_markers = ["s", "D", "P", "X", "v", "<"]
+    for i, m in enumerate(fec_methods):
+        mm = _FEC_METHOD_RE.match(m)
+        if mm:
+            method_labels[m] = (
+                f"QUIC-FEC(K={int(mm.group('k'))},R0={int(mm.group('r0'))},Rstep={int(mm.group('rstep'))})"
+            )
+        else:
+            method_labels[m] = m
+        method_colors.setdefault(m, fec_palette[i % len(fec_palette)])
+        method_markers.setdefault(m, fec_markers[i % len(fec_markers)])
 
     # Plot: 2x2 subplots (one per ddl), each subplot overlays 4 methods.
     _configure_matplotlib()

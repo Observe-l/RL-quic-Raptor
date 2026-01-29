@@ -371,6 +371,7 @@ _METHOD_LABELS = {
     "quic_bbrv2": "QUIC",
     "fec_k20_r0_2_rstep_2": "QUIC-FEC(K=20,R0=2,Rstep=2)",
     "fec_k20_r0_6_rstep_4": "QUIC-FEC(K=20,R0=6,Rstep=4)",
+    "flec": "FLEC",
 }
 
 _METHOD_COLORS = {
@@ -378,7 +379,81 @@ _METHOD_COLORS = {
     "quic_bbrv2": "#ff7f0e",
     "fec_k20_r0_2_rstep_2": "#2ca02c",
     "fec_k20_r0_6_rstep_4": "#d62728",
+    "flec": "#9467bd",
 }
+
+
+def _load_rows_from_results_jsonl(results_jsonl: Path) -> List[Row]:
+    out: List[Row] = []
+    with results_jsonl.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = (line or "").strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(d, dict):
+                continue
+            try:
+                out.append(
+                    Row(
+                        task=str(d.get("task", "")),
+                        method=str(d.get("method", "")),
+                        sender_id=int(d.get("sender_id", 0) or 0),
+                        loss_mode=str(d.get("loss_mode", "")),
+                        rep=int(d.get("rep", 0) or 0),
+                        is_warmup=int(d.get("is_warmup", 0) or 0),
+                        timed_out=int(d.get("timed_out", 0) or 0),
+                        md5_ok=int(d.get("md5_ok", 0) or 0),
+                        success=int(d.get("success", 0) or 0),
+                        dur_ms=int(d.get("dur_ms", 0) or 0),
+                        goodput_mbps=float(d.get("goodput_mbps", 0.0) or 0.0),
+                        a_idx=int(d.get("a_idx", -1) or -1),
+                        extra=d.get("extra", {}) if isinstance(d.get("extra", {}), dict) else {},
+                    )
+                )
+            except Exception:
+                continue
+    return out
+
+
+def _load_flec_delay_ms_from_jsonl(flec_jsonl: Path) -> Tuple[List[float], float]:
+    """Return (dur_ms list for ok==1, ok_rate) from flec jsonl."""
+
+    ok_ms: List[float] = []
+    n = 0
+    ok_n = 0
+    with flec_jsonl.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = (line or "").strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(d, dict):
+                continue
+
+            n += 1
+            ok = int(d.get("ok", 0) or 0)
+            if ok != 1:
+                continue
+            e2e_s = d.get("e2e_s", None)
+            if e2e_s is None:
+                continue
+            try:
+                dur_ms = float(e2e_s) * 1000.0
+            except Exception:
+                continue
+            if np.isfinite(dur_ms) and dur_ms > 0:
+                ok_n += 1
+                ok_ms.append(float(dur_ms))
+
+    ok_rate = float(ok_n) / float(n) if n > 0 else 0.0
+    return ok_ms, ok_rate
 
 
 def _configure_matplotlib() -> None:
@@ -627,8 +702,20 @@ def main() -> int:
     ap.add_argument(
         "--bandit-model-prefix",
         type=str,
-        required=True,
+        required=False,
         help="Trained bandit model prefix (no .json/.npz), e.g. python/results/.../model_tXXXX_r0pYYYY",
+    )
+    ap.add_argument(
+        "--results-jsonl",
+        type=str,
+        default="",
+        help="Plot-only mode: path to existing results.jsonl (output of this script). If set, no experiments are run.",
+    )
+    ap.add_argument(
+        "--flec-jsonl",
+        type=str,
+        default="",
+        help="Plot-only mode: optional flec results jsonl to overlay (fields: ok,e2e_s).",
     )
     ap.add_argument("--ge-params", type=str, default=str(_REPO_ROOT / "python" / "bandit" / "quic_fec_params.json"))
     ap.add_argument("--ge-key", type=str, default="GE_steady_rp")
@@ -637,7 +724,7 @@ def main() -> int:
     ap.add_argument("--ge-k-pct", type=float, default=99.0)
 
     ap.add_argument("--bitrate-mbps", type=int, default=10)
-    ap.add_argument("--rtt-ms", type=int, default=25)
+    ap.add_argument("--rtt-ms", type=int, default=50)
     ap.add_argument("--timeout-transfer-s", type=int, default=15)
     ap.add_argument("--timeout-s", type=int, default=180, help="Python-side subprocess timeout; must exceed transfer timeout")
 
@@ -646,7 +733,7 @@ def main() -> int:
     ap.add_argument(
         "--bandit-policy",
         type=str,
-        default="mean",
+        default="ts",
         choices=["mean", "ts"],
         help="Bandit action selection policy: mean=argmax(theta_hat), ts=Thompson sampling (matches training)",
     )
@@ -685,6 +772,67 @@ def main() -> int:
 
     args = ap.parse_args()
 
+    # Plot-only mode: read existing results.jsonl and optionally add flec.
+    if str(getattr(args, "results_jsonl", "")).strip():
+        results_jsonl = Path(str(args.results_jsonl)).expanduser()
+        if not results_jsonl.exists():
+            raise FileNotFoundError(str(results_jsonl))
+
+        out_dir = Path(args.out_dir).expanduser() if str(args.out_dir).strip() else (
+            _REPO_ROOT / "python" / "results" / "paper-flec-compare"
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        rows = _load_rows_from_results_jsonl(results_jsonl)
+
+        def _filter_rows(task_name: str, method: str) -> List[Row]:
+            return [r for r in rows if r.task == task_name and r.method == method and r.is_warmup == 0]
+
+        delay_series: List[Tuple[str, Sequence[float], float]] = []
+        for m in _METHOD_ORDER:
+            rs = _filter_rows("delay_128kb", m)
+            d_ok = [float(r.dur_ms) for r in rs if r.success == 1 and r.dur_ms > 0]
+            ok_rate = (sum([1 for r in rs if r.success == 1]) / float(len(rs))) if rs else 0.0
+            delay_series.append((m, d_ok, ok_rate))
+
+        flec_path_s = str(getattr(args, "flec_jsonl", "")).strip()
+        if flec_path_s:
+            flec_jsonl = Path(flec_path_s).expanduser()
+            if not flec_jsonl.exists():
+                raise FileNotFoundError(str(flec_jsonl))
+            flec_ms, flec_ok = _load_flec_delay_ms_from_jsonl(flec_jsonl)
+            delay_series.append(("flec", flec_ms, float(flec_ok)))
+
+        _plot_cdf(
+            out_path=out_dir / "fig_delay_cdf.pdf",
+            title="",
+            xlabel="E2E delay per message (ms)",
+            series=delay_series,
+            xlim=(0.0, 300.0),
+            show_ok_n_in_legend=False,
+        )
+
+        (out_dir / "paper_flec_compare_meta.json").write_text(
+            json.dumps(
+                {
+                    "mode": "plot_only",
+                    "results_jsonl": str(results_jsonl),
+                    "flec_jsonl": flec_path_s,
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        print("OUT:", out_dir)
+        print("- fig:", out_dir / "fig_delay_cdf.pdf")
+        return 0
+
+    if not str(getattr(args, "bandit_model_prefix", "") or "").strip():
+        raise SystemExit("--bandit-model-prefix is required unless --results-jsonl is set")
+
     model_prefix = str(args.bandit_model_prefix)
     if model_prefix.endswith(".json"):
         model_prefix = model_prefix[:-5]
@@ -712,6 +860,12 @@ def main() -> int:
     print(f"[bandit] checkpoint_signature={json.dumps(sig, ensure_ascii=False)}")
     ver = _verify_loaded_checkpoint(agent=agent, ctx_cfg=ctx_cfg, action_set=action_set)
     print(f"[bandit] checkpoint_consistency=ok details={json.dumps(ver, ensure_ascii=False)}")
+
+    if str(args.bandit_policy) == "mean":
+        print(
+            "[bandit][warn] --bandit-policy=mean is a greedy argmax policy; it may legitimately pick the same a_idx "
+            "for many/most environments once the model has converged. Use --bandit-policy=ts to match training."
+        )
 
     if int(args.verify_only) != 0:
         return 0
@@ -763,7 +917,9 @@ def main() -> int:
                 task_seed = 0
                 for ch in str(task).encode("utf-8", errors="ignore"):
                     task_seed = (task_seed * 131 + int(ch)) % 2_147_483_647
-                rs = np.random.RandomState(int(args.seed) + 1337 * int(sender_id) + 17 * int(task_seed))
+                # numpy RandomState requires 0 <= seed < 2**32.
+                seed32 = (int(args.seed) + 1337 * int(sender_id) + 17 * int(task_seed)) & 0xFFFFFFFF
+                rs = np.random.RandomState(int(seed32))
                 for _ in range(int(warmup_steps)):
                     warmup_indices.append(int(rs.randint(0, len(action_set))))
 

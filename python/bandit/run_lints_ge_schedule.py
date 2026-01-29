@@ -20,8 +20,6 @@ if _ROOT_DIR not in sys.path:
 
 _REPO_ROOT = os.path.abspath(os.path.join(_ROOT_DIR, ".."))
 
-from fecenv_env import FecEnv  # noqa: E402
-
 from bandit.action_set import ActionSet  # noqa: E402
 from bandit.context import ContextBuilder, ContextConfig  # noqa: E402
 from bandit.features import phi as phi_fn  # noqa: E402
@@ -263,6 +261,10 @@ def _auto_hk_from_sender(
 
 
 def main() -> int:
+    # Import here so that other modules can reuse helper functions from this file
+    # without requiring optional runtime dependencies (gym/gymnasium).
+    from fecenv_env import FecEnv  # noqa: E402
+
     ap = argparse.ArgumentParser(
         description="LinTS runner with external GE schedule (per-episode net params) and block-topk checkpointing"
     )
