@@ -846,7 +846,7 @@ class FecEnv(gym.Env):
         # Throughput + latency reward shaping.
         # tp_term: normalized by physical capacity.
         c = max(1e-6, float(self._capacity_mbps))
-        tp_term = float(self._reward_w_goodput) * float(np.clip(g / c, 0.0, 1.0))
+        tp_term = float(self._reward_w_goodput) * float(g / c)
         # lat_term: positive reward that decays with latency (scale=150ms).
         lat_term = float(self._reward_w_delay) * float(1.0 / (1.0 + (float(d95) / 150.0) ** 2))
 
@@ -855,12 +855,10 @@ class FecEnv(gym.Env):
             l_tilde = float(e > 0.0)
         else:
             l_tilde = float(e / (1.0 + max(0.0, e)))
-        # Overhead is a ratio (repairs/source). Use a smooth saturating penalty in [0,1).
-        r_tilde = float(np.clip(oh / (1.0 + max(0.0, oh)), 0.0, 1.0))
-        arq_tilde = float(np.clip(a_mean / 30.0, 0.0, 1.0))
+        arq_tilde = float(np.clip(a_mean / 2.0, 0.0, 1.0))
 
         resid_term = -float(self._reward_w_residual) * float(l_tilde)
-        oh_term = -float(self._reward_w_overhead) * float(r_tilde)
+        oh_term = float(self._reward_w_overhead) * float(1.0 / (1.0 + (float(oh) / 0.3) ** 2))
         arq_term = -float(self._reward_w_arq) * float(arq_tilde)
 
         r = float(tp_term + lat_term + resid_term + oh_term + arq_term)
@@ -873,7 +871,6 @@ class FecEnv(gym.Env):
             "tp_norm": float(np.clip(g / c, 0.0, 1.0)),
             "lat_reward": float(1.0 / (1.0 + (float(d95) / 150.0) ** 2)),
             "l_tilde": float(l_tilde),
-            "r_tilde": float(r_tilde),
             "arq_tilde": float(arq_tilde),
         }
 

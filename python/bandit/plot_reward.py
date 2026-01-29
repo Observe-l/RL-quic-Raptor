@@ -92,7 +92,7 @@ def _ensure_out_dir(p: str) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Plot reward curves from bandit_metrics.json (JSON-lines)")
     ap.add_argument("--log-path", required=True, help="path to bandit_metrics.json")
-    ap.add_argument("--episode-steps", type=int, default=50, help="steps per episode (default 50)")
+    ap.add_argument("--episode-steps", type=int, default=10, help="steps per episode (default 10)")
     ap.add_argument("--warmup", type=int, default=20, help="warmup steps (default 20)")
     ap.add_argument("--out-dir", default=None, help="output directory (default: log dir)")
     ap.add_argument("--rolling", type=int, default=200, help="rolling mean window (steps)")
