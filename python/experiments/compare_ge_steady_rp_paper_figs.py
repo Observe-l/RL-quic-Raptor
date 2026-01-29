@@ -98,6 +98,23 @@ def _parse_kv_from_run_line(line: str) -> Dict[str, str]:
     return out
 
 
+def _overhead_ratio_from_run_kv(*, kv: Dict[str, str], file_path: Path) -> float:
+    """Compute overhead as extra transmitted bytes over payload bytes.
+
+    Matches python/experiments/overhead_vs_completion_scatter.py:
+        overhead_ratio = max(0, (tx_bytes - file_bytes) / file_bytes)
+
+    Note: tx_bytes is collected at the NIC counter level (includes headers,
+    retransmissions, etc). This makes it comparable across quicraw / quicfec.
+    """
+
+    tx_bytes = _to_int(kv, "tx_bytes", 0)
+    file_bytes = _to_int(kv, "file_bytes", int(file_path.stat().st_size))
+    if file_bytes > 0 and tx_bytes > 0:
+        return float(max(0.0, (float(tx_bytes) - float(file_bytes)) / float(file_bytes)))
+    return 0.0
+
+
 def _to_float(d: Dict[str, str], k: str, default: float = 0.0) -> float:
     try:
         return float(d.get(k, str(default)))
@@ -149,6 +166,35 @@ def _extract_last_rl_observation(stderr: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _overhead_ratio_from_rl_observation(rl_obs: Optional[Dict[str, Any]]) -> float:
+    """Return FEC overhead ratio (repairs/source) from an rl-observation payload."""
+
+    if not isinstance(rl_obs, dict):
+        return 0.0
+
+    def _f(k: str, default: float = 0.0) -> float:
+        try:
+            return float(rl_obs.get(k, default))
+        except Exception:
+            return default
+
+    # Preferred: direct ratio.
+    if "fec_overhead" in rl_obs or "fec_overhead_pct_arrival" in rl_obs:
+        overhead = _f("fec_overhead", _f("fec_overhead_pct_arrival", 0.0))
+        # Backward-compat: older naming/scaling.
+        if overhead > 10.0:
+            overhead = overhead / 100.0
+        return float(np.clip(overhead, 0.0, 10.0))
+
+    # Fallback: derive from tx symbol counters if available.
+    tx_src = _f("tx_source_symbols", _f("tx_source", 0.0))
+    tx_rep = _f("tx_repair_symbols", _f("tx_repairs", 0.0))
+    if tx_src > 0 and tx_rep >= 0:
+        return float(np.clip(tx_rep / tx_src, 0.0, 10.0))
+
+    return 0.0
+
+
 # ---------------------------
 # Bandit helpers
 # ---------------------------
@@ -182,6 +228,112 @@ def _bandit_select_action_ts(*, agent, action_set: ActionSet, ctx: ContextBuilde
     except Exception:
         pass
     return int(a_idx), dbg
+
+
+def _bandit_select_action_mean_seeded(
+    *,
+    agent,
+    action_set: ActionSet,
+    ctx: ContextBuilder,
+    seed32: int,
+    sigma_scale: float = 1.0,
+) -> Tuple[int, Dict[str, Any]]:
+    """Deterministic (seeded) posterior draw + greedy argmax.
+
+    This behaves like TS but is reproducible per decision, and tends to react to
+    context changes because Phi changes even when the RNG seed is fixed.
+    """
+
+    x = ctx.get_context()
+    Phi = np.zeros((len(action_set), agent.dim), dtype=np.float32)
+    for i, _a in action_set.iter_actions():
+        Phi[i, :] = phi_fn(x=x, a_onehot=action_set.get_onehot(i))
+
+    theta_hat = np.asarray(agent.theta_hat, dtype=np.float64).reshape(-1)
+    A_inv_raw = getattr(agent, "A_inv", None)
+    if A_inv_raw is None:
+        scores = Phi.astype(np.float64) @ theta_hat
+        a_idx = int(np.argmax(scores))
+        return a_idx, {"x": x.tolist(), "a_idx": a_idx, "seed32": int(seed32), "mode": "fallback_mean"}
+
+    A_inv = np.asarray(A_inv_raw, dtype=np.float64)
+
+    # If checkpoint is partial, fall back to greedy mean.
+    if A_inv.ndim != 2 or A_inv.shape[0] != theta_hat.size or A_inv.shape[1] != theta_hat.size:
+        scores = Phi.astype(np.float64) @ theta_hat
+        a_idx = int(np.argmax(scores))
+        return a_idx, {"x": x.tolist(), "a_idx": a_idx, "seed32": int(seed32), "mode": "fallback_mean"}
+
+    sigma = float(getattr(getattr(agent, "cfg", None), "sigma", 0.2))
+    sigma = float(sigma) * float(sigma_scale)
+    if sigma < 0:
+        sigma = 0.0
+
+    cov = (sigma**2) * A_inv
+    rs = np.random.RandomState(int(seed32) & 0xFFFFFFFF)
+    try:
+        theta_tilde = rs.multivariate_normal(mean=theta_hat, cov=cov)
+    except Exception:
+        scores = Phi.astype(np.float64) @ theta_hat
+        a_idx = int(np.argmax(scores))
+        return a_idx, {"x": x.tolist(), "a_idx": a_idx, "seed32": int(seed32), "mode": "fallback_mean"}
+
+    scores = Phi.astype(np.float64) @ np.asarray(theta_tilde, dtype=np.float64)
+    a_idx = int(np.argmax(scores))
+    dbg: Dict[str, Any] = {
+        "x": x.tolist(),
+        "a_idx": int(a_idx),
+        "seed32": int(seed32),
+        "sigma_scale": float(sigma_scale),
+    }
+    try:
+        dbg["theta_norm"] = float(np.linalg.norm(theta_tilde))
+    except Exception:
+        pass
+    return int(a_idx), dbg
+
+
+def _bandit_select_action_ts_greedyish(
+    *,
+    agent,
+    action_set: ActionSet,
+    ctx: ContextBuilder,
+    eps: float,
+    sigma_scale: float,
+    rs: np.random.RandomState,
+) -> Tuple[int, Dict[str, Any]]:
+    """Mostly-greedy TS: reduce sampling variance + epsilon exploration."""
+
+    eps = float(np.clip(float(eps), 0.0, 1.0))
+    sigma_scale = float(max(0.0, float(sigma_scale)))
+
+    # Occasionally explore a random arm to adapt to non-stationarity.
+    if eps > 0 and float(rs.rand()) < eps:
+        a_idx = int(rs.randint(0, len(action_set)))
+        x = ctx.get_context()
+        return int(a_idx), {"x": x.tolist(), "a_idx": int(a_idx), "mode": "eps_random", "eps": eps}
+
+    # Temporarily reduce sigma during selection.
+    cfg = getattr(agent, "cfg", None)
+    old_sigma = None
+    if cfg is not None and hasattr(cfg, "sigma"):
+        try:
+            old_sigma = float(cfg.sigma)
+            cfg.sigma = float(old_sigma) * float(sigma_scale)
+        except Exception:
+            old_sigma = None
+
+    try:
+        a_idx, dbg_ts = _bandit_select_action_ts(agent=agent, action_set=action_set, ctx=ctx)
+        dbg: Dict[str, Any] = dict(dbg_ts)
+        dbg.update({"mode": "ts_lowvar", "eps": eps, "sigma_scale": sigma_scale})
+        return int(a_idx), dbg
+    finally:
+        if old_sigma is not None and cfg is not None and hasattr(cfg, "sigma"):
+            try:
+                cfg.sigma = float(old_sigma)
+            except Exception:
+                pass
 
 
 def _ckpt_signature(prefix: str) -> Dict[str, Any]:
@@ -355,6 +507,7 @@ class Row:
     success: int
     dur_ms: int
     goodput_mbps: float
+    overhead_ratio: float
     a_idx: int
     extra: Dict[str, Any]
 
@@ -410,6 +563,7 @@ def _load_rows_from_results_jsonl(results_jsonl: Path) -> List[Row]:
                         success=int(d.get("success", 0) or 0),
                         dur_ms=int(d.get("dur_ms", 0) or 0),
                         goodput_mbps=float(d.get("goodput_mbps", 0.0) or 0.0),
+                        overhead_ratio=float(d.get("overhead_ratio", 0.0) or 0.0),
                         a_idx=int(d.get("a_idx", -1) or -1),
                         extra=d.get("extra", {}) if isinstance(d.get("extra", {}), dict) else {},
                     )
@@ -685,6 +839,11 @@ def _run_one(
     md5_ok = _to_int(kv, "md5_ok", 0)
     goodput = _to_float(kv, "s_mbps", 0.0)
 
+    overhead_ratio = _overhead_ratio_from_run_kv(kv=kv, file_path=file_path)
+    tx_bytes = _to_int(kv, "tx_bytes", 0)
+    rx_bytes = _to_int(kv, "rx_bytes", 0)
+    file_bytes = _to_int(kv, "file_bytes", int(file_path.stat().st_size))
+
     # Failures -> goodput=0. For delay task we use success-only samples downstream.
     if timed_out or md5_ok != 1:
         goodput = 0.0
@@ -694,6 +853,10 @@ def _run_one(
         "timed_out": int(timed_out),
         "md5_ok": int(md5_ok),
         "goodput_mbps": float(goodput),
+        "tx_bytes": int(tx_bytes),
+        "rx_bytes": int(rx_bytes),
+        "file_bytes": int(file_bytes),
+        "overhead_ratio": float(overhead_ratio),
     }, stderr
 
 
@@ -734,10 +897,36 @@ def main() -> int:
         "--bandit-policy",
         type=str,
         default="ts",
-        choices=["mean", "ts"],
-        help="Bandit action selection policy: mean=argmax(theta_hat), ts=Thompson sampling (matches training)",
+        choices=["mean", "ts", "mean-seeded", "ts-greedyish"],
+        help=(
+            "Bandit action selection policy: "
+            "mean=argmax(theta_hat); ts=Thompson sampling (matches training); "
+            "mean-seeded=seeded posterior draw then greedy; "
+            "ts-greedyish=TS with lower variance + epsilon exploration"
+        ),
     )
     ap.add_argument("--seed", type=int, default=0, help="seed for warmup random actions (policy=ts uses checkpoint RNG)")
+    ap.add_argument(
+        "--ctx-alpha",
+        type=float,
+        default=0.15,
+        help=(
+            "override context EWMA alpha for deployment (default: 0.15). "
+            "Set to a negative value to keep the checkpoint ctx_cfg."
+        ),
+    )
+    ap.add_argument(
+        "--bandit-eps",
+        type=float,
+        default=0.02,
+        help="epsilon for ts-greedyish (probability of random arm); ignored otherwise",
+    )
+    ap.add_argument(
+        "--bandit-sigma-scale",
+        type=float,
+        default=0.15,
+        help="sigma scale for mean-seeded / ts-greedyish (lower => more greedy). Default 0.15 for deployment.",
+    )
     # Legacy warmup behavior: one fixed warmup action (old default was 2845 for the old 6-DDL action set).
     # Use -1 to disable fixed warmup index and instead do random warmup steps (recommended).
     ap.add_argument("--warmup-a-idx", type=int, default=-1)
@@ -867,6 +1056,13 @@ def main() -> int:
             "for many/most environments once the model has converged. Use --bandit-policy=ts to match training."
         )
 
+    if args.ctx_alpha is not None and float(args.ctx_alpha) >= 0.0:
+        try:
+            ctx_cfg.ewma_alpha = float(args.ctx_alpha)
+            print(f"[bandit] ctx_alpha_overridden={ctx_cfg.ewma_alpha}")
+        except Exception:
+            pass
+
     if int(args.verify_only) != 0:
         return 0
 
@@ -896,9 +1092,18 @@ def main() -> int:
         for task, file_path in tasks:
             print(f"[task] {task} file={file_path.name}")
 
+            # Stable per-task seed.
+            task_seed = 0
+            for ch in str(task).encode("utf-8", errors="ignore"):
+                task_seed = (task_seed * 131 + int(ch)) % 2_147_483_647
+
             # Bandit state is per-(sender,task) sequence.
             ctx = ContextBuilder(cfg=ctx_cfg)
             ctx.reset()
+
+            # Deterministic RNG for seeded policies (and for epsilon exploration).
+            pol_rs_seed32 = (int(args.seed) + 1000003 * int(sender_id) + 9176 * int(task_seed)) & 0xFFFFFFFF
+            pol_rs = np.random.RandomState(int(pol_rs_seed32))
 
             # Bandit warmup (excluded from stats).
             # If --warmup-a-idx >= 0: run that fixed action once (legacy).
@@ -914,9 +1119,6 @@ def main() -> int:
                     raise ValueError(f"--warmup-a-idx out of range: {warmup_fixed_idx} (action_set_n={len(action_set)})")
                 warmup_indices = [int(warmup_fixed_idx)]
             else:
-                task_seed = 0
-                for ch in str(task).encode("utf-8", errors="ignore"):
-                    task_seed = (task_seed * 131 + int(ch)) % 2_147_483_647
                 # numpy RandomState requires 0 <= seed < 2**32.
                 seed32 = (int(args.seed) + 1337 * int(sender_id) + 17 * int(task_seed)) & 0xFFFFFFFF
                 rs = np.random.RandomState(int(seed32))
@@ -939,6 +1141,8 @@ def main() -> int:
                 )
                 rl_obs = _extract_last_rl_observation(stderr)
                 failed = bool(int(m["timed_out"]) or int(m["md5_ok"]) != 1)
+                overhead_ratio = float(m.get("overhead_ratio", 0.0) or 0.0)
+                fec_overhead_ratio = _overhead_ratio_from_rl_observation(rl_obs)
                 obs_vec = _aligned_obs_vec_from_rl_observation(rl_obs=rl_obs, ddl_ms=warmup_ddl_ms, failed=failed)
                 ctx.update_from_obs(obs=obs_vec, ddl_ms=warmup_ddl_ms)
                 rows.append(
@@ -954,18 +1158,47 @@ def main() -> int:
                         success=1 if (int(m["timed_out"]) == 0 and int(m["md5_ok"]) == 1) else 0,
                         dur_ms=int(m["dur_ms"]),
                         goodput_mbps=float(m["goodput_mbps"]),
+                        overhead_ratio=float(overhead_ratio),
                         a_idx=int(warmup_idx),
-                        extra={"warmup": True, "warmup_step": int(w_i), "policy": str(args.bandit_policy)},
+                        extra={
+                            "warmup": True,
+                            "warmup_step": int(w_i),
+                            "policy": str(args.bandit_policy),
+                            "fec_overhead_ratio": float(fec_overhead_ratio),
+                        },
                     )
                 )
 
             # Measured runs
             for rep in range(int(args.reps)):
                 # Bandit
-                if str(args.bandit_policy) == "ts":
+                pol = str(args.bandit_policy)
+                if pol == "ts":
                     a_idx, dbg = _bandit_select_action_ts(agent=agent, action_set=action_set, ctx=ctx)
-                else:
+                elif pol == "mean":
                     a_idx, dbg = _bandit_select_action_mean(agent=agent, action_set=action_set, ctx=ctx)
+                elif pol == "mean-seeded":
+                    # Seed per decision to keep reproducible but still responsive to context changes.
+                    base_seed32 = (int(args.seed) + 1000003 * int(sender_id) + 9176 * int(task_seed)) & 0xFFFFFFFF
+                    step_seed32 = (int(base_seed32) ^ (0x9E3779B1 * (int(rep) + 1))) & 0xFFFFFFFF
+                    a_idx, dbg = _bandit_select_action_mean_seeded(
+                        agent=agent,
+                        action_set=action_set,
+                        ctx=ctx,
+                        seed32=int(step_seed32),
+                        sigma_scale=float(args.bandit_sigma_scale),
+                    )
+                elif pol == "ts-greedyish":
+                    a_idx, dbg = _bandit_select_action_ts_greedyish(
+                        agent=agent,
+                        action_set=action_set,
+                        ctx=ctx,
+                        eps=float(args.bandit_eps),
+                        sigma_scale=float(args.bandit_sigma_scale),
+                        rs=pol_rs,
+                    )
+                else:
+                    raise ValueError(f"unknown --bandit-policy: {pol}")
                 fec_env = _action_to_env_vars(action_set=action_set, a_idx=a_idx, symbol_bytes=int(args.symbol_bytes))
                 ddl_ms = int(fec_env.get("DDL_MS", "150"))
 
@@ -982,6 +1215,8 @@ def main() -> int:
                 )
                 rl_obs = _extract_last_rl_observation(stderr)
                 failed = bool(int(m["timed_out"]) or int(m["md5_ok"]) != 1)
+                overhead_ratio = float(m.get("overhead_ratio", 0.0) or 0.0)
+                fec_overhead_ratio = _overhead_ratio_from_rl_observation(rl_obs)
                 obs_vec = _aligned_obs_vec_from_rl_observation(rl_obs=rl_obs, ddl_ms=ddl_ms, failed=failed)
                 ctx.update_from_obs(obs=obs_vec, ddl_ms=ddl_ms)
 
@@ -998,13 +1233,14 @@ def main() -> int:
                         success=1 if (int(m["timed_out"]) == 0 and int(m["md5_ok"]) == 1) else 0,
                         dur_ms=int(m["dur_ms"]),
                         goodput_mbps=float(m["goodput_mbps"]),
+                        overhead_ratio=float(overhead_ratio),
                         a_idx=int(a_idx),
-                        extra={"bandit": dbg, "policy": str(args.bandit_policy)},
+                        extra={"bandit": dbg, "policy": str(args.bandit_policy), "fec_overhead_ratio": float(fec_overhead_ratio)},
                     )
                 )
 
                 # QUIC BBRv2 (raw)
-                m2, _stderr2 = _run_one(
+                m2, stderr2 = _run_one(
                     method="quic_bbrv2",
                     task=task,
                     loss_mode=loss_mode,
@@ -1014,6 +1250,7 @@ def main() -> int:
                     timeout_s=int(args.timeout_s),
                     file_path=file_path,
                 )
+                overhead2 = float(m2.get("overhead_ratio", 0.0) or 0.0)
                 rows.append(
                     Row(
                         task=task,
@@ -1027,6 +1264,7 @@ def main() -> int:
                         success=1 if (int(m2["timed_out"]) == 0 and int(m2["md5_ok"]) == 1) else 0,
                         dur_ms=int(m2["dur_ms"]),
                         goodput_mbps=float(m2["goodput_mbps"]),
+                        overhead_ratio=float(overhead2),
                         a_idx=-1,
                         extra={},
                     )
@@ -1034,7 +1272,7 @@ def main() -> int:
 
                 # Fixed FEC #1
                 env_f1 = _method_env_fixed_fec(k=20, r0=2, rstep=2, ddl_ms=150, symbol_bytes=int(args.symbol_bytes))
-                m3, _stderr3 = _run_one(
+                m3, stderr3 = _run_one(
                     method="fec_k20_r0_2_rstep_2",
                     task=task,
                     loss_mode=loss_mode,
@@ -1045,6 +1283,9 @@ def main() -> int:
                     file_path=file_path,
                     fec_env=env_f1,
                 )
+                rl3 = _extract_last_rl_observation(stderr3)
+                overhead3 = float(m3.get("overhead_ratio", 0.0) or 0.0)
+                fec_overhead3 = _overhead_ratio_from_rl_observation(rl3)
                 rows.append(
                     Row(
                         task=task,
@@ -1058,14 +1299,15 @@ def main() -> int:
                         success=1 if (int(m3["timed_out"]) == 0 and int(m3["md5_ok"]) == 1) else 0,
                         dur_ms=int(m3["dur_ms"]),
                         goodput_mbps=float(m3["goodput_mbps"]),
+                        overhead_ratio=float(overhead3),
                         a_idx=-1,
-                        extra={"fec": {"K": 20, "R0": 2, "RSTEP": 2, "DDL_MS": 150}},
+                        extra={"fec": {"K": 20, "R0": 2, "RSTEP": 2, "DDL_MS": 150}, "fec_overhead_ratio": float(fec_overhead3)},
                     )
                 )
 
                 # Fixed FEC #2
                 env_f2 = _method_env_fixed_fec(k=20, r0=6, rstep=4, ddl_ms=150, symbol_bytes=int(args.symbol_bytes))
-                m4, _stderr4 = _run_one(
+                m4, stderr4 = _run_one(
                     method="fec_k20_r0_6_rstep_4",
                     task=task,
                     loss_mode=loss_mode,
@@ -1076,6 +1318,9 @@ def main() -> int:
                     file_path=file_path,
                     fec_env=env_f2,
                 )
+                rl4 = _extract_last_rl_observation(stderr4)
+                overhead4 = float(m4.get("overhead_ratio", 0.0) or 0.0)
+                fec_overhead4 = _overhead_ratio_from_rl_observation(rl4)
                 rows.append(
                     Row(
                         task=task,
@@ -1089,8 +1334,9 @@ def main() -> int:
                         success=1 if (int(m4["timed_out"]) == 0 and int(m4["md5_ok"]) == 1) else 0,
                         dur_ms=int(m4["dur_ms"]),
                         goodput_mbps=float(m4["goodput_mbps"]),
+                        overhead_ratio=float(overhead4),
                         a_idx=-1,
-                        extra={"fec": {"K": 20, "R0": 6, "RSTEP": 4, "DDL_MS": 150}},
+                        extra={"fec": {"K": 20, "R0": 6, "RSTEP": 4, "DDL_MS": 150}, "fec_overhead_ratio": float(fec_overhead4)},
                     )
                 )
 
@@ -1117,6 +1363,7 @@ def main() -> int:
                         "success": r.success,
                         "dur_ms": r.dur_ms,
                         "goodput_mbps": r.goodput_mbps,
+                        "overhead_ratio": r.overhead_ratio,
                         "a_idx": r.a_idx,
                         "extra": r.extra,
                     },
@@ -1141,6 +1388,7 @@ def main() -> int:
                 "success",
                 "dur_ms",
                 "goodput_mbps",
+                "overhead_ratio",
                 "a_idx",
             ],
         )
@@ -1159,6 +1407,7 @@ def main() -> int:
                     "success": r.success,
                     "dur_ms": r.dur_ms,
                     "goodput_mbps": f"{r.goodput_mbps:.6f}",
+                    "overhead_ratio": f"{float(r.overhead_ratio):.6f}",
                     "a_idx": r.a_idx,
                 }
             )
@@ -1175,6 +1424,9 @@ def main() -> int:
         "reps": int(args.reps),
         "bandit_policy": str(args.bandit_policy),
         "seed": int(args.seed),
+        "ctx_alpha": float(args.ctx_alpha) if args.ctx_alpha is not None else None,
+        "bandit_eps": float(args.bandit_eps),
+        "bandit_sigma_scale": float(args.bandit_sigma_scale),
         "warmup_a_idx": int(args.warmup_a_idx),
         "warmup_steps": int(args.warmup_steps),
         "delay_file_bytes": int(args.delay_file_bytes),
