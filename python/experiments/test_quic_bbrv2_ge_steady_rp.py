@@ -34,7 +34,7 @@ class Trial:
 
 
 _RUN_RE = re.compile(
-    r"^\[run\].*proto=([^ ]+).*dur_ms=([0-9]+).*timed_out=([01]).*md5_ok=([01]).*s_mbps=([0-9.]+)"
+    r"^\[run\].*proto=([^ ]+).*dur_ms=([0-9]+).*timed_out=([01]).*(?:md5_ok=([01]).*)?s_mbps=([0-9.]+)"
 )
 
 

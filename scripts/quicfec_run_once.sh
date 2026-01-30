@@ -22,7 +22,7 @@ set -euo pipefail
 #               #   gemodel:p,r,h,k (Gilbert-Elliott model, percents)
 #   FILE=$ROOT/go/test_data/train_FD001.txt
 #   K=40, SYMBOL_BYTES=1200, R0=6, W=8, DDL_MS=150, RSTEP=4, ALPHA=0.6, ACK_EVERY=8, MAX_ATTEMPTS=8
-#   OBS_JSON=/tmp/quicfec_rl.json
+#   OBS_JSON=/tmp/quicfec_rl_${NS}.json
 #   POST_WAIT=0s (linger after client send; keep at 0s for fastest runs)
 #   SRV_TIMEOUT=10s (server max lifetime; lower keeps runs bounded)
 #   FORCE_BUILD=0 (set to 1 to force rebuilding Go binaries)
@@ -33,13 +33,22 @@ BIN_DIR="$ROOT/go/bin"
 NS=${NS:-qns}
 PORT=${PORT:-45300}
 
+# Parallel-safe overrides (used by Python training to run multiple workers concurrently).
+VETH_HOST=${VETH_HOST:-veth0}
+VETH_NS=${VETH_NS:-veth1}
+HOST_IP=${HOST_IP:-10.10.0.1/24}
+NS_IP=${NS_IP:-10.10.0.2/24}
+SRV_IP=${SRV_IP:-${NS_IP%%/*}}
+
 BITRATE_MBPS=${BITRATE_MBPS:-10}
 RTT_MS=${RTT_MS:-550}
 LOSS_PCT=${LOSS_PCT:-0}
 RATE="${BITRATE_MBPS}mbit"
 
 FILE=${FILE:-"$ROOT/go/test_data/train_FD001.txt"}
-OBS_JSON=${OBS_JSON:-/tmp/quicfec_rl.json}
+OUT_DIR=${OUT_DIR:-"$ROOT/go/test_data"}
+# Default OBS path is namespaced to avoid collisions across parallel runs.
+OBS_JSON=${OBS_JSON:-/tmp/quicfec_rl_${NS}.json}
 
 K=${K:-30}
 SYMBOL_BYTES=${SYMBOL_BYTES:-1032}
@@ -54,11 +63,8 @@ USE_ARQ=${USE_ARQ:-1}
 PACE_US=${PACE_US:-}
 TRANSPORT=${TRANSPORT:-dgram}
 if [[ -z "${POST_WAIT+x}" || -z "${POST_WAIT}" ]]; then
-  # Default linger: ~3*RTT, clamped to [200ms, 800ms] to let tail datagrams/ARQ settle
-  WAIT_MS=$(( RTT_MS * 3 ))
-  if [[ $WAIT_MS -lt 200 ]]; then WAIT_MS=200; fi
-  if [[ $WAIT_MS -gt 800 ]]; then WAIT_MS=800; fi
-  POST_WAIT="${WAIT_MS}ms"
+  # Default linger: 0s. QUIC-FEC now waits for an explicit server->client DONE ACK.
+  POST_WAIT="0s"
 fi
 # Experiment-level transfer timeout in seconds (15s by default).
 TIMEOUT_S=${TIMEOUT_S:-15}
@@ -83,7 +89,7 @@ SKIP_BUILD=${SKIP_BUILD:-0}
 # DDL_MS already defaulted above; kept here historically but now intentionally a no-op.
 
 chmod +x "$ROOT/scripts"/*.sh || true
-mkdir -p "$ROOT/go/test_data"
+mkdir -p "$ROOT/go/test_data" "$OUT_DIR"
 # Ensure test file exists (repo ignores test_data). Create a deterministic ~3MB file if missing.
 if [[ ! -f "$FILE" ]]; then
   head -c $((3*1024*1024)) </dev/urandom >"$FILE"
@@ -97,19 +103,19 @@ fi
 
 # Reset netns (unless explicitly reusing an existing one)
 if [[ "$SKIP_NETNS_RESET" != "1" ]]; then
-  "$ROOT/scripts/netns_reset.sh" "$NS"
+  VETH_HOST="$VETH_HOST" VETH_NS="$VETH_NS" HOST_IP="$HOST_IP" NS_IP="$NS_IP" "$ROOT/scripts/netns_reset.sh" "$NS"
 else
   # Validate the expected topology exists.
   if ! sudo ip netns list | awk '{print $1}' | grep -qx "$NS"; then
     echo "[error] netns '$NS' not found but SKIP_NETNS_RESET=1" >&2
     exit 2
   fi
-  if ! ip link show veth0 &>/dev/null; then
-    echo "[error] host veth0 not found but SKIP_NETNS_RESET=1" >&2
+  if ! ip link show "$VETH_HOST" &>/dev/null; then
+    echo "[error] host $VETH_HOST not found but SKIP_NETNS_RESET=1" >&2
     exit 2
   fi
-  if ! sudo ip netns exec "$NS" ip link show veth1 &>/dev/null; then
-    echo "[error] ns veth1 not found but SKIP_NETNS_RESET=1" >&2
+  if ! sudo ip netns exec "$NS" ip link show "$VETH_NS" &>/dev/null; then
+    echo "[error] ns $VETH_NS not found but SKIP_NETNS_RESET=1" >&2
     exit 2
   fi
 fi
@@ -149,7 +155,7 @@ FILE_SIZE=$(stat -c%s "$FILE")
 # Configure qdiscs: half RTT on each direction; apply TBF at root and NETEM as child on host side
 half=$(( RTT_MS / 2 ))
 if [[ "$SKIP_TC_CONFIG" != "1" ]]; then
-  sudo tc qdisc del dev veth0 root 2>/dev/null || true
+  sudo tc qdisc del dev "$VETH_HOST" root 2>/dev/null || true
 
   # Build NETEM args for loss model
   LOSS_MODE=${LOSS_MODE:-}
@@ -175,10 +181,10 @@ if [[ "$SKIP_TC_CONFIG" != "1" ]]; then
   esac
 
   # Apply TBF at root to enforce rate, then NETEM as child for delay/loss
-  sudo tc qdisc replace dev veth0 root handle 1: tbf rate ${RATE} burst 32kb latency 400ms
-  sudo tc qdisc replace dev veth0 parent 1:1 handle 10: netem "${NETEM_ARGS[@]}"
-  sudo ip netns exec "$NS" tc qdisc del dev veth1 root 2>/dev/null || true
-  sudo ip netns exec "$NS" tc qdisc replace dev veth1 root netem delay ${half}ms
+  sudo tc qdisc replace dev "$VETH_HOST" root handle 1: tbf rate ${RATE} burst 32kb latency 400ms
+  sudo tc qdisc replace dev "$VETH_HOST" parent 1:1 handle 10: netem "${NETEM_ARGS[@]}"
+  sudo ip netns exec "$NS" tc qdisc del dev "$VETH_NS" root 2>/dev/null || true
+  sudo ip netns exec "$NS" tc qdisc replace dev "$VETH_NS" root netem delay ${half}ms
 fi
 
 # JSON (line-oriented) for RL obs
@@ -191,19 +197,36 @@ fi
 
 # Run server (logs in /tmp/quic_fec_srv.* for easy tailing)
 SRV_LOG=$(mktemp -t quic_fec_srv.XXXXXX.log)
-sudo ip netns exec "$NS" bash -lc "ulimit -n 1048576; '$BIN_DIR/quicfec-server' -addr 10.10.0.2:$PORT -out '$ROOT/go/test_data' -rx-ddl ${DDL_MS}ms -timeout ${SRV_TIMEOUT}" >"$SRV_LOG" 2>&1 & SP=$!
-sleep 0.1
+# Remove any stale outputs from previous runs; otherwise md5_ok can be a false positive
+# if this run fails before producing a new file.
+rm -f "$OUT_DIR/$(basename "$FILE").recv" "$OUT_DIR/$(basename "$FILE").recv.part" 2>/dev/null || true
+sudo ip netns exec "$NS" bash -lc "ulimit -n 1048576; '$BIN_DIR/quicfec-server' -addr ${SRV_IP}:$PORT -out '$OUT_DIR' -timeout ${SRV_TIMEOUT}" >"$SRV_LOG" 2>&1 & SP=$!
+
+# Wait for server UDP socket to be ready (best-effort). A fixed sleep can be flaky under load.
+ready=0
+if command -v ss >/dev/null 2>&1; then
+  for _ in $(seq 1 30); do
+    if sudo ip netns exec "$NS" ss -lunH 2>/dev/null | awk '{print $5}' | grep -q ":$PORT$"; then
+      ready=1
+      break
+    fi
+    sleep 0.02
+  done
+fi
+if [[ "$ready" != "1" ]]; then
+  sleep 0.1
+fi
 
 # Run client (logs in /tmp/quic_fec_cli.*)
 CLI_LOG=$(mktemp -t quic_fec_cli.XXXXXX.log)
 export QUIC_FEC_CC_BYPASS=${QUIC_FEC_CC_BYPASS:-1}
 
-# Byte counters on host veth0 (network-layer; includes headers). These are used
+# Byte counters on host veth (network-layer; includes headers). These are used
 # to estimate overhead (extra transmitted bytes over the file payload).
 TX0=0; RX0=0
-if [[ -r /sys/class/net/veth0/statistics/tx_bytes ]]; then
-  TX0=$(cat /sys/class/net/veth0/statistics/tx_bytes 2>/dev/null || echo 0)
-  RX0=$(cat /sys/class/net/veth0/statistics/rx_bytes 2>/dev/null || echo 0)
+if [[ -r "/sys/class/net/${VETH_HOST}/statistics/tx_bytes" ]]; then
+  TX0=$(cat "/sys/class/net/${VETH_HOST}/statistics/tx_bytes" 2>/dev/null || echo 0)
+  RX0=$(cat "/sys/class/net/${VETH_HOST}/statistics/rx_bytes" 2>/dev/null || echo 0)
 fi
 START=$(date +%s%N)
 pace_arg=""
@@ -236,12 +259,12 @@ if [[ "${USE_ARQ}" == "1" ]]; then
 fi
 if command -v timeout >/dev/null 2>&1; then
   timeout --signal=KILL ${TIMEOUT_S}s \
-    "$BIN_DIR/quicfec-client" -addr 10.10.0.2:$PORT -file "$FILE" -N $((K+R0)) -K "$K" -L "$SYMBOL_BYTES" \
-      -post-wait "$POST_WAIT" -ack-every "$ACK_EVERY" -dgram-warn 1400 -transport "$TRANSPORT" $arq_flag -R0 "$R0" -W "$W" -Rstep "$RSTEP" -alpha "$ALPHA" -max-attempts "$MAX_ATTEMPTS" -loss 0 $pace_arg \
+    "$BIN_DIR/quicfec-client" -addr ${SRV_IP}:$PORT -file "$FILE" -N $((K+R0)) -K "$K" -L "$SYMBOL_BYTES" \
+      -post-wait "$POST_WAIT" -ack-every "$ACK_EVERY" -dgram-warn 1400 -transport "$TRANSPORT" $arq_flag -rx-ddl ${DDL_MS}ms -R0 "$R0" -W "$W" -Rstep "$RSTEP" -alpha "$ALPHA" -max-attempts "$MAX_ATTEMPTS" -loss 0 $pace_arg \
       >"$CLI_LOG" 2>&1 || RC=$?
 else
-  "$BIN_DIR/quicfec-client" -addr 10.10.0.2:$PORT -file "$FILE" -N $((K+R0)) -K "$K" -L "$SYMBOL_BYTES" \
-    -post-wait "$POST_WAIT" -ack-every "$ACK_EVERY" -dgram-warn 1400 -transport "$TRANSPORT" $arq_flag -R0 "$R0" -W "$W" -Rstep "$RSTEP" -alpha "$ALPHA" -max-attempts "$MAX_ATTEMPTS" -loss 0 $pace_arg \
+  "$BIN_DIR/quicfec-client" -addr ${SRV_IP}:$PORT -file "$FILE" -N $((K+R0)) -K "$K" -L "$SYMBOL_BYTES" \
+    -post-wait "$POST_WAIT" -ack-every "$ACK_EVERY" -dgram-warn 1400 -transport "$TRANSPORT" $arq_flag -rx-ddl ${DDL_MS}ms -R0 "$R0" -W "$W" -Rstep "$RSTEP" -alpha "$ALPHA" -max-attempts "$MAX_ATTEMPTS" -loss 0 $pace_arg \
     >"$CLI_LOG" 2>&1 || RC=$?
 fi
 RC=${RC:-0}
@@ -249,12 +272,16 @@ TIMED_OUT=0
 if [[ "$RC" == "124" || "$RC" == "137" ]]; then
   TIMED_OUT=1
 fi
+CLIENT_OK=1
+if [[ "$RC" != "0" ]]; then
+  CLIENT_OK=0
+fi
 END=$(date +%s%N)
 
 TX1=$TX0; RX1=$RX0
-if [[ -r /sys/class/net/veth0/statistics/tx_bytes ]]; then
-  TX1=$(cat /sys/class/net/veth0/statistics/tx_bytes 2>/dev/null || echo "$TX0")
-  RX1=$(cat /sys/class/net/veth0/statistics/rx_bytes 2>/dev/null || echo "$RX0")
+if [[ -r "/sys/class/net/${VETH_HOST}/statistics/tx_bytes" ]]; then
+  TX1=$(cat "/sys/class/net/${VETH_HOST}/statistics/tx_bytes" 2>/dev/null || echo "$TX0")
+  RX1=$(cat "/sys/class/net/${VETH_HOST}/statistics/rx_bytes" 2>/dev/null || echo "$RX0")
 fi
 TX_BYTES=$(( TX1 - TX0 ))
 RX_BYTES=$(( RX1 - RX0 ))
@@ -278,11 +305,11 @@ sleep 0.05; kill -9 $SP 2>/dev/null || true
 
 # Basic metrics
 IN_MD5=$(md5sum "$FILE" | awk '{print $1}')
-OUT_MD5=$(md5sum "$ROOT/go/test_data/$(basename "$FILE").recv" | awk '{print $1}' || true)
+OUT_MD5=$(md5sum "$OUT_DIR/$(basename "$FILE").recv" | awk '{print $1}' || true)
 MD5_OK=0; [[ "$IN_MD5" == "$OUT_MD5" ]] && MD5_OK=1
 
-# Timeout => count as failure.
-if [[ "$TIMED_OUT" == "1" ]]; then
+# Any client failure (including timeout) => count as failure.
+if [[ "$CLIENT_OK" == "0" ]]; then
   MD5_OK=0
 fi
 
@@ -305,18 +332,14 @@ if [[ -n "$E2E_MS" && "$E2E_OK" == "1" ]]; then
   DUR_MS=$E2E_MS
 fi
 
-# Extract server observation (preferred)
+# Build RL observation.
+# Design: contextual bandit controls TX only. Therefore, all observation fields
+# except residual_erasures are sourced from the sender (client) logs.
 KEEP_LOGS=0
-if [[ -n "$RL_OBS" ]]; then
-  # Post-process observation:
-  # - Server-side estimated_available_bw_mbps is an arrival-rate estimator and can
-  #   collapse to goodput when the sender is app-limited or transfers are short.
-  # - For RL we want a sender-side bandwidth estimate derived from transport signals.
-  #   We extract the congestion-controller estimate emitted by the client and merge it.
-  # Preserve the server estimator under estimated_available_bw_arrival_mbps.
-  CC_EST=$(grep -E '^\[cc-estimate\] ' "$CLI_LOG" | tail -n1 || true)
-  ARQ_STATS=$(grep -E '^\[arq-stats\] ' "$CLI_LOG" | tail -n1 || true)
-  MERGED_LINE=$(RL_OBS_LINE="$RL_OBS" CC_EST_LINE="$CC_EST" ARQ_STATS_LINE="$ARQ_STATS" python3 - <<'PY'
+CC_EST=$(grep -E '^\[cc-estimate\] ' "$CLI_LOG" | tail -n1 || true)
+ARQ_STATS=$(grep -E '^\[arq-stats\] ' "$CLI_LOG" | tail -n1 || true)
+CLI_STAGES=$(grep -E '^\[fec-client-stages\] ' "$CLI_LOG" | tail -n1 || true)
+MERGED_LINE=$(RL_OBS_LINE="$RL_OBS" CC_EST_LINE="$CC_EST" ARQ_STATS_LINE="$ARQ_STATS" CLI_STAGES_LINE="$CLI_STAGES" FILE_SIZE="$FILE_SIZE" K_VAL="$K" R0_VAL="$R0" DDL_MS_VAL="$DDL_MS" MD5_OK_VAL="$MD5_OK" TIMED_OUT_VAL="$TIMED_OUT" python3 - <<'PY'
 import json
 import os
 import sys
@@ -324,22 +347,60 @@ import sys
 line = os.environ.get('RL_OBS_LINE', '')
 cc = os.environ.get('CC_EST_LINE', '')
 arq = os.environ.get('ARQ_STATS_LINE', '')
-
-if not line.startswith('[rl-observation] '):
-    sys.stdout.write(line)
-    sys.exit(0)
+stg = os.environ.get('CLI_STAGES_LINE', '')
 
 try:
-    payload = json.loads(line.split(' ', 1)[1])
+  file_size = int(os.environ.get('FILE_SIZE', '0') or '0')
 except Exception:
-    sys.stdout.write(line)
-    sys.exit(0)
+  file_size = 0
 
-# Keep a copy of the server's arrival-based estimator.
 try:
-    payload['estimated_available_bw_arrival_mbps'] = float(payload.get('estimated_available_bw_mbps', 0.0))
+  K = int(os.environ.get('K_VAL', '0') or '0')
 except Exception:
-    payload['estimated_available_bw_arrival_mbps'] = 0.0
+  K = 0
+
+try:
+  R0 = int(os.environ.get('R0_VAL', '0') or '0')
+except Exception:
+  R0 = 0
+
+try:
+  ddl_ms = int(os.environ.get('DDL_MS_VAL', '0') or '0')
+except Exception:
+  ddl_ms = 0
+
+try:
+  md5_ok = int(os.environ.get('MD5_OK_VAL', '1') or '1')
+except Exception:
+  md5_ok = 1
+
+try:
+  timed_out = int(os.environ.get('TIMED_OUT_VAL', '0') or '0')
+except Exception:
+  timed_out = 0
+
+# Global info (receiver): residual erasures flag.
+residual_erasures = 1
+if (line or '').startswith('[rl-observation] '):
+  try:
+    rx_payload = json.loads(line.split(' ', 1)[1])
+    residual_erasures = int(rx_payload.get('residual_erasures', 1) or 0)
+  except Exception:
+    residual_erasures = 1
+
+payload = {
+  'goodput': 0.0,
+  'goodput_mbps': 0.0,
+  'fec_overhead': 0.0,
+  'ctrl_tx_nack_msgs': 0,
+  'arq_attempts_mean': 0.0,
+  'residual_erasures': int(residual_erasures),
+  'fec_rate': float(R0) / float(max(1, K)),
+  'ddl_ms': float(max(0, ddl_ms)),
+  # Validity markers (not used by the policy; env uses them to ignore invalid runs).
+  'md5_ok': int(md5_ok),
+  'timed_out': int(timed_out),
+}
 
 def parse_cc_line(s: str):
   s = (s or '').strip()
@@ -403,57 +464,85 @@ if isinstance(ccj, dict):
     payload['cc_mode'] = mode
 
 # Merge sender-side FEC tx counters / overhead from the client.
-# This is the source of truth for fec_overhead and avoids relying on the
-# server receiving a late stats stream before shutdown.
 arqj = parse_kv_line('[arq-stats]', arq)
+tx_source = 0
+tx_repairs = 0
+arq_attempts_total = 0
+arq_clusters_total = 0
 if isinstance(arqj, dict) and arqj:
-  # Prefer these sender-side keys when present.
-  # Keep server-side values if the client didn't report a field.
-  if 'tx_total_symbols' in arqj:
-    payload['tx_total_symbols'] = int(arqj['tx_total_symbols'])
-  if 'tx_source_symbols' in arqj:
-    payload['tx_source_symbols'] = int(arqj['tx_source_symbols'])
-  # The Go client prints tx_repairs (not tx_repair_symbols).
-  if 'tx_repairs' in arqj:
-    payload['tx_repair_symbols'] = int(arqj['tx_repairs'])
-  if 'fec_overhead' in arqj:
-    try:
-      payload['fec_overhead'] = float(arqj['fec_overhead'])
-    except Exception:
-      pass
-  if 'attempts' in arqj:
-    try:
-      payload['arq_attempts_total'] = int(arqj['attempts'])
-    except Exception:
-      pass
-  if 'clusters' in arqj:
-    try:
-      payload['arq_clusters_total'] = int(arqj['clusters'])
-    except Exception:
-      pass
+  try:
+    tx_source = int(arqj.get('tx_source_symbols', 0) or 0)
+  except Exception:
+    tx_source = 0
+  try:
+    tx_repairs = int(arqj.get('tx_repairs', arqj.get('tx_repair_symbols', 0)) or 0)
+  except Exception:
+    tx_repairs = 0
+  try:
+    arq_attempts_total = int(arqj.get('attempts', 0) or 0)
+  except Exception:
+    arq_attempts_total = 0
+  try:
+    arq_clusters_total = int(arqj.get('clusters', 0) or 0)
+  except Exception:
+    arq_clusters_total = 0
+
+  # ctrl_tx_nack_msgs: sender-side count of NACK messages received.
+  # The client reports total "attempts" (NACK rounds processed).
+  payload['ctrl_tx_nack_msgs'] = int(max(0, arq_attempts_total))
+
+  # ARQ attempts mean per cluster (tx-side).
+  if arq_clusters_total > 0:
+    payload['arq_attempts_mean'] = float(arq_attempts_total) / float(arq_clusters_total)
+  else:
+    payload['arq_attempts_mean'] = 0.0
+
+  # fec_overhead: repairs/source across initial R0 and ARQ appended repairs.
+  try:
+    if tx_source > 0:
+      payload['fec_overhead'] = float(tx_repairs) / float(tx_source)
+    else:
+      payload['fec_overhead'] = 0.0
+  except Exception:
+    payload['fec_overhead'] = 0.0
+
+stgj = parse_kv_line('[fec-client-stages]', stg)
+total_ms = None
+if isinstance(stgj, dict) and stgj:
+  try:
+    total_ms = float(stgj.get('total_ms', None))
+  except Exception:
+    total_ms = None
+
+# Sender-side goodput estimate: file_size over sender-observed total_ms.
+try:
+  if total_ms is not None and total_ms > 0 and file_size > 0:
+    goodput_mbps = (float(file_size) * 8.0 / 1e6) / (float(total_ms) / 1000.0)
+    payload['goodput'] = float(goodput_mbps)
+    payload['goodput_mbps'] = float(goodput_mbps)
+except Exception:
+  pass
 
 sys.stdout.write('[rl-observation] ' + json.dumps(payload, separators=(',', ':')))
 PY
-  )
-  echo "$MERGED_LINE" >>"$OBS_JSON"
-  echo "$MERGED_LINE" >&2
-  # If residual_erasures reported, keep logs for diagnosis and print tails
-  if echo "$MERGED_LINE" | grep -q '"residual_erasures"[[:space:]]*:[[:space:]]*1'; then
-    KEEP_LOGS=1
+)
+echo "$MERGED_LINE" >>"$OBS_JSON"
+echo "$MERGED_LINE" >&2
+
+# If residual_erasures reported (or server obs missing), keep logs for diagnosis and print tails.
+if [[ -z "$RL_OBS" ]] || echo "$MERGED_LINE" | grep -q '"residual_erasures"[[:space:]]*:[[:space:]]*1'; then
+  KEEP_LOGS=1
+  if [[ -z "$RL_OBS" ]]; then
+    echo "[warn] no [rl-observation] found in server logs; using tx-only obs with residual_erasures=1" >&2
+  else
     echo "[diag] residual_erasures=1 detected; preserving logs:" >&2
-    echo "[diag] server log: $SRV_LOG" >&2
-    echo "[diag] client log: $CLI_LOG" >&2
-    echo "[diag] ---- server log tail ----" >&2
-    tail -n 120 "$SRV_LOG" >&2 || true
-    echo "[diag] ---- client log tail ----" >&2
-    tail -n 120 "$CLI_LOG" >&2 || true
   fi
-else
-  echo "[warn] no [rl-observation] found in server logs" >&2
-  echo "[warn] server log tail:" >&2
-  tail -n 50 "$SRV_LOG" >&2 || true
-  echo "[warn] client log tail:" >&2
-  tail -n 50 "$CLI_LOG" >&2 || true
+  echo "[diag] server log: $SRV_LOG" >&2
+  echo "[diag] client log: $CLI_LOG" >&2
+  echo "[diag] ---- server log tail ----" >&2
+  tail -n 120 "$SRV_LOG" >&2 || true
+  echo "[diag] ---- client log tail ----" >&2
+  tail -n 120 "$CLI_LOG" >&2 || true
 fi
 
 # Echo a concise run summary (always)
@@ -462,18 +551,23 @@ S_DUR=""
 if [[ -n "$S_LINE" ]]; then
   S_DUR=$(echo "$S_LINE" | sed -n 's/.*dur_s=\([0-9.\-]\+\).*/\1/p')
 fi
+
+# Throughput metrics:
+# - s_mbps: computed from DUR_MS (server-e2e when available), to match dur_ms.
+# - s_mbps_total: computed from server-stats dur_s (includes tx-stats grace period + finalize), useful for diagnostics.
+S_MBPS=0
+if [[ "$DUR_MS" -gt 0 ]]; then
+  S_MBPS=$(awk -v sz="$FILE_SIZE" -v ms="$DUR_MS" 'BEGIN{printf "%.2f", (sz*8.0/1000000.0)/(ms/1000.0)}')
+fi
+
+S_MBPS_TOTAL=""
 if [[ -n "$S_DUR" && "$S_DUR" != "0" ]]; then
-  S_MBPS=$(awk -v sz="$FILE_SIZE" -v ds="$S_DUR" 'BEGIN{printf "%.2f", (sz*8.0/1000000.0)/ds}')
-else
-  if [[ "$DUR_MS" -gt 0 ]]; then
-    S_MBPS=$(awk -v sz="$FILE_SIZE" -v ms="$DUR_MS" 'BEGIN{printf "%.2f", (sz*8.0/1000000.0)/(ms/1000.0)}')
-  else
-    S_MBPS=0
-  fi
+  S_MBPS_TOTAL=$(awk -v sz="$FILE_SIZE" -v ds="$S_DUR" 'BEGIN{printf "%.2f", (sz*8.0/1000000.0)/ds}')
 fi
 
 if [[ "$TIMED_OUT" == "1" ]]; then
   S_MBPS=0
+  S_MBPS_TOTAL=0
 fi
 
 LOSS_DESC="${LOSS_PCT}%"
@@ -481,7 +575,11 @@ if [[ -n "${LOSS_MODE:-}" ]]; then
   LOSS_DESC="${LOSS_MODE}"
 fi
 
-echo "[run] proto=quic_fec bitrate=${BITRATE_MBPS}Mbps rtt=${RTT_MS}ms loss=${LOSS_DESC} dur_ms=${DUR_MS} dur_ms_client=${DUR_MS_CLIENT} timed_out=${TIMED_OUT} md5_ok=${MD5_OK} s_mbps=${S_MBPS} file_bytes=${FILE_SIZE} tx_bytes=${TX_BYTES} rx_bytes=${RX_BYTES}" >&2
+run_tail=""
+if [[ -n "$S_MBPS_TOTAL" ]]; then
+  run_tail=" s_mbps_total=${S_MBPS_TOTAL}"
+fi
+echo "[run] proto=quic_fec bitrate=${BITRATE_MBPS}Mbps rtt=${RTT_MS}ms loss=${LOSS_DESC} dur_ms=${DUR_MS} dur_ms_client=${DUR_MS_CLIENT} timed_out=${TIMED_OUT} client_ok=${CLIENT_OK} client_rc=${RC} md5_ok=${MD5_OK} s_mbps=${S_MBPS}${run_tail} file_bytes=${FILE_SIZE} tx_bytes=${TX_BYTES} rx_bytes=${RX_BYTES}" >&2
 
 # Cleanup temp logs
 # - Keep logs when a failure occurs (no RL_OBS) or residual_erasures=1.

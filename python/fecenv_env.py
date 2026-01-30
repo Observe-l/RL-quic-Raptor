@@ -56,12 +56,41 @@ class QuicFecRunner:
         obs_wait_secs: int | None = None,
     ):
         self.root = root or os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        self.ns = ns
+
+        # Parallel-safety: multiple training processes (or Ray workers) may run on the same host.
+        # The shell harness historically used fixed netns/veth/IP defaults, which causes collisions.
+        # Default to a per-process namespace unless the caller explicitly chose a non-default.
+        isolate_key = os.environ.get("QUICFEC_ISOLATE_KEY", "")
+        if not isolate_key.strip():
+            isolate_key = f"pid{os.getpid()}"
+        if ns == "qns" and not os.environ.get("QUICFEC_NS"):
+            self.ns = f"qns-{isolate_key}"
+        else:
+            self.ns = os.environ.get("QUICFEC_NS", ns)
+
+        # Keep derived resources stable for the lifetime of this runner.
+        self._isolate_key = isolate_key
+        # Keep names within the Linux IFNAMSIZ=16 limit.
+        self._veth_host = (os.environ.get("QUICFEC_VETH_HOST") or f"vh{isolate_key}")[:15]
+        self._veth_ns = (os.environ.get("QUICFEC_VETH_NS") or f"vn{isolate_key}")[:15]
+
+        # Per-run subnet to avoid having multiple host veth interfaces share an IP.
+        # Use a stable third octet derived from PID by default.
+        if os.environ.get("QUICFEC_HOST_IP") and os.environ.get("QUICFEC_NS_IP"):
+            self._host_ip_cidr = str(os.environ.get("QUICFEC_HOST_IP"))
+            self._ns_ip_cidr = str(os.environ.get("QUICFEC_NS_IP"))
+        else:
+            subnet_id = (int(os.getpid()) % 200) + 20
+            self._host_ip_cidr = f"10.200.{subnet_id}.1/24"
+            self._ns_ip_cidr = f"10.200.{subnet_id}.2/24"
+
+        # Avoid output file collisions on shared basenames.
+        self._out_dir = os.environ.get("QUICFEC_OUT_DIR", f"/tmp/quicfec_out_{isolate_key}")
         # Only use the shaped runner script (no local mode)
         self.script = os.path.join(self.root, "scripts", "quicfec_run_once.sh")
         # The shaping harness writes observations as one JSON object per line.
         # We keep the format but use .json suffix (some tools dislike .jsonl).
-        self.obs_json = os.environ.get("QUICFEC_OBS_JSON", "/tmp/quicfec_rl.json")
+        self.obs_json = os.environ.get("QUICFEC_OBS_JSON", f"/tmp/quicfec_rl_{isolate_key}.json")
         self.last_cfg = None
         self.timeout_sec = int(timeout_sec)
         self.pace_us = 200
@@ -128,6 +157,12 @@ class QuicFecRunner:
 
         cfg = self.last_cfg or EnvConfig()
         env["NS"] = self.ns
+        env["VETH_HOST"] = self._veth_host
+        env["VETH_NS"] = self._veth_ns
+        env["HOST_IP"] = self._host_ip_cidr
+        env["NS_IP"] = self._ns_ip_cidr
+        env["SRV_IP"] = self._ns_ip_cidr.split("/", 1)[0]
+        env["OUT_DIR"] = self._out_dir
         env["RTT_MS"] = str(int(rtt_ms))
         env["LOSS_MODE"] = str(loss_mode)
         env["LOSS_PCT"] = str(int(loss_pct))
@@ -178,6 +213,13 @@ class QuicFecRunner:
         env["PATH"] = path
         env["REPS"] = "1"
         cfg = self.last_cfg or EnvConfig()
+        env["NS"] = self.ns
+        env["VETH_HOST"] = self._veth_host
+        env["VETH_NS"] = self._veth_ns
+        env["HOST_IP"] = self._host_ip_cidr
+        env["NS_IP"] = self._ns_ip_cidr
+        env["SRV_IP"] = self._ns_ip_cidr.split("/", 1)[0]
+        env["OUT_DIR"] = self._out_dir
         # K and RSTEP are controlled by the policy.
         k = int(getattr(action, "K", cfg.K))
         if k < 1:
@@ -366,8 +408,6 @@ class QuicFecRunner:
             "arq_attempts_p95": 3.0,
             "rx_unique_at_ddl_mean": 0.0,
             "rx_unique_at_ddl_p95": 0.0,
-            "decode_latency_p50_ms": 0.0,
-            "decode_latency_p95_ms": 0.0,
             "estimated_available_bw_mbps": 0.0,
             # peak removed; only robust estimate is used
         }
@@ -433,7 +473,6 @@ class FecEnv(gym.Env):
         # Keep this strictly limited to the learning signal (no debug/leakage).
         # Layout (requested):
         #   goodput,
-        #   decode_latency_p95_ms,
         #   fec_overhead,
         #   ctrl_tx_nack_msgs,
         #   arq_attempts_mean,
@@ -442,7 +481,6 @@ class FecEnv(gym.Env):
         #   ddl_ms (executed)
         self._obs_keys: List[str] = [
             "goodput",
-            "decode_latency_p95_ms",
             "fec_overhead",
             "ctrl_tx_nack_msgs",
             "arq_attempts_mean",
@@ -469,6 +507,15 @@ class FecEnv(gym.Env):
         # Timeouts are treated as a valid (bad) outcome by default.
         self._ignore_runner_errors = bool(cfg.get("ignore_runner_errors", False))
 
+        # Invalid-transfer filtering:
+        # - timeouts (Python-side) and
+        # - md5_ok=0 (harness-side)
+        # should not be counted as learning signal nor included in step_metrics.
+        # This is critical for the TX-only contextual bandit: failures are often
+        # environmental (netns readiness, transient EPERM, etc.) and would poison
+        # the contextual update.
+        self._ignore_invalid_transfers = bool(cfg.get("ignore_invalid_transfers", True))
+
         # Curriculum / randomization
         self._randomize_net_params_enabled = bool(cfg.get("randomize_net_params", False))
         self._curriculum_warmup_episodes = int(cfg.get("curriculum_warmup_episodes", 0))
@@ -478,13 +525,12 @@ class FecEnv(gym.Env):
         # - "qarc_v1": soft penalties, non-saturating signals for throughput/overhead
         # - "legacy": previous clipped/thresholded reward
         self._reward_variant = str(cfg.get("reward_variant", "qarc_v1"))
-        # Default weights for the (throughput + latency-reward) shaping.
-        self._reward_w_goodput = float(cfg.get("reward_w_goodput", 0.7))
-        self._reward_w_delay = float(cfg.get("reward_w_delay", 0.3))
+        # Default weights for shaping.
+        # Latency term removed: bandit controls TX side only.
+        self._reward_w_goodput = float(cfg.get("reward_w_goodput", 1.0))
         self._reward_w_residual = float(cfg.get("reward_w_residual", 0.0))
-        self._reward_w_overhead = float(cfg.get("reward_w_overhead", 0.0))
+        self._reward_w_overhead = float(cfg.get("reward_w_overhead", 0.3))
         self._reward_w_arq = float(cfg.get("reward_w_arq", 0.0))
-        self._reward_delay_binary = bool(cfg.get("reward_delay_binary", True))
         self._reward_residual_binary = bool(cfg.get("reward_residual_binary", True))
 
         # Network defaults
@@ -646,8 +692,26 @@ class FecEnv(gym.Env):
         if info and isinstance(info, dict):
             err = info.get("error")
         is_timeout = bool(isinstance(err, str) and err.lower().startswith("timeout"))
+
+        # md5_ok is produced by the harness (scripts/quicfec_run_once.sh) and is
+        # not part of the policy observation; it is used only to filter invalid runs.
+        md5_ok = 1
         try:
-            goodput_mbps = float(obs_dict.get("goodput_arrival_mbps", obs_dict.get("goodput_decode_mbps", 0.0)))
+            md5_ok = int(obs_dict.get("md5_ok", 1))
+        except Exception:
+            md5_ok = 1
+        is_md5_fail = bool(md5_ok != 1)
+        try:
+            # Bandit-safe: prefer tx-side goodput estimate (provided by the harness).
+            goodput_mbps = float(
+                obs_dict.get(
+                    "goodput",
+                    obs_dict.get(
+                        "goodput_mbps",
+                        obs_dict.get("goodput_arrival_mbps", obs_dict.get("goodput_decode_mbps", 0.0)),
+                    ),
+                )
+            )
         except Exception:
             goodput_mbps = 0.0
         if is_timeout:
@@ -666,6 +730,19 @@ class FecEnv(gym.Env):
             err = str(info.get("error"))
             if not err.lower().startswith("timeout"):
                 raise RuntimeError(f"QUIC-FEC harness failed: {err}")
+
+        # If this transfer is invalid, do not emit learning signal.
+        # We intentionally avoid updating last_obs so that reset() returns the
+        # last known-good observation.
+        if self._ignore_invalid_transfers and (is_timeout or is_md5_fail):
+            info = {
+                **(info or {}),
+                "step_valid": 0,
+                "invalid_reason": "timeout" if is_timeout else "md5_fail",
+                "md5_ok": int(md5_ok),
+            }
+            return self._last_obs_vec.copy(), 0.0, False, False, info
+
         # Compute reward (variant selectable via env_config). If the harness timed out,
         # override with a hard penalty to discourage actions that fail to complete.
         if is_timeout:
@@ -682,6 +759,7 @@ class FecEnv(gym.Env):
 
         info = {
             **(info or {}),
+            "step_valid": 1,
             "net_params": {
                 "rtt_ms": self._rtt_ms,
                 "bitrate_mbps": self._bitrate_mbps,
@@ -697,12 +775,13 @@ class FecEnv(gym.Env):
                 "cc_algo": str(getattr(self._runner.last_cfg or EnvConfig(), "cc_algo", "bbrv2")),
             },
             "bw_cap_mbps": float(self._capacity_mbps),
-            "goodput_mbps": float(obs_dict.get("goodput_arrival_mbps", obs_dict.get("goodput_decode_mbps", 0.0))),
+            "goodput_mbps": float(obs_dict.get("goodput", obs_dict.get("goodput_mbps", obs_dict.get("goodput_arrival_mbps", obs_dict.get("goodput_decode_mbps", 0.0))))),
             "reward_terms": r_terms,
             # "cap_hit": cap_hit,
             "cap_hits_cum": self._cap_hits,
             "zero_residual_flag": int(obs_dict.get("residual_erasures", 0) == 0),
-            "on_time_flag": int(float(obs_dict.get("decode_latency_p95_ms", 0.0)) <= float(ddl_ms)),
+            # Latency term removed; keep field for backward-compatible logs.
+            "on_time_flag": 0,
         }
 
         # Resolve trial/log dir: prefer Ray trial dir/env override
@@ -814,10 +893,8 @@ class FecEnv(gym.Env):
             self._loss_mode = f"gemodel:{pG},{r},{h},{pB}"
 
     def _compute_reward_satellite(self, obs: Dict[str, Any], ddl_ms: int) -> Tuple[float, Dict[str, float]]:
-        g = float(obs.get("goodput_arrival_mbps", obs.get("goodput_decode_mbps", 0.0)))
+        g = float(obs.get("goodput", obs.get("goodput_mbps", obs.get("goodput_arrival_mbps", obs.get("goodput_decode_mbps", 0.0)))))
         e = float(obs.get("residual_erasures", 0.0))
-        d95 = float(obs.get("decode_latency_p95_ms", 0.0))
-        d = float(max(1, int(ddl_ms)))
         oh = float(obs.get("fec_overhead", 0.0))
         a_mean = float(obs.get("arq_attempts_mean", 0.0))
 
@@ -827,18 +904,15 @@ class FecEnv(gym.Env):
             tp_term = float(np.clip(g / c, 0.0, 1.0))
             lam_e = 0.75
             resid_term = -lam_e * (e / (1.0 + e))
-            lam_d = 0.3
-            lat_term = -lam_d * max(0.0, (d95 - d) / max(d, 1.0))
             lam_o = 0.3
             # Legacy overhead term: treat fec_overhead as a ratio (repairs/source).
             # Penalize overhead above ~0.5, saturating by ~2.0.
             oh_term = -lam_o * max(0.0, (oh - 0.5) / 1.5)
             arq_term = -min(0.3, 0.08 * a_mean)
-            r = tp_term + resid_term + lat_term + oh_term + arq_term
+            r = tp_term + resid_term + oh_term + arq_term
             return float(r), {
                 "tp_term": float(tp_term),
                 "resid_term": float(resid_term),
-                "lat_term": float(lat_term),
                 "oh_term": float(oh_term),
                 "arq_term": float(arq_term),
             }
@@ -847,8 +921,6 @@ class FecEnv(gym.Env):
         # tp_term: normalized by physical capacity.
         c = max(1e-6, float(self._capacity_mbps))
         tp_term = float(self._reward_w_goodput) * float(g / c)
-        # lat_term: positive reward that decays with latency (scale=150ms).
-        lat_term = float(self._reward_w_delay) * float(1.0 / (1.0 + (float(d95) / 150.0) ** 2))
 
         # Keep residual/overhead/ARQ as penalties (optional knobs).
         if self._reward_residual_binary:
@@ -861,15 +933,13 @@ class FecEnv(gym.Env):
         oh_term = float(self._reward_w_overhead) * float(1.0 / (1.0 + (float(oh) / 0.3) ** 2))
         arq_term = -float(self._reward_w_arq) * float(arq_tilde)
 
-        r = float(tp_term + lat_term + resid_term + oh_term + arq_term)
+        r = float(tp_term + resid_term + oh_term + arq_term)
         return r, {
             "tp_term": float(tp_term),
-            "lat_term": float(lat_term),
             "resid_term": float(resid_term),
             "oh_term": float(oh_term),
             "arq_term": float(arq_term),
             "tp_norm": float(np.clip(g / c, 0.0, 1.0)),
-            "lat_reward": float(1.0 / (1.0 + (float(d95) / 150.0) ** 2)),
             "l_tilde": float(l_tilde),
             "arq_tilde": float(arq_tilde),
         }

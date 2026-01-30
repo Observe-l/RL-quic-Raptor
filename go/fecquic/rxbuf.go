@@ -114,9 +114,10 @@ type rxManager struct {
 	dropsRepairs atomic.Int64
 
 	// ARQ control (optional)
-	ctrlW   io.Writer   // underlying stream
-	ctrlOut chan []byte // buffered queue to dedicated writer
-	ctrlWG  sync.WaitGroup
+	ctrlW    io.Writer   // underlying stream
+	ctrlOut  chan []byte // buffered queue to dedicated writer
+	ctrlWG   sync.WaitGroup
+	ctrlDead atomic.Bool
 	// server metrics aggregator
 	met *serverMetrics
 	// first arrival timestamp (for missing-block ARQ heuristics)
@@ -217,11 +218,15 @@ func (m *rxManager) start(rx RXOptions) {
 	// control writer goroutine (serialize writes; don't block actors)
 	if m.ctrlW != nil {
 		if m.ctrlOut == nil {
-			m.ctrlOut = make(chan []byte, 2048)
+			// Large buffer to avoid dropping control under burst decode.
+			// Dropping ACKs can leave the sender waiting in ARQ drain long after
+			// the receiver has completed the transfer.
+			m.ctrlOut = make(chan []byte, 65536)
 		}
 		m.ctrlWG.Add(1)
 		go func() {
 			defer m.ctrlWG.Done()
+			defer m.ctrlDead.Store(true)
 			// If the underlying writer supports SetWriteDeadline, use it to avoid indefinite blocks.
 			type deadlineWriter interface{ SetWriteDeadline(time.Time) error }
 			dw, _ := m.ctrlW.(deadlineWriter)
@@ -323,14 +328,25 @@ func (m *rxManager) start(rx RXOptions) {
 							DecodeLatencyMs: uint32(time.Since(t0).Milliseconds()),
 						})
 						payload := buf.Bytes()
-						// non-blocking enqueue; drop if full (next events will resend state)
 						dropped := false
 						select {
 						case m.ctrlOut <- payload:
 							// ok
 						default:
-							dropped = true
-							fmt.Fprintf(os.Stderr, "[arq] ctrl queue full, dropping ACK block=%d\n", b.id)
+							if m.ctrlDead.Load() {
+								dropped = true
+								fmt.Fprintf(os.Stderr, "[arq] ctrl writer dead, dropping ACK block=%d\n", b.id)
+							} else {
+								t := time.NewTimer(200 * time.Millisecond)
+								defer t.Stop()
+								select {
+								case m.ctrlOut <- payload:
+									// queued
+								case <-t.C:
+									dropped = true
+									fmt.Fprintf(os.Stderr, "[arq] ctrl queue enqueue timeout, dropping ACK block=%d\n", b.id)
+								}
+							}
 						}
 						if m.met != nil {
 							m.met.OnCtrlTx(len(payload), "ack", dropped)
@@ -478,15 +494,29 @@ func (m *rxManager) start(rx RXOptions) {
 					Reason:         0,
 				})
 				payload := buf.Bytes()
-				// non-blocking send; if closed or full, skip
 				dropped := false
 				select {
 				case <-m.stopCh:
 					return
 				case m.ctrlOut <- payload:
+					// ok
 				default:
-					// best-effort: drop if queue full
-					dropped = true
+					if m.ctrlDead.Load() {
+						dropped = true
+						fmt.Fprintf(os.Stderr, "[arq] ctrl writer dead, dropping NACK block=%d\n", n.blockID)
+					} else {
+						t := time.NewTimer(200 * time.Millisecond)
+						defer t.Stop()
+						select {
+						case <-m.stopCh:
+							return
+						case m.ctrlOut <- payload:
+							// queued
+						case <-t.C:
+							dropped = true
+							fmt.Fprintf(os.Stderr, "[arq] ctrl queue enqueue timeout, dropping NACK block=%d\n", n.blockID)
+						}
+					}
 				}
 				if m.met != nil {
 					m.met.OnCtrlTx(len(payload), "nack", dropped)
@@ -789,9 +819,22 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 			dropped := false
 			select {
 			case m.ctrlOut <- payload:
+				// ok
 			default:
-				dropped = true
-				fmt.Fprintf(os.Stderr, "[arq] ctrl queue full, dropping ACK block=%d\n", sysBlockID)
+				if m.ctrlDead.Load() {
+					dropped = true
+					fmt.Fprintf(os.Stderr, "[arq] ctrl writer dead, dropping ACK block=%d\n", sysBlockID)
+				} else {
+					t := time.NewTimer(200 * time.Millisecond)
+					defer t.Stop()
+					select {
+					case m.ctrlOut <- payload:
+						// queued
+					case <-t.C:
+						dropped = true
+						fmt.Fprintf(os.Stderr, "[arq] ctrl queue enqueue timeout, dropping ACK block=%d\n", sysBlockID)
+					}
+				}
 			}
 			if m.met != nil {
 				m.met.OnCtrlTx(len(payload), "ack", dropped)
@@ -852,8 +895,17 @@ func (m *rxManager) closeAndFinalize(expectedSHA [32]byte) (string, error) {
 	if err := m.out.Close(); err != nil {
 		return "", err
 	}
-	// Verify SHA by reopening file
 	finalPath := filepath.Join(m.outDir, filepath.Base(m.tmpPath[:len(m.tmpPath)-5]))
+	// Match raw QUIC behavior: do not reread the output file unless the sender
+	// explicitly provided a non-zero SHA256 to verify.
+	var zero [32]byte
+	if expectedSHA == zero {
+		if err := os.Rename(m.tmpPath, finalPath); err != nil {
+			return "", err
+		}
+		return finalPath, nil
+	}
+	// Verify SHA by reopening file
 	out, err := os.Open(m.tmpPath)
 	if err != nil {
 		return "", err

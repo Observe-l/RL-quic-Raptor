@@ -80,12 +80,6 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--curriculum-warmup-episodes", type=int, default=None, help="Warmup episodes before randomization")
 
     p.add_argument(
-        "--reward-delay-binary",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="If true, delay penalty is a hard threshold; else smooth ratio",
-    )
-    p.add_argument(
         "--reward-residual-binary",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -143,8 +137,6 @@ def main():
         env_overrides["randomize_net_params"] = bool(args.randomize_net_params)
     if args.curriculum_warmup_episodes is not None:
         env_overrides["curriculum_warmup_episodes"] = int(args.curriculum_warmup_episodes)
-    if args.reward_delay_binary is not None:
-        env_overrides["reward_delay_binary"] = bool(args.reward_delay_binary)
     if args.reward_residual_binary is not None:
         env_overrides["reward_residual_binary"] = bool(args.reward_residual_binary)
     if args.reward_w_arq is not None:

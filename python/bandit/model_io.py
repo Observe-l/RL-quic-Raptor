@@ -80,7 +80,6 @@ def save_checkpoint(
         "t": int(getattr(ctx, "_t", 0)),
         "ewma": {
             "goodput": float(getattr(ctx, "_ewma_goodput", 0.0)),
-            "d95": float(getattr(ctx, "_ewma_d95", 0.0)),
             "overhead": float(getattr(ctx, "_ewma_overhead", 0.0)),
             "nack": float(getattr(ctx, "_ewma_nack", 0.0)),
             "arq": float(getattr(ctx, "_ewma_arq", 0.0)),
@@ -92,7 +91,6 @@ def save_checkpoint(
         "hists": {
             "residual": list(getattr(ctx, "_residual_hist", [])),
             "timeout": list(getattr(ctx, "_timeout_hist", [])),
-            "delay_violate": list(getattr(ctx, "_delay_violate_hist", [])),
             "residual_value": list(getattr(ctx, "_residual_value_hist", [])),
         },
     }
@@ -159,7 +157,6 @@ def load_checkpoint(
             setattr(ctx, "_t", int(ctx_state.get("t", 0)))
             ewma = ctx_state.get("ewma", {}) if isinstance(ctx_state.get("ewma"), dict) else {}
             setattr(ctx, "_ewma_goodput", float(ewma.get("goodput", 0.0)))
-            setattr(ctx, "_ewma_d95", float(ewma.get("d95", 0.0)))
             setattr(ctx, "_ewma_overhead", float(ewma.get("overhead", 0.0)))
             setattr(ctx, "_ewma_nack", float(ewma.get("nack", 0.0)))
             setattr(ctx, "_ewma_arq", float(ewma.get("arq", 0.0)))
@@ -169,7 +166,6 @@ def load_checkpoint(
             hists = ctx_state.get("hists", {}) if isinstance(ctx_state.get("hists"), dict) else {}
             setattr(ctx, "_residual_hist", list(hists.get("residual", [])))
             setattr(ctx, "_timeout_hist", list(hists.get("timeout", [])))
-            setattr(ctx, "_delay_violate_hist", list(hists.get("delay_violate", [])))
             setattr(ctx, "_residual_value_hist", list(hists.get("residual_value", [])))
         except Exception:
             pass

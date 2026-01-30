@@ -269,7 +269,7 @@ def main() -> int:
         description="LinTS runner with external GE schedule (per-episode net params) and block-topk checkpointing"
     )
 
-    ap.add_argument("--steps", type=int, default=1000, help="number of bandit steps (transfers)")
+    ap.add_argument("--steps", type=int, default=50000, help="number of bandit steps (transfers)")
     ap.add_argument("--episode-steps", type=int, default=10, help="steps per episode (per GE sender)")
     ap.add_argument("--block-steps", type=int, default=1000, help="checkpointing block size in steps")
     ap.add_argument("--save-topk", type=int, default=3, help="save top-k models within each block")
@@ -309,20 +309,23 @@ def main() -> int:
 
     ap.add_argument("--rtt-ms", type=int, default=50)
     ap.add_argument("--bitrate-mbps", type=int, default=10)
-    ap.add_argument("--timeout-sec", type=int, default=15)
-    ap.add_argument("--train-file-bytes", type=int, default= 512 * 1024)
+    ap.add_argument("--timeout-sec", type=int, default=5)
+    ap.add_argument("--train-file-bytes", type=int, default= 128 * 1024)
 
+    ap.add_argument(
+        "--reward-w-goodput",
+        type=float,
+        default=1.0,
+        help="goodput reward weight (tp_term uses goodput/capacity)",
+    )
     ap.add_argument("--reward-w-arq", type=float, default=0.1)
     ap.add_argument(
         "--reward-w-overhead",
         type=float,
-        default=0.5,
+        default=0.3,
         help="overhead penalty weight (uses fec_overhead = tx_repair_symbols/tx_source_symbols)",
     )
     ap.add_argument("--reward-variant", type=str, default="qarc_v1")
-    # Delay shaping: use continuous penalty by default to avoid a hard threshold
-    # that can dominate the reward when d95 hovers around ddl.
-    ap.add_argument("--reward-delay-binary", type=int, default=0)
     ap.add_argument("--reward-residual-binary", type=int, default=1)
 
     ap.add_argument("--ctx-alpha", type=float, default=0.2)
@@ -448,9 +451,9 @@ def main() -> int:
         "train_file_bytes": int(args.train_file_bytes),
         "ddl_ms_values": list(action_set.ddl_ms_values),
         "reward_variant": str(args.reward_variant),
+        "reward_w_goodput": float(args.reward_w_goodput),
         "reward_w_arq": float(args.reward_w_arq),
         "reward_w_overhead": float(args.reward_w_overhead),
-        "reward_delay_binary": bool(int(args.reward_delay_binary)),
         "reward_residual_binary": bool(int(args.reward_residual_binary)),
         "log_obs_vec": False,
         # Avoid curriculum overriding our externally supplied schedule.
@@ -604,8 +607,12 @@ def main() -> int:
     block_dir0 = os.path.join(best_root, f"block_{int(current_block):04d}")
     best_in_block = _load_block_best(block_dir0)
 
+    max_invalid_skips = int(os.environ.get("BANDIT_INVALID_SKIP_CAP", "500"))
+    invalid_skips = 0
+
     try:
-        for t in range(int(start_t), int(total_steps)):
+        t = int(start_t)
+        while int(t) < int(total_steps):
             last_t = int(t)
 
             # Block book-keeping
@@ -632,6 +639,22 @@ def main() -> int:
             env_action = a.to_env_action()
 
             obs, reward, terminated, truncated, info = env.step(env_action)
+
+            # Ignore invalid transfers: do not feed them into the bandit update nor stats.
+            step_valid = True
+            try:
+                step_valid = bool(int((info or {}).get("step_valid", 1)))
+            except Exception:
+                step_valid = True
+            if not step_valid:
+                invalid_skips += 1
+                if invalid_skips > max_invalid_skips:
+                    raise RuntimeError(
+                        f"too many invalid transfers skipped (>{max_invalid_skips}); last info={info}"
+                    )
+                # Do not advance t.
+                continue
+            invalid_skips = 0
 
             ddl_ms_levels = list(action_set.ddl_ms_values)
             ddl_ms = int(ddl_ms_levels[int(a.ddl_idx)])
@@ -696,6 +719,9 @@ def main() -> int:
                         except Exception:
                             pass
                 sender_id, active_loss_mode, active_h_pct, active_k_pct = _episode_reset()
+
+            # Count only valid transfers.
+            t += 1
 
     except KeyboardInterrupt:
         pass

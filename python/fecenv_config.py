@@ -38,12 +38,9 @@ def build_ppo_config(env_name: str = "FECEnv-v0", env_config: Dict[str, Any] | N
     # Reward shaping (defaults closer to docs/main.pdf Eq. (25))
     env_config.setdefault("reward_variant", os.environ.get("REWARD_VARIANT", "qarc_v1"))
     env_config.setdefault("reward_w_goodput", float(os.environ.get("REWARD_W_GOODPUT", "1.0")))
-    env_config.setdefault("reward_w_delay", float(os.environ.get("REWARD_W_DELAY", "0.5")))
     env_config.setdefault("reward_w_residual", float(os.environ.get("REWARD_W_RESIDUAL", "1.0")))
-    env_config.setdefault("reward_w_overhead", float(os.environ.get("REWARD_W_OVERHEAD", "0.5")))
+    env_config.setdefault("reward_w_overhead", float(os.environ.get("REWARD_W_OVERHEAD", "0.3")))
     env_config.setdefault("reward_w_arq", float(os.environ.get("REWARD_W_ARQ", "0.1")))
-    # Continuous reward by default (no hard thresholds).
-    env_config.setdefault("reward_delay_binary", os.environ.get("REWARD_DELAY_BINARY", "0") not in ("0", "false", "False"))
     env_config.setdefault("reward_residual_binary", os.environ.get("REWARD_RESIDUAL_BINARY", "0") not in ("0", "false", "False"))
 
     env_config["result_dir"] = results_dir

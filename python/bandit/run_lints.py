@@ -87,11 +87,14 @@ def main() -> int:
     ap.add_argument("--timeout-sec", type=int, default=30)
     ap.add_argument("--train-file-bytes", type=int, default=1 * 1024 * 1024)
 
+    ap.add_argument(
+        "--reward-w-goodput",
+        type=float,
+        default=1.0,
+        help="goodput reward weight (tp_term uses goodput/capacity)",
+    )
     ap.add_argument("--reward-w-arq", type=float, default=0.1)
     ap.add_argument("--reward-variant", type=str, default="qarc_v1")
-    # Delay shaping: use continuous penalty by default to avoid a hard threshold
-    # that can dominate the reward when d95 hovers around ddl.
-    ap.add_argument("--reward-delay-binary", type=int, default=0)
     ap.add_argument("--reward-residual-binary", type=int, default=1)
 
     # Context builder
@@ -133,8 +136,8 @@ def main() -> int:
         "timeout_sec": int(args.timeout_sec),
         "train_file_bytes": int(args.train_file_bytes),
         "reward_variant": str(args.reward_variant),
+        "reward_w_goodput": float(args.reward_w_goodput),
         "reward_w_arq": float(args.reward_w_arq),
-        "reward_delay_binary": bool(int(args.reward_delay_binary)),
         "reward_residual_binary": bool(int(args.reward_residual_binary)),
         "log_obs_vec": False,
         # Bandit should only consume the environment observation (no debug info).
@@ -252,9 +255,13 @@ def main() -> int:
         except Exception:
             pass
 
+    max_invalid_skips = int(os.environ.get("BANDIT_INVALID_SKIP_CAP", "500"))
+    invalid_skips = 0
+
     last_t = int(start_t)
     try:
-        for t in range(int(start_t), int(start_t) + total_steps):
+        t = int(start_t)
+        while int(t) < int(start_t) + int(total_steps):
             last_t = int(t)
             x = ctx.get_context()
 
@@ -273,6 +280,23 @@ def main() -> int:
             env_action = a.to_env_action()
 
             obs, reward, terminated, truncated, info = env.step(env_action)
+
+            step_valid = True
+            try:
+                step_valid = bool(int((info or {}).get("step_valid", 1)))
+            except Exception:
+                step_valid = True
+            if not step_valid:
+                invalid_skips += 1
+                if invalid_skips > max_invalid_skips:
+                    raise RuntimeError(
+                        f"too many invalid transfers skipped (>{max_invalid_skips}); last info={info}"
+                    )
+                # Reset and retry without advancing t.
+                env.reset()
+                continue
+            invalid_skips = 0
+
             assert terminated or truncated  # env is configured with episode_step=1
 
             # Convert ddl_idx back to ddl_ms for context update
@@ -312,6 +336,9 @@ def main() -> int:
 
             # Save top-k models by reward.
             maybe_save_topk(reward_val=float(reward), step_t=int(t))
+
+            # Count only valid transfers.
+            t += 1
     except KeyboardInterrupt:
         # Keep whatever has been saved so far.
         pass

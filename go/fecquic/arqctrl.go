@@ -10,6 +10,7 @@ const (
 	arqMsgACK  uint8 = 1
 	arqMsgNACK uint8 = 2
 	arqMsgPROG uint8 = 3
+	arqMsgDONE uint8 = 4 // receiver completed file (EOF-like signal)
 )
 
 type AckSuccess struct {
@@ -28,6 +29,26 @@ type NackNeedMore struct {
 	RxUnique       uint16
 	RecommendExtra uint16
 	Reason         uint8 // 0=DDL,1=CAP,2=OTHER
+}
+
+// DoneFile indicates the receiver has delivered the full file.
+// This is sent on the reliable control uni-stream from server->client.
+type DoneFile struct {
+	FileID  uint32
+	Written uint64 // bytes delivered (best-effort, for diagnostics)
+	Ok      uint8  // 1=success, 0=failure
+}
+
+func writeDone(w io.Writer, d DoneFile) error {
+	if _, err := w.Write([]byte{arqMsgDONE}); err != nil {
+		return err
+	}
+	var b [13]byte
+	binary.LittleEndian.PutUint32(b[0:4], d.FileID)
+	binary.LittleEndian.PutUint64(b[4:12], d.Written)
+	b[12] = d.Ok
+	_, err := w.Write(b[:])
+	return err
 }
 
 func writeAck(w io.Writer, a AckSuccess) error {
@@ -103,6 +124,17 @@ func readCtrl(r io.Reader) (uint8, interface{}, error) {
 			Reason:         b[14],
 		}
 		return t[0], n, nil
+	case arqMsgDONE:
+		var b [13]byte
+		if _, err := io.ReadFull(r, b[:]); err != nil {
+			return 0, nil, err
+		}
+		d := DoneFile{
+			FileID:  binary.LittleEndian.Uint32(b[0:4]),
+			Written: binary.LittleEndian.Uint64(b[4:12]),
+			Ok:      b[12],
+		}
+		return t[0], d, nil
 	default:
 		return 0, nil, fmt.Errorf("unknown ctrl type %d", t[0])
 	}

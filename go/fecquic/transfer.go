@@ -1,6 +1,7 @@
 package fecquic
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
@@ -33,12 +34,16 @@ const (
 
 // SendOptions control ClientSendFile behavior.
 type SendOptions struct {
-	K, N, L       int
-	InsecureTLS   bool
-	DropProb      float64
-	Seed          int64
-	PaceEach      time.Duration
-	BlockPause    time.Duration
+	K, N, L     int
+	InsecureTLS bool
+	DropProb    float64
+	Seed        int64
+	PaceEach    time.Duration
+	BlockPause  time.Duration
+	// RxDDL is the receiver decode deadline per block.
+	// It is sent once in the FileHeader and applied by the server.
+	// 0 means "not specified".
+	RxDDL         time.Duration
 	WarnDgramSize int           // bytes; 0 disables
 	PostWait      time.Duration // linger before closing
 	AckEvery      int           // write 1B on a stream every N datagrams (ack-eliciting); <=0 uses default
@@ -54,6 +59,9 @@ type SendOptions struct {
 
 // ClientSendFile connects and sends a file using QFEC header + RaptorQ symbols over datagrams.
 func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptions) error {
+	// Phase timing (client-side)
+	startTotal := time.Now()
+	var dialDur, hdrDur, sendBlocksDur, arqDrainDur, txStatsDur, postWaitDur, keepStopDur time.Duration
 	// Optional pacing (set via -pace / PACE_US)
 	var pc *pacer
 	if opts.PaceEach > 0 {
@@ -96,14 +104,18 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		return err
 	}
 	defer f.Close()
-	// Precompute hash and size
-	sum, size, err := ComputeSHA256(f)
+	// Match raw QUIC behavior: do not precompute checksums on the sender.
+	// File integrity is verified by the experiment harness (md5) on the final output.
+	st, err := f.Stat()
 	if err != nil {
 		return err
 	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return err
+	sz := st.Size()
+	if sz < 0 {
+		return errors.New("negative file size")
 	}
+	size := uint64(sz)
+	var sum [32]byte // zero => receiver will skip SHA verification
 
 	tlsConf := &tls.Config{InsecureSkipVerify: opts.InsecureTLS, NextProtos: []string{alpn}}
 	qconf := &quic.Config{
@@ -121,18 +133,24 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		InitialStreamReceiveWindow:     8 * 1024 * 1024,
 		InitialConnectionReceiveWindow: 16 * 1024 * 1024,
 	}
+	t0 := time.Now()
 	conn, err := quic.DialAddr(ctx, addr, tlsConf, qconf)
 	if err != nil {
 		return err
 	}
+	dialDur = time.Since(t0)
 	defer conn.CloseWithError(0, "done")
 
 	// Send header on a stream
+	t0 = time.Now()
 	str, err := conn.OpenStreamSync(ctx)
 	if err != nil {
 		return err
 	}
 	hdr := FileHeader{Version: 1, FileSize: uint64(size), SHA256: sum, ChunkL: uint32(L)}
+	if opts.RxDDL > 0 {
+		hdr.RxDDLMS = uint32(opts.RxDDL.Milliseconds())
+	}
 	if _, err := str.Write(hdr.MarshalBinary()); err != nil {
 		return err
 	}
@@ -153,6 +171,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	if err := str.Close(); err != nil {
 		return err
 	}
+	hdrDur = time.Since(t0)
 
 	// Open a keepalive stream to periodically send tiny bytes (ack-eliciting)
 	// so that the connection doesn't go idle when only sending DATAGRAM frames.
@@ -266,6 +285,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	}()
 
 	// Send symbols per block
+	sendBlocksStart := time.Now()
 	buf := make([]byte, K*L)
 	blockID := 0
 	// If ARQ window enforcement times out once, disable it for the remainder to avoid per-block 5s stalls
@@ -290,131 +310,153 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	active := make(map[uint16]*blockTx)
 	cond := sync.NewCond(txMu)
 
-	// Control reader: accept server control uni stream and react to NACK/ACK
-	if opts.UseARQ {
-		go func() {
-			for {
-				us, err := conn.AcceptUniStream(ctx)
-				if err != nil {
-					return
-				}
-				// one stream carrying a sequence of control messages
-				go func(rs *quic.ReceiveStream) {
-					defer rs.CancelRead(0)
-					for {
-						t, msg, err := readCtrl(rs)
-						if err != nil {
+	// DONE ACK (server->client) via control uni-stream.
+	// Enabled by default; disable with QUIC_FEC_WAIT_DONE=0.
+	waitDone := os.Getenv("QUIC_FEC_WAIT_DONE") != "0"
+	doneMsgCh := make(chan DoneFile, 1)
+	var doneSeen sync.Once
+
+	// Control reader: accept server control uni stream(s) and react to NACK/ACK/DONE.
+	go func() {
+		for {
+			us, err := conn.AcceptUniStream(ctx)
+			if err != nil {
+				return
+			}
+			// one stream carrying a sequence of control messages
+			go func(rs *quic.ReceiveStream) {
+				defer rs.CancelRead(0)
+				for {
+					t, msg, err := readCtrl(rs)
+					if err != nil {
+						return
+					}
+					switch t {
+					case arqMsgDONE:
+						if !waitDone {
 							return
 						}
-						switch t {
-						case arqMsgNACK:
-							n := msg.(NackNeedMore)
-							bid := uint16(n.ClusterID)
-							txMu.Lock()
-							bt := active[bid]
-							txMu.Unlock()
-							if bt == nil {
-								continue
+						d := msg.(DoneFile)
+						doneSeen.Do(func() {
+							select {
+							case doneMsgCh <- d:
+							default:
 							}
-							// ignore stale attempts (process each attempt index once)
-							if int(n.AttemptIdx) <= bt.attempt {
-								continue
-							}
-							// If we've reached the maximum number of ARQ attempts for this block, give up and free a window slot.
-							if opts.MaxAttempts > 0 && int(n.AttemptIdx) >= opts.MaxAttempts {
-								txMu.Lock()
-								delete(active, bid)
-								txMu.Unlock()
-								cond.Broadcast()
-								fmt.Fprintf(os.Stderr, "[arq] giveup block=%d at attempt=%d (max=%d)\n", bid, n.AttemptIdx, opts.MaxAttempts)
-								continue
-							}
-							toSend := int(n.RecommendExtra)
-							if toSend <= 0 {
-								toSend = 0
-							}
-							// ΔR policy: max(rec_extra, R_step, ceil(alpha * deficit))
-							deficit := 0
-							if bt.K-int(n.RxUnique) > 0 {
-								deficit = bt.K - int(n.RxUnique)
-							}
-							rstep := opts.RStep
-							if rstep <= 0 {
-								rstep = 4
-							}
-							alpha := opts.Alpha
-							if alpha <= 0 {
-								alpha = 0.6
-							}
-							cand := int(alpha*float64(deficit) + 0.9999)
-							if cand < rstep {
-								cand = rstep
-							}
-							if cand < toSend {
-								cand = toSend
-							}
-							if cand <= 0 {
-								cand = 1
-							}
-							if cand == 0 {
-								// nothing to append
-								continue
-							}
-							// send cand fresh repairs
-							for i := 0; i < cand; i++ {
-								esi := bt.nextESI
-								payload := bt.enc.GenSymbol(uint32(esi))
-								// Avoid per-packet allocation: reuse a fixed-size buffer.
-								// SendDatagram copies the slice before returning, so reuse is safe.
-								b := make([]byte, fecwire.HeaderLen+bt.L)
-								pay := b[fecwire.HeaderLen:]
-								if len(payload) == bt.L {
-									copy(pay, payload)
-								} else {
-									clear(pay)
-									copy(pay, payload)
-								}
-								// Guard N to avoid overflow and unrealistic growth
-								advN := minInt(255, bt.K+bt.repairsOut+1)
-								h := fecwire.FECHeader{
-									Version:    1,
-									Scheme:     fecwire.SchemeRaptorQ,
-									BlockID:    bid,
-									N:          uint8(advN),
-									K:          uint8(bt.K),
-									SymID:      uint8(esi),
-									PayloadLen: uint32(bt.L),
-								}
-								h.MarshalBinary(b[:fecwire.HeaderLen])
-								if err := sendSymbol(b); err == nil {
-									sentDgrams++
-									sentBytes += int64(len(b))
-									totalSymbols++
-									totalRepairs++
-								} else {
-									sendErrs++
-								}
-								bt.nextESI++
-								bt.repairsOut++
-								if pc != nil {
-									pc.AfterSend()
-								}
-							}
-							bt.attempt = int(n.AttemptIdx)
-							totalAttempts++
-						case arqMsgACK:
-							a := msg.(AckSuccess)
-							bid := uint16(a.ClusterID)
+						})
+						return
+					case arqMsgNACK:
+						if !opts.UseARQ {
+							continue
+						}
+						n := msg.(NackNeedMore)
+						bid := uint16(n.ClusterID)
+						txMu.Lock()
+						bt := active[bid]
+						txMu.Unlock()
+						if bt == nil {
+							continue
+						}
+						// ignore stale attempts (process each attempt index once)
+						if int(n.AttemptIdx) <= bt.attempt {
+							continue
+						}
+						// If we've reached the maximum number of ARQ attempts for this block, give up and free a window slot.
+						if opts.MaxAttempts > 0 && int(n.AttemptIdx) >= opts.MaxAttempts {
 							txMu.Lock()
 							delete(active, bid)
 							txMu.Unlock()
 							cond.Broadcast()
+							fmt.Fprintf(os.Stderr, "[arq] giveup block=%d at attempt=%d (max=%d)\n", bid, n.AttemptIdx, opts.MaxAttempts)
+							continue
 						}
+						toSend := int(n.RecommendExtra)
+						if toSend <= 0 {
+							toSend = 0
+						}
+						// ΔR policy: max(rec_extra, R_step, ceil(alpha * deficit))
+						deficit := 0
+						if bt.K-int(n.RxUnique) > 0 {
+							deficit = bt.K - int(n.RxUnique)
+						}
+						rstep := opts.RStep
+						if rstep <= 0 {
+							rstep = 4
+						}
+						alpha := opts.Alpha
+						if alpha <= 0 {
+							alpha = 0.6
+						}
+						cand := int(alpha*float64(deficit) + 0.9999)
+						if cand < rstep {
+							cand = rstep
+						}
+						if cand < toSend {
+							cand = toSend
+						}
+						if cand <= 0 {
+							cand = 1
+						}
+						if cand == 0 {
+							// nothing to append
+							continue
+						}
+						// send cand fresh repairs
+						for i := 0; i < cand; i++ {
+							esi := bt.nextESI
+							payload := bt.enc.GenSymbol(uint32(esi))
+							// Avoid per-packet allocation: reuse a fixed-size buffer.
+							// SendDatagram copies the slice before returning, so reuse is safe.
+							b := make([]byte, fecwire.HeaderLen+bt.L)
+							pay := b[fecwire.HeaderLen:]
+							if len(payload) == bt.L {
+								copy(pay, payload)
+							} else {
+								clear(pay)
+								copy(pay, payload)
+							}
+							// Guard N to avoid overflow and unrealistic growth
+							advN := minInt(255, bt.K+bt.repairsOut+1)
+							h := fecwire.FECHeader{
+								Version:    1,
+								Scheme:     fecwire.SchemeRaptorQ,
+								BlockID:    bid,
+								N:          uint8(advN),
+								K:          uint8(bt.K),
+								SymID:      uint8(esi),
+								PayloadLen: uint32(bt.L),
+							}
+							h.MarshalBinary(b[:fecwire.HeaderLen])
+							if err := sendSymbol(b); err == nil {
+								sentDgrams++
+								sentBytes += int64(len(b))
+								totalSymbols++
+								totalRepairs++
+							} else {
+								sendErrs++
+							}
+							bt.nextESI++
+							bt.repairsOut++
+							if pc != nil {
+								pc.AfterSend()
+							}
+						}
+						bt.attempt = int(n.AttemptIdx)
+						totalAttempts++
+					case arqMsgACK:
+						if !opts.UseARQ {
+							continue
+						}
+						a := msg.(AckSuccess)
+						bid := uint16(a.ClusterID)
+						txMu.Lock()
+						delete(active, bid)
+						txMu.Unlock()
+						cond.Broadcast()
 					}
-				}(us)
-			}
-		}()
-	}
+				}
+			}(us)
+		}
+	}()
 
 	for {
 		n, err := io.ReadFull(f, buf)
@@ -586,11 +628,13 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 			buf = buf[:K*L]
 		}
 	}
+	sendBlocksDur = time.Since(sendBlocksStart)
 	// If ARQ is enabled, drain outstanding blocks before closing.
 	// NOTE: Do not tie reliability to congestion control mode. Skipping this drain can
 	// cause sha256 mismatch / residual erasures when the client exits before ARQ completes.
 	skipDrain := os.Getenv("QUIC_FEC_SKIP_ARQ_DRAIN") == "1"
 	if opts.UseARQ && !skipDrain {
+		drainStart := time.Now()
 		// Wait until all active blocks have been ACKed or until a cap.
 		// Base cap defaults to max(PostWait, 15s).
 		// This prevents premature close under loss where ARQ may need multiple RTTs.
@@ -618,8 +662,10 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 			}
 		}
 		if drainCap <= 0 {
-			// Explicitly disabled.
-			return nil
+			// Explicitly disabled: skip drain but keep the connection alive
+			// to allow stats and DONE ACK reception.
+			arqDrainDur = time.Since(drainStart)
+			goto afterArqDrain
 		}
 		deadline := time.Now().Add(drainCap)
 		// Poll with short sleeps to avoid indefinite waits on missing broadcasts.
@@ -632,10 +678,14 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
+		arqDrainDur = time.Since(drainStart)
 	}
+
+afterArqDrain:
 	// Send sender-side symbol counters to the server so it can compute fec_overhead.
 	// This is done after ARQ drain so counts reflect all appended repairs.
 	{
+		tStatsStart := time.Now()
 		txSourceSymbols := totalSymbols - totalRepairs
 		if txSourceSymbols < 0 {
 			txSourceSymbols = 0
@@ -653,15 +703,32 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 			_, _ = us.Write(buf)
 			_ = us.Close()
 		}
+		txStatsDur = time.Since(tStatsStart)
+	}
+
+	// Wait for receiver DONE ACK (server-driven completion) to avoid time-based tail waits.
+	// This is analogous to quic-raw's 1-byte completion ACK.
+	if waitDone {
+		t0 = time.Now()
+		select {
+		case d := <-doneMsgCh:
+			fmt.Fprintf(os.Stderr, "[fec-client-done] wait_ms=%d ok=%d written=%d\n", time.Since(t0).Milliseconds(), d.Ok, d.Written)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	// Optional tail wait after ARQ drain
 	if opts.PostWait > 0 && !skipDrain {
+		t0 = time.Now()
 		time.Sleep(opts.PostWait)
+		postWaitDur = time.Since(t0)
 	}
 	// stop live printer and keepalive goroutine after ARQ drain
+	t0 = time.Now()
 	close(liveStop)
 	close(kaStop)
 	<-keepDone
+	keepStopDur = time.Since(t0)
 	// Final stats
 	dur := time.Since(start).Seconds()
 	if dur < 1e-6 {
@@ -682,10 +749,13 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		fmt.Fprintf(os.Stderr, "[arq-stats] clusters=%d attempts=%d tx_total_symbols=%d tx_source_symbols=%d tx_repairs=%d fec_overhead=%.3f\n",
 			blockID, totalAttempts, totalSymbols, txSourceSymbols, totalRepairs, overhead)
 	}
+	fmt.Fprintf(os.Stderr, "[fec-client-stages] dial_ms=%d header_ms=%d send_blocks_ms=%d arq_drain_ms=%d tx_stats_ms=%d post_wait_ms=%d keep_stop_ms=%d total_ms=%d\n",
+		dialDur.Milliseconds(), hdrDur.Milliseconds(), sendBlocksDur.Milliseconds(), arqDrainDur.Milliseconds(), txStatsDur.Milliseconds(), postWaitDur.Milliseconds(), keepStopDur.Milliseconds(), time.Since(startTotal).Milliseconds())
 	return nil
 }
 
-// ServerRecvFile listens for a connection on ln, receives the file, verifies SHA256 and writes to outDir.
+// ServerRecvFile listens for a connection on ln, receives the file and writes to outDir.
+// If the sender provided a non-zero SHA256 in the header, it is verified during finalize.
 // Returns the path to the stored file.
 func ServerRecvFile(ctx context.Context, ln *quic.Listener, outDir string) (string, error) {
 	return ServerRecvFileWithRX(ctx, ln, outDir, RXOptions{})
@@ -730,6 +800,10 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 		}
 		if err := hdr.UnmarshalBinary(hdrBytes); err != nil {
 			return "", err
+		}
+		// Client-controlled receiver deadline: when present, override RXOptions.DDL.
+		if hdr.RxDDLMS > 0 {
+			rx.DDL = time.Duration(hdr.RxDDLMS) * time.Millisecond
 		}
 		// Try read optional filename (u16 len + bytes); safe if EOF
 		var lb [2]byte
@@ -944,7 +1018,7 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 	// wait for reception to complete
 	<-doneCh
 	// E2E completion time: transport + retransmissions + decode only.
-	// IMPORTANT: log this BEFORE closeAndFinalize(), which includes disk IO and SHA verification.
+	// IMPORTANT: log this BEFORE closeAndFinalize(), which may include disk IO (and optional SHA verification).
 	e2eDur := time.Since(recvStart)
 	e2eOk := 0
 	if rxm != nil && rxm.delivered.Load() >= hdr.FileSize {
@@ -958,6 +1032,23 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 		writtenNow = rxm.delivered.Load()
 	}
 	fmt.Fprintf(os.Stderr, "[server-e2e] e2e_ms=%d ok=%d written=%d/%d\n", e2eDur.Milliseconds(), e2eOk, writtenNow, hdr.FileSize)
+	// Server->client DONE ACK: best-effort notify sender that receive/decode finished.
+	// Use the same buffered control stream writer to avoid interleaving with ACK/NACK.
+	if rxm != nil && rxm.ctrlOut != nil {
+		var b bytes.Buffer
+		_ = writeDone(&b, DoneFile{FileID: 0, Written: writtenNow, Ok: uint8(e2eOk)})
+		payload := b.Bytes()
+		select {
+		case rxm.ctrlOut <- payload:
+			// ok
+		default:
+			// avoid blocking; we only need best-effort delivery
+			select {
+			case rxm.ctrlOut <- payload:
+			case <-time.After(200 * time.Millisecond):
+			}
+		}
+	}
 	// Wait briefly for the client to report sender-side tx symbol counts (used for fec_overhead).
 	// Without this grace period, the stats stream can arrive just after completion and be missed.
 	if rxm != nil && rxm.met != nil {
@@ -970,6 +1061,16 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 	close(progStop)
 	finalPath, err := rxm.closeAndFinalize(hdr.SHA256)
 	if err != nil {
+		// Best-effort DONE ACK with ok=0 on failure.
+		if rxm != nil && rxm.ctrlOut != nil {
+			var b bytes.Buffer
+			_ = writeDone(&b, DoneFile{FileID: 0, Written: writtenNow, Ok: 0})
+			payload := b.Bytes()
+			select {
+			case rxm.ctrlOut <- payload:
+			default:
+			}
+		}
 		// On failure (e.g., SHA mismatch / residual erasures), still emit a best-effort observation
 		// so external harnesses don't stall waiting for metrics.
 		if rxm != nil && rxm.met != nil {

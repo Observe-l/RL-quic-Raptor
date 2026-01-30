@@ -83,4 +83,6 @@ Command
 python3 python/experiments/compare_ge_steady_rp_paper_figs.py --bandit-model-prefix python/results/bandit-ge-run-20260123-220614/best_models/block_0007/model_t7063_r0p877026 --ge-key GE_steady_rp --sender-ids all --bitrate-mbps 10 --rtt-ms 50 --reps 10 --out-dir python/results/paper-delay-rtt50-64kb --which delay --delay-file-bytes 65536
 
 python3 python/experiments/replot_delay_cdf.py --in-dir python/results/paper-delay-rtt50 --xmax-ms 500 --out fig_delay_cdf.pdf && ls -l python/results/paper-delay-rtt50/fig_delay_cdf.pdf python/results/paper-delay-rtt50/fig_delay_cdf.png
+
+python3 python/bandit/run_lints_ge_schedule.py --reward-w-goodput 1.0 --reward-w-overhead 0.3 --result-dir python/results/bandit-ge-rg1.0-ro0.3
 ```

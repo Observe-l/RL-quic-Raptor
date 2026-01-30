@@ -10,6 +10,13 @@ BIN_DIR="$ROOT/go/bin"
 NS=${NS:-qns}
 PORT=${PORT:-45301}
 
+# Parallel-safe overrides (used by Python training to run multiple workers concurrently).
+VETH_HOST=${VETH_HOST:-veth0}
+VETH_NS=${VETH_NS:-veth1}
+HOST_IP=${HOST_IP:-10.10.0.1/24}
+NS_IP=${NS_IP:-10.10.0.2/24}
+SRV_IP=${SRV_IP:-${NS_IP%%/*}}
+
 BITRATE_MBPS=${BITRATE_MBPS:-50}
 RTT_MS=${RTT_MS:-20}
 LOSS_PCT=${LOSS_PCT:-0}
@@ -32,7 +39,7 @@ if [[ ! -f "$FILE" ]]; then
   head -c $((3*1024*1024)) </dev/urandom >"$FILE"
 fi
 
-"$ROOT/scripts/netns_reset.sh" "$NS"
+VETH_HOST="$VETH_HOST" VETH_NS="$VETH_NS" HOST_IP="$HOST_IP" NS_IP="$NS_IP" "$ROOT/scripts/netns_reset.sh" "$NS"
 
 # Build binaries if missing or stale
 NEED_BUILD=0
@@ -49,7 +56,7 @@ fi
 
 # Configure qdiscs: same as quicfec_run_once.sh
 half=$(( RTT_MS / 2 ))
-sudo tc qdisc del dev veth0 root 2>/dev/null || true
+sudo tc qdisc del dev "$VETH_HOST" root 2>/dev/null || true
 NETEM_ARGS=(delay ${half}ms)
 case "$LOSS_MODE" in
   none)
@@ -65,16 +72,30 @@ case "$LOSS_MODE" in
   ""|*)
     NETEM_ARGS+=(loss ${LOSS_PCT}%) ;;
 esac
-sudo tc qdisc replace dev veth0 root handle 1: tbf rate ${RATE} burst 32kb latency 400ms
-sudo tc qdisc replace dev veth0 parent 1:1 handle 10: netem "${NETEM_ARGS[@]}"
-sudo ip netns exec "$NS" tc qdisc del dev veth1 root 2>/dev/null || true
-sudo ip netns exec "$NS" tc qdisc replace dev veth1 root netem delay ${half}ms
+sudo tc qdisc replace dev "$VETH_HOST" root handle 1: tbf rate ${RATE} burst 32kb latency 400ms
+sudo tc qdisc replace dev "$VETH_HOST" parent 1:1 handle 10: netem "${NETEM_ARGS[@]}"
+sudo ip netns exec "$NS" tc qdisc del dev "$VETH_NS" root 2>/dev/null || true
+sudo ip netns exec "$NS" tc qdisc replace dev "$VETH_NS" root netem delay ${half}ms
 
 # Run server
 SRV_LOG=$(mktemp -t quic_raw_srv.XXXXXX.log)
 rm -f "$OUT_DIR/$(basename "$FILE").recv" 2>/dev/null || true
-sudo ip netns exec "$NS" bash -lc "ulimit -n 1048576; '$BIN_DIR/quicraw-server' -addr 10.10.0.2:$PORT -out '$OUT_DIR' -timeout 45s" >"$SRV_LOG" 2>&1 & SP=$!
-sleep 0.1
+sudo ip netns exec "$NS" bash -lc "ulimit -n 1048576; '$BIN_DIR/quicraw-server' -addr ${SRV_IP}:$PORT -out '$OUT_DIR' -timeout 45s" >"$SRV_LOG" 2>&1 & SP=$!
+
+# Wait for server UDP socket to be ready (best-effort). A fixed sleep can be flaky under load.
+ready=0
+if command -v ss >/dev/null 2>&1; then
+  for _ in $(seq 1 30); do
+    if sudo ip netns exec "$NS" ss -lunH 2>/dev/null | awk '{print $5}' | grep -q ":$PORT$"; then
+      ready=1
+      break
+    fi
+    sleep 0.02
+  done
+fi
+if [[ "$ready" != "1" ]]; then
+  sleep 0.1
+fi
 
 # Run client
 CLI_LOG=$(mktemp -t quic_raw_cli.XXXXXX.log)
@@ -83,30 +104,34 @@ QUIC_FEC_CC_BYPASS=${QUIC_FEC_CC_BYPASS:-0} \
 QUIC_FEC_CC_ALGO=${QUIC_FEC_CC_ALGO:-} \
 TIMED_OUT=0
 
-# Byte counters on host veth0 (network-layer; includes headers).
+# Byte counters on host veth (network-layer; includes headers).
 TX0=0; RX0=0
-if [[ -r /sys/class/net/veth0/statistics/tx_bytes ]]; then
-  TX0=$(cat /sys/class/net/veth0/statistics/tx_bytes 2>/dev/null || echo 0)
-  RX0=$(cat /sys/class/net/veth0/statistics/rx_bytes 2>/dev/null || echo 0)
+if [[ -r "/sys/class/net/${VETH_HOST}/statistics/tx_bytes" ]]; then
+  TX0=$(cat "/sys/class/net/${VETH_HOST}/statistics/tx_bytes" 2>/dev/null || echo 0)
+  RX0=$(cat "/sys/class/net/${VETH_HOST}/statistics/rx_bytes" 2>/dev/null || echo 0)
 fi
 if command -v timeout >/dev/null 2>&1; then
   timeout --signal=KILL ${TIMEOUT_S}s \
-    "$BIN_DIR/quicraw-client" -addr 10.10.0.2:$PORT -file "$FILE" -timeout ${TIMEOUT_S}s -measure-delay=true -packet-bytes 1200 \
+    "$BIN_DIR/quicraw-client" -addr ${SRV_IP}:$PORT -file "$FILE" -timeout ${TIMEOUT_S}s -measure-delay=true -packet-bytes 1200 \
     >"$CLI_LOG" 2>&1 || RC=$?
 else
-  "$BIN_DIR/quicraw-client" -addr 10.10.0.2:$PORT -file "$FILE" -timeout ${TIMEOUT_S}s -measure-delay=true -packet-bytes 1200 \
+  "$BIN_DIR/quicraw-client" -addr ${SRV_IP}:$PORT -file "$FILE" -timeout ${TIMEOUT_S}s -measure-delay=true -packet-bytes 1200 \
     >"$CLI_LOG" 2>&1 || RC=$?
 fi
 RC=${RC:-0}
+CLIENT_OK=1
+if [[ "$RC" != "0" ]]; then
+  CLIENT_OK=0
+fi
 if [[ "$RC" == "124" || "$RC" == "137" ]]; then
   TIMED_OUT=1
 fi
 END=$(date +%s%N)
 
 TX1=$TX0; RX1=$RX0
-if [[ -r /sys/class/net/veth0/statistics/tx_bytes ]]; then
-  TX1=$(cat /sys/class/net/veth0/statistics/tx_bytes 2>/dev/null || echo "$TX0")
-  RX1=$(cat /sys/class/net/veth0/statistics/rx_bytes 2>/dev/null || echo "$RX0")
+if [[ -r "/sys/class/net/${VETH_HOST}/statistics/tx_bytes" ]]; then
+  TX1=$(cat "/sys/class/net/${VETH_HOST}/statistics/tx_bytes" 2>/dev/null || echo "$TX0")
+  RX1=$(cat "/sys/class/net/${VETH_HOST}/statistics/rx_bytes" 2>/dev/null || echo "$RX0")
 fi
 TX_BYTES=$(( TX1 - TX0 ))
 RX_BYTES=$(( RX1 - RX0 ))
@@ -152,7 +177,29 @@ if [[ "$TIMED_OUT" == "1" ]]; then
   MD5_OK=0
 fi
 
-echo "[run] proto=quic_raw bitrate=${BITRATE_MBPS}Mbps rtt=${RTT_MS}ms loss=${LOSS_PCT}% dur_ms=${DUR_MS} timed_out=${TIMED_OUT} md5_ok=${MD5_OK} s_mbps=${S_MBPS} file_bytes=${FILE_SIZE} tx_bytes=${TX_BYTES} rx_bytes=${RX_BYTES}" >&2
+# Client wall duration (includes dial/open/header/send/ack; does not include md5 below).
+DUR_MS_CLIENT=$(( (END-START)/1000000 ))
+
+# Prefer server-side duration when available.
+SRV_LINE=$(grep -E '^\[raw-server\] ' "$SRV_LOG" | tail -n1 || true)
+DUR_MS_SERVER=$(echo "$SRV_LINE" | sed -n 's/.*dur_ms=\([0-9]\+\).*/\1/p')
+if [[ -z "$DUR_MS_SERVER" ]]; then
+  DUR_MS_SERVER=$DUR_MS_CLIENT
+fi
+
+# Extract client total_ms (more detailed phase timing) when available.
+STAGES_LINE=$(grep -E '^\[raw-client-stages\] ' "$CLI_LOG" | tail -n1 || true)
+TOTAL_MS=$(echo "$STAGES_LINE" | sed -n 's/.*total_ms=\([0-9]\+\).*/\1/p')
+if [[ -n "$TOTAL_MS" ]]; then
+  DUR_MS_CLIENT=$TOTAL_MS
+fi
+
+LOSS_TAG="${LOSS_PCT}%"
+if [[ -n "${LOSS_MODE}" ]]; then
+  LOSS_TAG="${LOSS_MODE}"
+fi
+
+echo "[run] proto=quic_raw bitrate=${BITRATE_MBPS}Mbps rtt=${RTT_MS}ms loss=${LOSS_TAG} dur_ms=${DUR_MS_SERVER} dur_ms_client=${DUR_MS_CLIENT} timed_out=${TIMED_OUT} client_ok=${CLIENT_OK} client_rc=${RC} md5_ok=${MD5_OK} s_mbps=${S_MBPS} file_bytes=${FILE_SIZE} tx_bytes=${TX_BYTES} rx_bytes=${RX_BYTES}" >&2
 
 # Emit AoI-style average one-way delay from server output.
 DELAY_LINE=$(grep -E '^\[delay\] ' "$SRV_LOG" | tail -n1 || true)
