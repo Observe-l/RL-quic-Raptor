@@ -84,5 +84,5 @@ python3 python/experiments/compare_ge_steady_rp_paper_figs.py --bandit-model-pre
 
 python3 python/experiments/replot_delay_cdf.py --in-dir python/results/paper-delay-rtt50 --xmax-ms 500 --out fig_delay_cdf.pdf && ls -l python/results/paper-delay-rtt50/fig_delay_cdf.pdf python/results/paper-delay-rtt50/fig_delay_cdf.png
 
-python3 python/bandit/run_lints_ge_schedule.py --reward-w-goodput 1.0 --reward-w-overhead 0.3 --result-dir python/results/bandit-ge-rg1.0-ro0.3
+python3 python/bandit/run_lints_ge_schedule.py --reward-w-goodput 1.0 --reward-w-overhead 0.8 --result-dir python/results/bandit-ge-rg1.0-ro0.8
 ```

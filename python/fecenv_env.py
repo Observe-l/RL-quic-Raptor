@@ -548,11 +548,16 @@ class FecEnv(gym.Env):
         self._capacity_mbps = float(self._bitrate_mbps)
         self._result_dir_hint = cfg.get("result_dir")
 
-        # Logging controls (step_metrics.json is JSON)
+        # Logging controls
         # - log_obs_vec: large; disable by default to avoid bloating logs.
         # - log_raw_obs_full: deprecated; step_metrics.json always logs policy obs only.
         self._log_obs_vec = bool(cfg.get("log_obs_vec", False))
         self._log_raw_obs_full = bool(cfg.get("log_raw_obs_full", False))
+        # NOTE: These JSON-lines logs are useful for debugging, but they tend to
+        # clutter results when using bandit runners that already write
+        # bandit_metrics.json.
+        self._log_step_metrics = bool(cfg.get("log_step_metrics", False))
+        self._log_episode_metrics = bool(cfg.get("log_episode_metrics", False))
 
         # Runner
         # Default training file size: 1 MiB
@@ -792,33 +797,36 @@ class FecEnv(gym.Env):
             or self._result_dir_hint
             or os.path.join(os.path.dirname(__file__), "results")
         )
+
+        # Always return raw observations to the caller (useful for smoke tests),
+        # even if we disable file logging.
         try:
-            os.makedirs(dest_dir, exist_ok=True)
-            # Keep JSON format (one JSON object per line) but write to the
-            # requested filename.
-            log_path = os.path.join(dest_dir, "step_metrics.json")
-
-            # Always log only the observations used by the policy.
-            raw_obs_out = {k: obs_dict.get(k, 0.0) for k in self._obs_keys}
-
-            # Return raw observations to the caller as well (useful for smoke tests).
-            info["raw_obs"] = raw_obs_out
-
-            rec = {
-                "t": int(self._global_step),
-                "epi": self.epi,
-                "reward": float(reward),
-                "raw_obs": raw_obs_out,
-                **info,
-            }
-
-            if self._log_obs_vec:
-                rec["obs_vec"] = [float(x) for x in obs_vec.tolist()]
-
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec) + "\n")
+            info["raw_obs"] = {k: obs_dict.get(k, 0.0) for k in self._obs_keys}
         except Exception:
             pass
+
+        if self._log_step_metrics:
+            try:
+                os.makedirs(dest_dir, exist_ok=True)
+                # Keep JSON format (one JSON object per line) but write to the
+                # requested filename.
+                log_path = os.path.join(dest_dir, "step_metrics.json")
+
+                rec = {
+                    "t": int(self._global_step),
+                    "epi": self.epi,
+                    "reward": float(reward),
+                    "raw_obs": info.get("raw_obs"),
+                    **info,
+                }
+
+                if self._log_obs_vec:
+                    rec["obs_vec"] = [float(x) for x in obs_vec.tolist()]
+
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec) + "\n")
+            except Exception:
+                pass
 
         # Episode-level aggregates
         self._ep_return += float(reward)
@@ -833,7 +841,7 @@ class FecEnv(gym.Env):
         terminated = bool(self._t_in_ep >= self._episode_steps)
         truncated = False
 
-        if terminated:
+        if terminated and self._log_episode_metrics:
             # Write episode summary to help diagnose learning signal and non-stationarity.
             try:
                 epi_path = os.path.join(dest_dir, "episode_metrics.json")
