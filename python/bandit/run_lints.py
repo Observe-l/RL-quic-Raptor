@@ -163,6 +163,43 @@ def _iid_loss_mode(loss_pct: float) -> str:
     return f"iid:{v:g}"
 
 
+_DEFAULT_IID_LOSS_CYCLE_PCT: List[float] = [
+    0.1,
+    0.2,
+    0.3,
+    0.4,
+    0.5,
+    1.0,
+    2.0,
+    3.0,
+    4.0,
+    5.0,
+    6.0,
+    7.0,
+    8.0,
+]
+
+
+def _parse_loss_cycle(s: str) -> List[float]:
+    items: List[float] = []
+    for part in (s or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            v = float(part)
+        except Exception:
+            raise ValueError(f"invalid --loss-cycle entry: {part!r}")
+        if not np.isfinite(v):
+            raise ValueError(f"invalid --loss-cycle entry: {part!r}")
+        if v < 0.0 or v > 100.0:
+            raise ValueError(f"--loss-cycle entries must be within [0,100], got {v}")
+        items.append(float(v))
+    if not items:
+        raise ValueError("--loss-cycle must contain at least one value")
+    return items
+
+
 
 def main() -> int:
     ap = argparse.ArgumentParser(
@@ -189,8 +226,17 @@ def main() -> int:
     ap.add_argument(
         "--loss-pct",
         type=float,
-        default=0.5,
-        help="IID loss rate in percent (0.5 means 0.5%%).",
+        default=None,
+        help="Fixed IID loss rate in percent (e.g. 0.5 means 0.5%%). If omitted, uses --loss-cycle.",
+    )
+    ap.add_argument(
+        "--loss-cycle",
+        type=str,
+        default=",".join(f"{x:g}" for x in _DEFAULT_IID_LOSS_CYCLE_PCT),
+        help=(
+            "Comma-separated IID loss rates (percent) to cycle over per episode, in order, repeating. "
+            "Default: 0.1,0.2,0.3,0.4,0.5,1,2,3,4,5,6,7,8"
+        ),
     )
 
     ap.add_argument(
@@ -252,7 +298,10 @@ def main() -> int:
     if ckpt_every_episodes < 0:
         raise ValueError("--checkpoint-every-episodes must be >= 0")
 
-    loss_mode = _iid_loss_mode(float(args.loss_pct))
+    fixed_loss_pct: Optional[float] = None
+    if args.loss_pct is not None:
+        fixed_loss_pct = float(args.loss_pct)
+    loss_cycle_pct = _parse_loss_cycle(str(args.loss_cycle))
 
     # Logging
     dest_dir = args.result_dir or os.environ.get("QUICFEC_RESULT_DIR")
@@ -263,27 +312,6 @@ def main() -> int:
     _ensure_dir(dest_dir)
 
     log_path = os.path.join(dest_dir, "bandit_metrics.json")
-
-    # # Ensure the log file exists and capture a run header immediately.
-    # run_ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    # wall_t0 = time.time()
-    # try:
-    #     with open(log_path, "w", encoding="utf-8") as f:
-    #         f.write(
-    #             json.dumps(
-    #                 {
-    #                     "event": "start",
-    #                     "ts": str(run_ts),
-    #                     "dest_dir": str(dest_dir),
-    #                     "argv": list(sys.argv),
-    #                 },
-    #                 ensure_ascii=False,
-    #                 default=_json_default,
-    #             )
-    #             + "\n"
-    #         )
-    # except Exception:
-    #     pass
 
     save_ckpt_prefix = args.checkpoint_prefix
     if not save_ckpt_prefix:
@@ -446,8 +474,8 @@ def main() -> int:
                 "dest_dir": dest_dir,
                 "reward": float(reward_val),
                 "block": int(block_idx),
-                "loss_mode": str(loss_mode),
-                "loss_pct": float(args.loss_pct),
+                "loss_mode": str(active_loss_mode),
+                "loss_pct": float(active_loss_pct),
             },
         )
 
@@ -462,18 +490,24 @@ def main() -> int:
 
         _write_block_summary(int(block_idx))
 
-    def _episode_reset() -> str:
+    def _episode_reset(epi_idx: int) -> Tuple[str, float]:
+        if fixed_loss_pct is None:
+            pct = float(loss_cycle_pct[int(epi_idx) % int(len(loss_cycle_pct))])
+        else:
+            pct = float(fixed_loss_pct)
+        lm = _iid_loss_mode(float(pct))
         env.reset(
             options={
                 "rtt_ms": int(args.rtt_ms),
                 "bitrate_mbps": int(args.bitrate_mbps),
-                "loss_mode": str(loss_mode),
+                "loss_mode": str(lm),
                 "loss_pct": 0,
             }
         )
-        return str(loss_mode)
+        return str(lm), float(pct)
 
-    active_loss_mode = _episode_reset()
+    episode_idx = int(start_t // episode_steps)
+    active_loss_mode, active_loss_pct = _episode_reset(int(episode_idx))
 
     max_invalid_skips = int(os.environ.get("BANDIT_INVALID_SKIP_CAP", "500"))
     invalid_skips = 0
@@ -547,7 +581,7 @@ def main() -> int:
                 "context": [float(v) for v in x.tolist()],
                 "env_info": info,
                 "active_loss_mode": str(active_loss_mode),
-                "loss_pct": float(args.loss_pct),
+                "loss_pct": float(active_loss_pct),
                 "block_idx": int(block_idx),
                 "ctx_cfg": asdict(ctx_cfg) if t == int(start_t) else None,
                 "lints_cfg": asdict(lints_cfg) if t == int(start_t) else None,
@@ -579,13 +613,14 @@ def main() -> int:
                                     "dest_dir": dest_dir,
                                     "note": "latest",
                                     "checkpoint_every_episodes": int(ckpt_every_episodes),
-                                    "loss_mode": str(loss_mode),
-                                    "loss_pct": float(args.loss_pct),
+                                    "loss_mode": str(active_loss_mode),
+                                    "loss_pct": float(active_loss_pct),
                                 },
                             )
                         except Exception:
                             pass
-                active_loss_mode = _episode_reset()
+                episode_idx += 1
+                active_loss_mode, active_loss_pct = _episode_reset(int(episode_idx))
 
             # Count only valid transfers.
             t += 1
@@ -611,24 +646,6 @@ def main() -> int:
             _write_block_summary(int(current_block))
         except Exception:
             pass
-
-        # # Always append a run footer.
-        # try:
-        #     with open(log_path, "a", encoding="utf-8") as f:
-        #         f.write(
-        #             json.dumps(
-        #                 {
-        #                     "event": "end",
-        #                     "t_end": int(last_t) + 1,
-        #                     "wall_s": float(time.time() - float(wall_t0)),
-        #                 },
-        #                 ensure_ascii=False,
-        #                 default=_json_default,
-        #             )
-        #             + "\n"
-        #         )
-        # except Exception:
-        #     pass
 
     print(f"wrote {log_path}")
     if save_topk > 0:
