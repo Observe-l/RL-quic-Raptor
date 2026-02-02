@@ -769,6 +769,7 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 		return "", err
 	}
 	defer conn.CloseWithError(0, "done")
+	recvStart := time.Now()
 
 	// Receive header: find the stream that starts with magic "QFEC"
 	var (
@@ -845,7 +846,6 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 		// ctrlOut will be created in rxm.start when ctrlW is set
 	}
 	rxm.start(rx)
-	recvStart := time.Now()
 	var rcvDgrams int64
 	// Concurrent receivers: datagrams and uni streams
 	cctx, cancelRx := context.WithCancel(ctx)

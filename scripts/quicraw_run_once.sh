@@ -28,6 +28,16 @@ OUT_DIR=${OUT_DIR:-"$ROOT/go/test_data"}
 
 TIMEOUT_S=${TIMEOUT_S:-15}
 
+# Training / experiment speed flags (match quicfec_run_once.sh semantics):
+#   SETUP_ONLY=1         Only prepare netns/tc (and optional build), then exit 0.
+#   SKIP_NETNS_RESET=1   Assume netns/veth already exist; do not recreate.
+#   SKIP_TC_CONFIG=1     Assume tc qdiscs already configured; do not replace.
+#   SKIP_BUILD=1         Skip go build / rebuild checks (requires existing binaries).
+SETUP_ONLY=${SETUP_ONLY:-0}
+SKIP_NETNS_RESET=${SKIP_NETNS_RESET:-0}
+SKIP_TC_CONFIG=${SKIP_TC_CONFIG:-0}
+SKIP_BUILD=${SKIP_BUILD:-0}
+
 if ! sudo -n true 2>/dev/null; then
   echo "[error] sudo privileges are required. Run 'sudo -v' once and rerun." >&2
   exit 1
@@ -39,43 +49,72 @@ if [[ ! -f "$FILE" ]]; then
   head -c $((3*1024*1024)) </dev/urandom >"$FILE"
 fi
 
-VETH_HOST="$VETH_HOST" VETH_NS="$VETH_NS" HOST_IP="$HOST_IP" NS_IP="$NS_IP" "$ROOT/scripts/netns_reset.sh" "$NS"
-
-# Build binaries if missing or stale
-NEED_BUILD=0
-if [[ ! -x "$BIN_DIR/quicraw-server" || ! -x "$BIN_DIR/quicraw-client" ]]; then
-  NEED_BUILD=1
+if [[ "$SKIP_NETNS_RESET" != "1" ]]; then
+  VETH_HOST="$VETH_HOST" VETH_NS="$VETH_NS" HOST_IP="$HOST_IP" NS_IP="$NS_IP" "$ROOT/scripts/netns_reset.sh" "$NS"
 else
-  if find "$ROOT/go" -type f -name '*.go' -newer "$BIN_DIR/quicraw-server" -print -quit | grep -q .; then NEED_BUILD=1; fi
-  if find "$ROOT/go" -type f -name '*.go' -newer "$BIN_DIR/quicraw-client" -print -quit | grep -q .; then NEED_BUILD=1; fi
+  # Validate the expected topology exists.
+  if ! sudo ip netns list | awk '{print $1}' | grep -qx "$NS"; then
+    echo "[error] netns '$NS' not found but SKIP_NETNS_RESET=1" >&2
+    exit 2
+  fi
+  if ! ip link show "$VETH_HOST" &>/dev/null; then
+    echo "[error] host $VETH_HOST not found but SKIP_NETNS_RESET=1" >&2
+    exit 2
+  fi
+  if ! sudo ip netns exec "$NS" ip link show "$VETH_NS" &>/dev/null; then
+    echo "[error] ns $VETH_NS not found but SKIP_NETNS_RESET=1" >&2
+    exit 2
+  fi
 fi
-if [[ "$NEED_BUILD" == "1" ]]; then
-  mkdir -p "$BIN_DIR"
-  (cd "$ROOT/go" && go build -o "$BIN_DIR/quicraw-server" ./cmd/quicraw-server && go build -o "$BIN_DIR/quicraw-client" ./cmd/quicraw-client)
+
+# Build binaries if missing or stale (can be skipped for faster repeated trials).
+if [[ "$SKIP_BUILD" == "1" ]]; then
+  if [[ ! -x "$BIN_DIR/quicraw-server" || ! -x "$BIN_DIR/quicraw-client" ]]; then
+    echo "[error] SKIP_BUILD=1 but binaries missing in $BIN_DIR" >&2
+    exit 2
+  fi
+else
+  NEED_BUILD=0
+  if [[ ! -x "$BIN_DIR/quicraw-server" || ! -x "$BIN_DIR/quicraw-client" ]]; then
+    NEED_BUILD=1
+  else
+    if find "$ROOT/go" -type f -name '*.go' -newer "$BIN_DIR/quicraw-server" -print -quit | grep -q .; then NEED_BUILD=1; fi
+    if find "$ROOT/go" -type f -name '*.go' -newer "$BIN_DIR/quicraw-client" -print -quit | grep -q .; then NEED_BUILD=1; fi
+  fi
+  if [[ "$NEED_BUILD" == "1" ]]; then
+    mkdir -p "$BIN_DIR"
+    (cd "$ROOT/go" && go build -o "$BIN_DIR/quicraw-server" ./cmd/quicraw-server && go build -o "$BIN_DIR/quicraw-client" ./cmd/quicraw-client)
+  fi
 fi
 
 # Configure qdiscs: same as quicfec_run_once.sh
 half=$(( RTT_MS / 2 ))
-sudo tc qdisc del dev "$VETH_HOST" root 2>/dev/null || true
-NETEM_ARGS=(delay ${half}ms)
-case "$LOSS_MODE" in
-  none)
-    NETEM_ARGS+=(loss 0%) ;;
-  iid:*)
-    pct=${LOSS_MODE#iid:}
-    NETEM_ARGS+=(loss ${pct}%) ;;
-  gemodel:*)
-    params=${LOSS_MODE#gemodel:}
-    IFS=',' read -r p r h k <<<"$params"
-    # See quicfec_run_once.sh for parameter mapping rationale.
-    NETEM_ARGS+=(loss gemodel ${p}% ${r}% ${k}% ${h}%) ;;
-  ""|*)
-    NETEM_ARGS+=(loss ${LOSS_PCT}%) ;;
-esac
-sudo tc qdisc replace dev "$VETH_HOST" root handle 1: tbf rate ${RATE} burst 32kb latency 400ms
-sudo tc qdisc replace dev "$VETH_HOST" parent 1:1 handle 10: netem "${NETEM_ARGS[@]}"
-sudo ip netns exec "$NS" tc qdisc del dev "$VETH_NS" root 2>/dev/null || true
-sudo ip netns exec "$NS" tc qdisc replace dev "$VETH_NS" root netem delay ${half}ms
+if [[ "$SKIP_TC_CONFIG" != "1" ]]; then
+  sudo tc qdisc del dev "$VETH_HOST" root 2>/dev/null || true
+  NETEM_ARGS=(delay ${half}ms)
+  case "$LOSS_MODE" in
+    none)
+      NETEM_ARGS+=(loss 0%) ;;
+    iid:*)
+      pct=${LOSS_MODE#iid:}
+      NETEM_ARGS+=(loss ${pct}%) ;;
+    gemodel:*)
+      params=${LOSS_MODE#gemodel:}
+      IFS=',' read -r p r h k <<<"$params"
+      # See quicfec_run_once.sh for parameter mapping rationale.
+      NETEM_ARGS+=(loss gemodel ${p}% ${r}% ${k}% ${h}%) ;;
+    ""|*)
+      NETEM_ARGS+=(loss ${LOSS_PCT}%) ;;
+  esac
+  sudo tc qdisc replace dev "$VETH_HOST" root handle 1: tbf rate ${RATE} burst 32kb latency 400ms
+  sudo tc qdisc replace dev "$VETH_HOST" parent 1:1 handle 10: netem "${NETEM_ARGS[@]}"
+  sudo ip netns exec "$NS" tc qdisc del dev "$VETH_NS" root 2>/dev/null || true
+  sudo ip netns exec "$NS" tc qdisc replace dev "$VETH_NS" root netem delay ${half}ms
+fi
+
+if [[ "$SETUP_ONLY" == "1" ]]; then
+  exit 0
+fi
 
 # Run server
 SRV_LOG=$(mktemp -t quic_raw_srv.XXXXXX.log)
@@ -163,20 +202,6 @@ IN_MD5=$(md5sum "$FILE" | awk '{print $1}')
 OUT_MD5=$(md5sum "$OUT_DIR/$(basename "$FILE").recv" | awk '{print $1}' || true)
 MD5_OK=0; [[ "$IN_MD5" == "$OUT_MD5" ]] && MD5_OK=1
 
-DUR_MS=$(( (END-START)/1000000 ))
-FILE_SIZE=$(stat -c%s "$FILE")
-if [[ "$DUR_MS" -gt 0 ]]; then
-  S_MBPS=$(awk -v sz="$FILE_SIZE" -v ms="$DUR_MS" 'BEGIN{printf "%.3f", (sz*8.0/1000000.0)/(ms/1000.0)}')
-else
-  S_MBPS=0
-fi
-
-# Timeout => count as failure.
-if [[ "$TIMED_OUT" == "1" ]]; then
-  S_MBPS=0
-  MD5_OK=0
-fi
-
 # Client wall duration (includes dial/open/header/send/ack; does not include md5 below).
 DUR_MS_CLIENT=$(( (END-START)/1000000 ))
 
@@ -185,6 +210,21 @@ SRV_LINE=$(grep -E '^\[raw-server\] ' "$SRV_LOG" | tail -n1 || true)
 DUR_MS_SERVER=$(echo "$SRV_LINE" | sed -n 's/.*dur_ms=\([0-9]\+\).*/\1/p')
 if [[ -z "$DUR_MS_SERVER" ]]; then
   DUR_MS_SERVER=$DUR_MS_CLIENT
+fi
+
+FILE_SIZE=$(stat -c%s "$FILE")
+
+# Throughput metric:
+# - s_mbps: computed from dur_ms (server duration when available), so it matches dur_ms.
+S_MBPS=0
+if [[ "$DUR_MS_SERVER" -gt 0 ]]; then
+  S_MBPS=$(awk -v sz="$FILE_SIZE" -v ms="$DUR_MS_SERVER" 'BEGIN{printf "%.3f", (sz*8.0/1000000.0)/(ms/1000.0)}')
+fi
+
+# Timeout => count as failure.
+if [[ "$TIMED_OUT" == "1" ]]; then
+  S_MBPS=0
+  MD5_OK=0
 fi
 
 # Extract client total_ms (more detailed phase timing) when available.

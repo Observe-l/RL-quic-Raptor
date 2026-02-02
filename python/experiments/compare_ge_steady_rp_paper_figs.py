@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import time
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -45,6 +46,37 @@ def _now_ts() -> str:
     return time.strftime("%Y%m%d-%H%M%S")
 
 
+def _default_run_tag() -> str:
+    # Short, process-unique-ish tag to avoid netns/veth/IP collisions across concurrent runs.
+    pid = os.getpid()
+    t = int(time.time() * 1000)
+    raw = f"{pid:x}{t:x}"
+    raw = re.sub(r"[^0-9a-zA-Z]+", "", raw)
+    return raw[:8] or "run"
+
+
+def _netns_env_for_tag(tag: str) -> Dict[str, str]:
+    tag = re.sub(r"[^0-9a-zA-Z]+", "", str(tag or ""))
+    tag = tag[:8] if tag else _default_run_tag()
+
+    # Linux iface name limit is 15 chars.
+    veth_host = ("vh" + tag)[:15]
+    veth_ns = ("vn" + tag)[:15]
+
+    # Use a per-tag /24 to avoid host-side IP collisions between concurrent runs.
+    subnet = 20 + (zlib.crc32(tag.encode("utf-8")) % 200)
+    host_ip = f"10.10.{subnet}.1/24"
+    ns_ip = f"10.10.{subnet}.2/24"
+
+    return {
+        "NS": f"qns_{tag}",
+        "VETH_HOST": veth_host,
+        "VETH_NS": veth_ns,
+        "HOST_IP": host_ip,
+        "NS_IP": ns_ip,
+    }
+
+
 def _parse_int_list(s: str) -> List[int]:
     s = (s or "").strip()
     if not s:
@@ -75,6 +107,35 @@ def _parse_int_list(s: str) -> List[int]:
         seen.add(x)
         dedup.append(x)
     return dedup
+
+
+def _parse_float_list(s: str) -> List[float]:
+    s = (s or "").strip()
+    if not s:
+        return []
+    out: List[float] = []
+    for part in s.split(","):
+        part = (part or "").strip()
+        if not part:
+            continue
+        if part.endswith("%"):
+            part = part[:-1]
+        try:
+            out.append(float(part))
+        except Exception:
+            continue
+    return out
+
+
+def _choose_rtt_ms(*, mode: str, fixed_rtt_ms: int, candidates: Sequence[int], seed32: int) -> int:
+    mode = str(mode or "fixed").strip().lower()
+    if mode != "random":
+        return int(fixed_rtt_ms)
+    cand = [int(x) for x in candidates if int(x) > 0]
+    if not cand:
+        return int(fixed_rtt_ms)
+    rs = np.random.RandomState(int(seed32 & 0xFFFFFFFF))
+    return int(cand[int(rs.randint(0, len(cand)))])
 
 
 def _extract_last_line(prefix: str, s: str) -> Optional[str]:
@@ -142,14 +203,15 @@ def _run_bash_script(*, script: Path, env: Dict[str, str], timeout_s: int) -> Tu
             ["bash", str(script)],
             cwd=str(_REPO_ROOT),
             env={**os.environ, **env},
-            capture_output=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
             timeout=int(timeout_s),
         )
-        return p.stdout or "", p.stderr or ""
+        return "", p.stderr or ""
     except subprocess.TimeoutExpired as e:
         # Ensure downstream sees a [run] line.
-        out = (e.stdout or "") if isinstance(e.stdout, str) else ""
+        out = ""
         err = (e.stderr or "") if isinstance(e.stderr, str) else ""
         err = err + "\n" + "[run] proto=timeout dur_ms=0 timed_out=1 md5_ok=0 s_mbps=0\n"
         return out, err
@@ -803,9 +865,12 @@ def _run_one(
     timeout_s: int,
     file_path: Path,
     fec_env: Optional[Dict[str, str]] = None,
+    net_env: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, Any], str]:
     """Run one trial, return parsed metrics + raw stderr."""
 
+    # Private control knobs for the bash runners.
+    # _COMPARE_FAST is consumed inside this module to decide whether to set SKIP_* flags.
     common_env = {
         "BITRATE_MBPS": str(int(bitrate_mbps)),
         "RTT_MS": str(int(rtt_ms)),
@@ -814,7 +879,10 @@ def _run_one(
         "FILE": str(file_path),
         "TIMEOUT_S": str(int(timeout_transfer_s)),
         "POST_WAIT": "0ms",
+        "_COMPARE_FAST": os.environ.get("COMPARE_FAST", "0"),
     }
+    if net_env:
+        common_env.update({k: str(v) for k, v in net_env.items()})
 
     if method == "quic_bbrv2":
         env = {
@@ -822,6 +890,8 @@ def _run_one(
             "QUIC_FEC_CC_BYPASS": "0",
             "QUIC_FEC_CC_ALGO": "bbrv2",
         }
+        if str(env.get("_COMPARE_FAST", "0")) == "1":
+            env.update({"SKIP_BUILD": "1", "SKIP_NETNS_RESET": "1"})
         _stdout, stderr = _run_bash_script(script=_REPO_ROOT / "scripts" / "quicraw_run_once.sh", env=env, timeout_s=timeout_s)
     elif method.startswith("fec_") or method == "bandit":
         if not fec_env:
@@ -835,9 +905,12 @@ def _run_one(
     kv = _parse_kv_from_run_line(run_line)
 
     dur_ms = _to_int(kv, "dur_ms", 0)
+    dur_ms_client = _to_int(kv, "dur_ms_client", 0)
     timed_out = _to_int(kv, "timed_out", 0)
     md5_ok = _to_int(kv, "md5_ok", 0)
     goodput = _to_float(kv, "s_mbps", 0.0)
+    client_ok = _to_int(kv, "client_ok", 1)
+    client_rc = _to_int(kv, "client_rc", 0)
 
     overhead_ratio = _overhead_ratio_from_run_kv(kv=kv, file_path=file_path)
     tx_bytes = _to_int(kv, "tx_bytes", 0)
@@ -850,8 +923,11 @@ def _run_one(
 
     return {
         "dur_ms": int(dur_ms),
+        "dur_ms_client": int(dur_ms_client),
         "timed_out": int(timed_out),
         "md5_ok": int(md5_ok),
+        "client_ok": int(client_ok),
+        "client_rc": int(client_rc),
         "goodput_mbps": float(goodput),
         "tx_bytes": int(tx_bytes),
         "rx_bytes": int(rx_bytes),
@@ -887,9 +963,68 @@ def main() -> int:
     ap.add_argument("--ge-k-pct", type=float, default=99.0)
 
     ap.add_argument("--bitrate-mbps", type=int, default=10)
-    ap.add_argument("--rtt-ms", type=int, default=50)
-    ap.add_argument("--timeout-transfer-s", type=int, default=15)
+    ap.add_argument("--rtt-ms", type=int, default=50, help="RTT in ms when --rtt-mode=fixed")
+    ap.add_argument(
+        "--rtt-mode",
+        type=str,
+        default="fixed",
+        choices=["fixed", "random"],
+        help="RTT mode: fixed uses --rtt-ms; random samples from --rtt-random-ms (deterministic by --seed).",
+    )
+    ap.add_argument(
+        "--rtt-random-ms",
+        type=str,
+        default="30,50,60,80,100",
+        help="Candidate RTT values (ms) when --rtt-mode=random, e.g. '30,50,60,80,100'",
+    )
+
+    ap.add_argument(
+        "--loss-profile",
+        type=str,
+        default="ge",
+        choices=["ge", "iid"],
+        help="Loss profile: ge uses per-sender GE schedule; iid sweeps i.i.d loss rates from --iid-loss-pcts.",
+    )
+    ap.add_argument(
+        "--iid-loss-pcts",
+        type=str,
+        default="0.1,0.2,0.3,0.4,0.5",
+        help="Comma list of i.i.d loss rates in percent (e.g. '0.1,0.2,0.3,0.4,0.5').",
+    )
+    ap.add_argument("--timeout-transfer-s", type=int, default=5)
     ap.add_argument("--timeout-s", type=int, default=180, help="Python-side subprocess timeout; must exceed transfer timeout")
+
+    ap.add_argument(
+        "--duration-field",
+        type=str,
+        default="dur_ms",
+        choices=["dur_ms", "dur_ms_client"],
+        help=(
+            "Which duration to record as dur_ms in results/plots. "
+            "dur_ms=server-side e2e completion when available (recommended for fairness); "
+            "dur_ms_client=client wall-clock total (includes ARQ drain / ack wait)."
+        ),
+    )
+
+    ap.add_argument(
+        "--run-tag",
+        type=str,
+        default="",
+        help=(
+            "Unique tag to isolate netns/veth/IP so multiple compares can run concurrently. "
+            "Default: auto-generated per process."
+        ),
+    )
+
+    ap.add_argument(
+        "--fast",
+        type=int,
+        default=1,
+        help=(
+            "1: speed up by skipping per-trial netns reset and build checks (requires sudo -v, and stable netns). "
+            "0: run scripts in fully isolated mode per trial (slower but most reproducible)."
+        ),
+    )
 
     ap.add_argument("--reps", type=int, default=10)
 
@@ -930,7 +1065,7 @@ def main() -> int:
     # Legacy warmup behavior: one fixed warmup action (old default was 2845 for the old 6-DDL action set).
     # Use -1 to disable fixed warmup index and instead do random warmup steps (recommended).
     ap.add_argument("--warmup-a-idx", type=int, default=-1)
-    ap.add_argument("--warmup-steps", type=int, default=20, help="number of random warmup transfers when --warmup-a-idx < 0")
+    ap.add_argument("--warmup-steps", type=int, default=2, help="number of random warmup transfers when --warmup-a-idx < 0")
 
     ap.add_argument("--delay-file-bytes", type=int, default=128 * 1024)
     ap.add_argument("--goodput-file-bytes", type=int, default=3 * 1024 * 1024)
@@ -1029,13 +1164,32 @@ def main() -> int:
         model_prefix = model_prefix[:-4]
 
     params_path = Path(args.ge_params)
-    sender_ids = _load_sender_ids(params_path=params_path, sender_ids_arg=str(args.sender_ids), ge_key=str(args.ge_key))
 
-    # Files
-    file_delay = _REPO_ROOT / "go" / "test_data" / f"paper_delay_{int(args.delay_file_bytes)}B.bin"
-    file_goodput = _REPO_ROOT / "go" / "test_data" / f"paper_goodput_{int(args.goodput_file_bytes)}B.bin"
-    _ensure_file_of_size(file_path=file_delay, file_bytes=int(args.delay_file_bytes))
-    _ensure_file_of_size(file_path=file_goodput, file_bytes=int(args.goodput_file_bytes))
+    loss_profile = str(getattr(args, "loss_profile", "ge") or "ge").strip().lower()
+    iid_loss_pcts = _parse_float_list(str(getattr(args, "iid_loss_pcts", "") or ""))
+    if loss_profile == "iid" and not iid_loss_pcts:
+        iid_loss_pcts = [0.1, 0.2, 0.3, 0.4, 0.5]
+
+    # RTT candidates for random mode.
+    rtt_mode = str(getattr(args, "rtt_mode", "fixed") or "fixed").strip().lower()
+    rtt_candidates = [int(x) for x in _parse_int_list(str(getattr(args, "rtt_random_ms", "") or "")) if int(x) > 0]
+    if rtt_mode == "random" and not rtt_candidates:
+        rtt_candidates = [30, 50, 60, 80, 100]
+
+    # Scenario list: (scenario_id, loss_mode_string).
+    # We keep scenario_id in Row.sender_id for backward compatibility and stable RNG seeding.
+    scenarios: List[Tuple[int, str]] = []
+    if loss_profile == "iid":
+        for pct in iid_loss_pcts:
+            sid = int(round(float(pct) * 1000.0))
+            scenarios.append((sid, f"iid:{float(pct)}"))
+        sender_ids = [sid for sid, _lm in scenarios]
+    else:
+        sender_ids = _load_sender_ids(params_path=params_path, sender_ids_arg=str(args.sender_ids), ge_key=str(args.ge_key))
+        for sid in sender_ids:
+            ge = _load_sender_ge(params_path=params_path, sender_id=int(sid), ge_key=str(args.ge_key))
+            lm = _ge_to_tc_gemodel_loss_mode(ge, h_loss_pct=float(args.ge_h_pct), k_loss_pct=float(args.ge_k_pct))
+            scenarios.append((int(sid), str(lm)))
 
     # Load bandit checkpoint
     agent, _cfg, _ctx0, ctx_cfg, action_set, _t0 = load_checkpoint(path_prefix=model_prefix)
@@ -1066,6 +1220,55 @@ def main() -> int:
     if int(args.verify_only) != 0:
         return 0
 
+    duration_field = str(getattr(args, "duration_field", "dur_ms") or "dur_ms").strip()
+    use_fast = bool(int(getattr(args, "fast", 1) or 0) != 0)
+
+    net_env = _netns_env_for_tag(str(getattr(args, "run_tag", "") or ""))
+    # Use the effective netns tag for all per-run temporary artifact names.
+    run_tag_effective = str(net_env.get("NS", "qns")).removeprefix("qns_") if hasattr(str, "removeprefix") else str(net_env.get("NS", "qns")).replace("qns_", "", 1)
+    if not run_tag_effective:
+        run_tag_effective = "run"
+    # Per-run output directory for server recv files (keeps parallel runs isolated).
+    tmp_out_dir = Path("/tmp") / f"rl-quic-out-{str(net_env.get('NS','qns'))}"
+    tmp_out_dir.mkdir(parents=True, exist_ok=True)
+    run_env = {**net_env, "OUT_DIR": str(tmp_out_dir)}
+
+    # Files (payloads): include run tag to avoid cross-process clobbering.
+    file_delay = _REPO_ROOT / "go" / "test_data" / f"paper_delay_{int(args.delay_file_bytes)}B_{run_tag_effective}.bin"
+    file_goodput = _REPO_ROOT / "go" / "test_data" / f"paper_goodput_{int(args.goodput_file_bytes)}B_{run_tag_effective}.bin"
+    _ensure_file_of_size(file_path=file_delay, file_bytes=int(args.delay_file_bytes))
+    _ensure_file_of_size(file_path=file_goodput, file_bytes=int(args.goodput_file_bytes))
+    print(
+        "[netns] "
+        f"ns={net_env.get('NS','')} veth_host={net_env.get('VETH_HOST','')} veth_ns={net_env.get('VETH_NS','')} "
+        f"host_ip={net_env.get('HOST_IP','')} ns_ip={net_env.get('NS_IP','')}"
+    )
+    print(f"[io] out_dir={tmp_out_dir} file_delay={file_delay.name} file_goodput={file_goodput.name}")
+
+    # Plumb fast mode into _run_one via environment (keeps function signatures stable).
+    os.environ["COMPARE_FAST"] = "1" if use_fast else "0"
+
+    # One-command workflow: if fast mode is enabled, prepare netns/veth/tc once here.
+    # The per-trial bash runners will then run with SKIP_NETNS_RESET=1 to avoid repeated resets.
+    if use_fast:
+        try:
+            subprocess.run(["sudo", "-n", "true"], check=True, capture_output=True, text=True)
+        except Exception as e:
+            raise RuntimeError("sudo privileges required for --fast=1; run 'sudo -v' once and retry") from e
+
+        setup_env = {
+            "SETUP_ONLY": "1",
+            "SKIP_BUILD": "1",
+            "BITRATE_MBPS": str(int(args.bitrate_mbps)),
+            "RTT_MS": str(int(args.rtt_ms)),
+            # Loss is configured per run; here we just ensure the namespace exists.
+            "LOSS_MODE": "none",
+        }
+        setup_env.update(run_env)
+        # quicfec_run_once.sh already knows how to create the namespace + veth and configure tc.
+        # (This is a no-op if the user disables --fast.)
+        _run_bash_script(script=_REPO_ROOT / "scripts" / "quicfec_run_once.sh", env=setup_env, timeout_s=60)
+
     ts = _now_ts()
     out_dir = Path(args.out_dir) if args.out_dir else (_REPO_ROOT / "python" / "results" / f"paper-ge-steady-rp-{ts}")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1084,10 +1287,11 @@ def main() -> int:
         ]
     ran_tasks = {t for t, _p in tasks}
 
-    for sender_id in sender_ids:
-        ge = _load_sender_ge(params_path=params_path, sender_id=int(sender_id), ge_key=str(args.ge_key))
-        loss_mode = _ge_to_tc_gemodel_loss_mode(ge, h_loss_pct=float(args.ge_h_pct), k_loss_pct=float(args.ge_k_pct))
-        print(f"[ge] sender_id={sender_id} loss_mode={loss_mode}")
+    for scenario_id, loss_mode in scenarios:
+        if loss_profile == "iid":
+            print(f"[iid] loss_mode={loss_mode}")
+        else:
+            print(f"[ge] sender_id={scenario_id} loss_mode={loss_mode}")
 
         for task, file_path in tasks:
             print(f"[task] {task} file={file_path.name}")
@@ -1097,12 +1301,23 @@ def main() -> int:
             for ch in str(task).encode("utf-8", errors="ignore"):
                 task_seed = (task_seed * 131 + int(ch)) % 2_147_483_647
 
+            # RTT selection policy:
+            # Keep RTT fixed for the entire group (same loss rate / sender + same task),
+            # across warmup + all reps. This makes the bandit environment stationary enough.
+            group_seed32 = (int(args.seed) + 9876541 + 1000003 * int(scenario_id) + 9176 * int(task_seed)) & 0xFFFFFFFF
+            rtt_ms_group = _choose_rtt_ms(
+                mode=rtt_mode,
+                fixed_rtt_ms=int(args.rtt_ms),
+                candidates=rtt_candidates,
+                seed32=int(group_seed32),
+            )
+
             # Bandit state is per-(sender,task) sequence.
             ctx = ContextBuilder(cfg=ctx_cfg)
             ctx.reset()
 
             # Deterministic RNG for seeded policies (and for epsilon exploration).
-            pol_rs_seed32 = (int(args.seed) + 1000003 * int(sender_id) + 9176 * int(task_seed)) & 0xFFFFFFFF
+            pol_rs_seed32 = (int(args.seed) + 1000003 * int(scenario_id) + 9176 * int(task_seed)) & 0xFFFFFFFF
             pol_rs = np.random.RandomState(int(pol_rs_seed32))
 
             # Bandit warmup (excluded from stats).
@@ -1120,27 +1335,31 @@ def main() -> int:
                 warmup_indices = [int(warmup_fixed_idx)]
             else:
                 # numpy RandomState requires 0 <= seed < 2**32.
-                seed32 = (int(args.seed) + 1337 * int(sender_id) + 17 * int(task_seed)) & 0xFFFFFFFF
+                seed32 = (int(args.seed) + 1337 * int(scenario_id) + 17 * int(task_seed)) & 0xFFFFFFFF
                 rs = np.random.RandomState(int(seed32))
                 for _ in range(int(warmup_steps)):
                     warmup_indices.append(int(rs.randint(0, len(action_set))))
 
             for w_i, warmup_idx in enumerate(warmup_indices):
                 warmup_env = _action_to_env_vars(action_set=action_set, a_idx=int(warmup_idx), symbol_bytes=int(args.symbol_bytes))
-                warmup_ddl_ms = int(warmup_env.get("DDL_MS", "150"))
+                warmup_ddl_ms = int(warmup_env.get("DDL_MS", "100"))
+                if use_fast:
+                    warmup_env.update({"SKIP_BUILD": "1", "SKIP_NETNS_RESET": "1", "SKIP_SYSCTL": "1"})
                 m, stderr = _run_one(
                     method="bandit",
                     task=task,
                     loss_mode=loss_mode,
                     bitrate_mbps=int(args.bitrate_mbps),
-                    rtt_ms=int(args.rtt_ms),
+                    rtt_ms=int(rtt_ms_group),
                     timeout_transfer_s=int(args.timeout_transfer_s),
                     timeout_s=int(args.timeout_s),
                     file_path=file_path,
                     fec_env=warmup_env,
+                    net_env=run_env,
                 )
                 rl_obs = _extract_last_rl_observation(stderr)
                 failed = bool(int(m["timed_out"]) or int(m["md5_ok"]) != 1)
+                dur_record = int(m.get(duration_field, m.get("dur_ms", 0)) or 0)
                 overhead_ratio = float(m.get("overhead_ratio", 0.0) or 0.0)
                 fec_overhead_ratio = _overhead_ratio_from_rl_observation(rl_obs)
                 obs_vec = _aligned_obs_vec_from_rl_observation(rl_obs=rl_obs, ddl_ms=warmup_ddl_ms, failed=failed)
@@ -1149,14 +1368,14 @@ def main() -> int:
                     Row(
                         task=task,
                         method="bandit",
-                        sender_id=int(sender_id),
+                        sender_id=int(scenario_id),
                         loss_mode=str(loss_mode),
                         rep=-(int(w_i) + 1),
                         is_warmup=1,
                         timed_out=int(m["timed_out"]),
                         md5_ok=int(m["md5_ok"]),
                         success=1 if (int(m["timed_out"]) == 0 and int(m["md5_ok"]) == 1) else 0,
-                        dur_ms=int(m["dur_ms"]),
+                        dur_ms=int(dur_record),
                         goodput_mbps=float(m["goodput_mbps"]),
                         overhead_ratio=float(overhead_ratio),
                         a_idx=int(warmup_idx),
@@ -1164,7 +1383,12 @@ def main() -> int:
                             "warmup": True,
                             "warmup_step": int(w_i),
                             "policy": str(args.bandit_policy),
+                            "rtt_ms": int(rtt_ms_group),
                             "fec_overhead_ratio": float(fec_overhead_ratio),
+                            "dur_ms_server": int(m.get("dur_ms", 0) or 0),
+                            "dur_ms_client": int(m.get("dur_ms_client", 0) or 0),
+                            "client_ok": int(m.get("client_ok", 1) or 1),
+                            "client_rc": int(m.get("client_rc", 0) or 0),
                         },
                     )
                 )
@@ -1179,7 +1403,7 @@ def main() -> int:
                     a_idx, dbg = _bandit_select_action_mean(agent=agent, action_set=action_set, ctx=ctx)
                 elif pol == "mean-seeded":
                     # Seed per decision to keep reproducible but still responsive to context changes.
-                    base_seed32 = (int(args.seed) + 1000003 * int(sender_id) + 9176 * int(task_seed)) & 0xFFFFFFFF
+                    base_seed32 = (int(args.seed) + 1000003 * int(scenario_id) + 9176 * int(task_seed)) & 0xFFFFFFFF
                     step_seed32 = (int(base_seed32) ^ (0x9E3779B1 * (int(rep) + 1))) & 0xFFFFFFFF
                     a_idx, dbg = _bandit_select_action_mean_seeded(
                         agent=agent,
@@ -1200,21 +1424,25 @@ def main() -> int:
                 else:
                     raise ValueError(f"unknown --bandit-policy: {pol}")
                 fec_env = _action_to_env_vars(action_set=action_set, a_idx=a_idx, symbol_bytes=int(args.symbol_bytes))
-                ddl_ms = int(fec_env.get("DDL_MS", "150"))
+                ddl_ms = int(fec_env.get("DDL_MS", "100"))
+                if use_fast:
+                    fec_env.update({"SKIP_BUILD": "1", "SKIP_NETNS_RESET": "1", "SKIP_SYSCTL": "1"})
 
                 m, stderr = _run_one(
                     method="bandit",
                     task=task,
                     loss_mode=loss_mode,
                     bitrate_mbps=int(args.bitrate_mbps),
-                    rtt_ms=int(args.rtt_ms),
+                    rtt_ms=int(rtt_ms_group),
                     timeout_transfer_s=int(args.timeout_transfer_s),
                     timeout_s=int(args.timeout_s),
                     file_path=file_path,
                     fec_env=fec_env,
+                    net_env=run_env,
                 )
                 rl_obs = _extract_last_rl_observation(stderr)
                 failed = bool(int(m["timed_out"]) or int(m["md5_ok"]) != 1)
+                dur_record = int(m.get(duration_field, m.get("dur_ms", 0)) or 0)
                 overhead_ratio = float(m.get("overhead_ratio", 0.0) or 0.0)
                 fec_overhead_ratio = _overhead_ratio_from_rl_observation(rl_obs)
                 obs_vec = _aligned_obs_vec_from_rl_observation(rl_obs=rl_obs, ddl_ms=ddl_ms, failed=failed)
@@ -1224,18 +1452,27 @@ def main() -> int:
                     Row(
                         task=task,
                         method="bandit",
-                        sender_id=int(sender_id),
+                        sender_id=int(scenario_id),
                         loss_mode=str(loss_mode),
                         rep=int(rep),
                         is_warmup=0,
                         timed_out=int(m["timed_out"]),
                         md5_ok=int(m["md5_ok"]),
                         success=1 if (int(m["timed_out"]) == 0 and int(m["md5_ok"]) == 1) else 0,
-                        dur_ms=int(m["dur_ms"]),
+                        dur_ms=int(dur_record),
                         goodput_mbps=float(m["goodput_mbps"]),
                         overhead_ratio=float(overhead_ratio),
                         a_idx=int(a_idx),
-                        extra={"bandit": dbg, "policy": str(args.bandit_policy), "fec_overhead_ratio": float(fec_overhead_ratio)},
+                        extra={
+                            "bandit": dbg,
+                            "policy": str(args.bandit_policy),
+                            "rtt_ms": int(rtt_ms_group),
+                            "fec_overhead_ratio": float(fec_overhead_ratio),
+                            "dur_ms_server": int(m.get("dur_ms", 0) or 0),
+                            "dur_ms_client": int(m.get("dur_ms_client", 0) or 0),
+                            "client_ok": int(m.get("client_ok", 1) or 1),
+                            "client_rc": int(m.get("client_rc", 0) or 0),
+                        },
                     )
                 )
 
@@ -1245,104 +1482,137 @@ def main() -> int:
                     task=task,
                     loss_mode=loss_mode,
                     bitrate_mbps=int(args.bitrate_mbps),
-                    rtt_ms=int(args.rtt_ms),
+                    rtt_ms=int(rtt_ms_group),
                     timeout_transfer_s=int(args.timeout_transfer_s),
                     timeout_s=int(args.timeout_s),
                     file_path=file_path,
+                    net_env=run_env,
                 )
                 overhead2 = float(m2.get("overhead_ratio", 0.0) or 0.0)
+                dur2_record = int(m2.get(duration_field, m2.get("dur_ms", 0)) or 0)
                 rows.append(
                     Row(
                         task=task,
                         method="quic_bbrv2",
-                        sender_id=int(sender_id),
+                        sender_id=int(scenario_id),
                         loss_mode=str(loss_mode),
                         rep=int(rep),
                         is_warmup=0,
                         timed_out=int(m2["timed_out"]),
                         md5_ok=int(m2["md5_ok"]),
                         success=1 if (int(m2["timed_out"]) == 0 and int(m2["md5_ok"]) == 1) else 0,
-                        dur_ms=int(m2["dur_ms"]),
+                        dur_ms=int(dur2_record),
                         goodput_mbps=float(m2["goodput_mbps"]),
                         overhead_ratio=float(overhead2),
                         a_idx=-1,
-                        extra={},
+                        extra={
+                            "rtt_ms": int(rtt_ms_group),
+                            "dur_ms_server": int(m2.get("dur_ms", 0) or 0),
+                            "dur_ms_client": int(m2.get("dur_ms_client", 0) or 0),
+                            "client_ok": int(m2.get("client_ok", 1) or 1),
+                            "client_rc": int(m2.get("client_rc", 0) or 0),
+                        },
                     )
                 )
 
                 # Fixed FEC #1
-                env_f1 = _method_env_fixed_fec(k=20, r0=2, rstep=2, ddl_ms=150, symbol_bytes=int(args.symbol_bytes))
+                env_f1 = _method_env_fixed_fec(k=20, r0=2, rstep=2, ddl_ms=100, symbol_bytes=int(args.symbol_bytes))
+                if use_fast:
+                    env_f1.update({"SKIP_BUILD": "1", "SKIP_NETNS_RESET": "1", "SKIP_SYSCTL": "1"})
                 m3, stderr3 = _run_one(
                     method="fec_k20_r0_2_rstep_2",
                     task=task,
                     loss_mode=loss_mode,
                     bitrate_mbps=int(args.bitrate_mbps),
-                    rtt_ms=int(args.rtt_ms),
+                    rtt_ms=int(rtt_ms_group),
                     timeout_transfer_s=int(args.timeout_transfer_s),
                     timeout_s=int(args.timeout_s),
                     file_path=file_path,
                     fec_env=env_f1,
+                    net_env=run_env,
                 )
                 rl3 = _extract_last_rl_observation(stderr3)
                 overhead3 = float(m3.get("overhead_ratio", 0.0) or 0.0)
                 fec_overhead3 = _overhead_ratio_from_rl_observation(rl3)
+                dur3_record = int(m3.get(duration_field, m3.get("dur_ms", 0)) or 0)
                 rows.append(
                     Row(
                         task=task,
                         method="fec_k20_r0_2_rstep_2",
-                        sender_id=int(sender_id),
+                        sender_id=int(scenario_id),
                         loss_mode=str(loss_mode),
                         rep=int(rep),
                         is_warmup=0,
                         timed_out=int(m3["timed_out"]),
                         md5_ok=int(m3["md5_ok"]),
                         success=1 if (int(m3["timed_out"]) == 0 and int(m3["md5_ok"]) == 1) else 0,
-                        dur_ms=int(m3["dur_ms"]),
+                        dur_ms=int(dur3_record),
                         goodput_mbps=float(m3["goodput_mbps"]),
                         overhead_ratio=float(overhead3),
                         a_idx=-1,
-                        extra={"fec": {"K": 20, "R0": 2, "RSTEP": 2, "DDL_MS": 150}, "fec_overhead_ratio": float(fec_overhead3)},
+                        extra={
+                            "fec": {"K": 20, "R0": 2, "RSTEP": 2, "DDL_MS": 100},
+                            "fec_overhead_ratio": float(fec_overhead3),
+                            "rtt_ms": int(rtt_ms_group),
+                            "dur_ms_server": int(m3.get("dur_ms", 0) or 0),
+                            "dur_ms_client": int(m3.get("dur_ms_client", 0) or 0),
+                            "client_ok": int(m3.get("client_ok", 1) or 1),
+                            "client_rc": int(m3.get("client_rc", 0) or 0),
+                        },
                     )
                 )
 
                 # Fixed FEC #2
-                env_f2 = _method_env_fixed_fec(k=20, r0=6, rstep=4, ddl_ms=150, symbol_bytes=int(args.symbol_bytes))
+                env_f2 = _method_env_fixed_fec(k=20, r0=6, rstep=4, ddl_ms=100, symbol_bytes=int(args.symbol_bytes))
+                if use_fast:
+                    env_f2.update({"SKIP_BUILD": "1", "SKIP_NETNS_RESET": "1", "SKIP_SYSCTL": "1"})
                 m4, stderr4 = _run_one(
                     method="fec_k20_r0_6_rstep_4",
                     task=task,
                     loss_mode=loss_mode,
                     bitrate_mbps=int(args.bitrate_mbps),
-                    rtt_ms=int(args.rtt_ms),
+                    rtt_ms=int(rtt_ms_group),
                     timeout_transfer_s=int(args.timeout_transfer_s),
                     timeout_s=int(args.timeout_s),
                     file_path=file_path,
                     fec_env=env_f2,
+                    net_env=run_env,
                 )
                 rl4 = _extract_last_rl_observation(stderr4)
                 overhead4 = float(m4.get("overhead_ratio", 0.0) or 0.0)
                 fec_overhead4 = _overhead_ratio_from_rl_observation(rl4)
+                dur4_record = int(m4.get(duration_field, m4.get("dur_ms", 0)) or 0)
                 rows.append(
                     Row(
                         task=task,
                         method="fec_k20_r0_6_rstep_4",
-                        sender_id=int(sender_id),
+                        sender_id=int(scenario_id),
                         loss_mode=str(loss_mode),
                         rep=int(rep),
                         is_warmup=0,
                         timed_out=int(m4["timed_out"]),
                         md5_ok=int(m4["md5_ok"]),
                         success=1 if (int(m4["timed_out"]) == 0 and int(m4["md5_ok"]) == 1) else 0,
-                        dur_ms=int(m4["dur_ms"]),
+                        dur_ms=int(dur4_record),
                         goodput_mbps=float(m4["goodput_mbps"]),
                         overhead_ratio=float(overhead4),
                         a_idx=-1,
-                        extra={"fec": {"K": 20, "R0": 6, "RSTEP": 4, "DDL_MS": 150}, "fec_overhead_ratio": float(fec_overhead4)},
+                        extra={
+                            "fec": {"K": 20, "R0": 6, "RSTEP": 4, "DDL_MS": 100},
+                            "fec_overhead_ratio": float(fec_overhead4),
+                            "rtt_ms": int(rtt_ms_group),
+                            "dur_ms_server": int(m4.get("dur_ms", 0) or 0),
+                            "dur_ms_client": int(m4.get("dur_ms_client", 0) or 0),
+                            "client_ok": int(m4.get("client_ok", 1) or 1),
+                            "client_rc": int(m4.get("client_rc", 0) or 0),
+                        },
                     )
                 )
 
                 print(
-                    f"rep={rep:02d} bandit(a={a_idx}) dur_ms={m['dur_ms']} ok={1-int(m['timed_out'])==1 and int(m['md5_ok'])==1} | "
-                    f"quic_bbrv2 dur_ms={m2['dur_ms']} | fec1 dur_ms={m3['dur_ms']} | fec2 dur_ms={m4['dur_ms']}"
+                    f"rep={rep:02d} rtt_ms={int(rtt_ms_group)} bandit(a={a_idx}) dur_ms={dur_record} "
+                    f"ok={1-int(m['timed_out'])==1 and int(m['md5_ok'])==1} | "
+                    f"quic_bbrv2 dur_ms={dur2_record} | fec1 dur_ms={dur3_record} | fec2 dur_ms={dur4_record}"
                 )
 
     # Save raw results
@@ -1417,8 +1687,18 @@ def main() -> int:
         "ge_params": str(params_path),
         "ge_key": str(args.ge_key),
         "sender_ids": sender_ids,
+        "run_tag": str(getattr(args, "run_tag", "") or ""),
+        "run_tag_effective": str(run_tag_effective),
+        "tmp_out_dir": str(tmp_out_dir),
+        "file_delay": str(file_delay),
+        "file_goodput": str(file_goodput),
         "bitrate_mbps": int(args.bitrate_mbps),
         "rtt_ms": int(args.rtt_ms),
+        "rtt_mode": str(rtt_mode),
+        "rtt_random_ms": rtt_candidates,
+        "loss_profile": str(loss_profile),
+        "iid_loss_pcts": [float(x) for x in iid_loss_pcts],
+        "scenarios": [{"sender_id": int(sid), "loss_mode": str(lm)} for sid, lm in scenarios],
         "timeout_transfer_s": int(args.timeout_transfer_s),
         "timeout_s": int(args.timeout_s),
         "reps": int(args.reps),
