@@ -5,12 +5,21 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/quic-go/quic-go/fecquic"
 )
 
 func main() {
+	// Default congestion control: enable CC and select BBRv2 unless the caller overrides.
+	if strings.TrimSpace(os.Getenv("QUIC_FEC_CC_BYPASS")) == "" {
+		_ = os.Setenv("QUIC_FEC_CC_BYPASS", "0")
+	}
+	if strings.TrimSpace(os.Getenv("QUIC_FEC_CC_ALGO")) == "" {
+		_ = os.Setenv("QUIC_FEC_CC_ALGO", "bbrv2")
+	}
+
 	var (
 		addr      = flag.String("addr", "127.0.0.1:4444", "server address")
 		alpn      = flag.String("alpn", "quic-fec", "ALPN protocol")
@@ -27,17 +36,15 @@ func main() {
 		ackEvery  = flag.Int("ack-every", 8, "write 1B on a stream every N datagrams (0=auto)")
 		transport = flag.String("transport", "dgram", "symbol transport: dgram|stream")
 		arq       = flag.Bool("arq", false, "enable ARQ control plane (NACK/ACK)")
-		rxDDL     = flag.Duration("rx-ddl", 0, "receiver decode deadline per block (sent to server via header; 0=unspecified)")
 		R0        = flag.Int("R0", 0, "initial extra repairs (default: N-K)")
 		W         = flag.Int("W", 8, "ARQ window W (unfinished clusters)")
-		Rstep     = flag.Int("Rstep", 4, "ARQ minimum append per NACK")
-		alpha     = flag.Float64("alpha", 0.6, "ARQ ΔR scaling on deficit")
+		Rstep     = flag.Int("Rstep", 4, "ARQ repairs to append per repair round")
 		maxAtt    = flag.Int("max-attempts", 5, "ARQ max attempts per cluster")
 	)
 	flag.Parse()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	opts := fecquic.SendOptions{K: *K, N: *N, L: *L, InsecureTLS: *insecure, DropProb: *loss, PaceEach: *pace, BlockPause: *blkPause, RxDDL: *rxDDL, WarnDgramSize: *warn, PostWait: *postWait, AckEvery: *ackEvery, Transport: *transport, UseARQ: *arq, InitialRepairs: *R0, WindowW: *W, RStep: *Rstep, Alpha: *alpha, MaxAttempts: *maxAtt}
+	opts := fecquic.SendOptions{K: *K, N: *N, L: *L, InsecureTLS: *insecure, DropProb: *loss, PaceEach: *pace, BlockPause: *blkPause, WarnDgramSize: *warn, PostWait: *postWait, AckEvery: *ackEvery, Transport: *transport, UseARQ: *arq, InitialRepairs: *R0, WindowW: *W, RStep: *Rstep, MaxAttempts: *maxAtt}
 	if err := fecquic.ClientSendFile(ctx, *addr, *alpn, *filePath, opts); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)

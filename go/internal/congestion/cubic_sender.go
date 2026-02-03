@@ -12,11 +12,11 @@ import (
 const (
 	// maxDatagramSize is the default maximum packet size used in the Linux TCP implementation.
 	// Used in QUIC for congestion window computations in bytes.
-	initialMaxDatagramSize     = protocol.ByteCount(protocol.InitialPacketSize)
-	maxBurstPackets            = 3
-	renoBeta                   = 0.7 // Reno backoff factor.
-	minCongestionWindowPackets = 2
-	initialCongestionWindow    = 32
+	initialMaxDatagramSize                                   = protocol.ByteCount(protocol.InitialPacketSize)
+	maxBurstPackets                                          = 3
+	renoBeta                                                 = 0.7 // Reno backoff factor.
+	minCongestionWindowPackets                               = 2
+	defaultInitialCongestionWindowPackets protocol.ByteCount = 32
 )
 
 type cubicSender struct {
@@ -77,7 +77,7 @@ func NewCubicSender(
 		rttStats,
 		reno,
 		initialMaxDatagramSize,
-		initialCongestionWindow*initialMaxDatagramSize,
+		initialCwndPackets()*initialMaxDatagramSize,
 		protocol.MaxCongestionWindowPackets*initialMaxDatagramSize,
 		tracer,
 	)

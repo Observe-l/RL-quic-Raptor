@@ -3,6 +3,7 @@ package quic
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/quic-go/quic-go/internal/utils"
 	"github.com/quic-go/quic-go/internal/utils/ringbuffer"
@@ -13,6 +14,9 @@ const (
 	// Increase queues to allow higher datagram throughput without blocking the app.
 	maxDatagramSendQueueLen = 32
 	maxDatagramRcvQueueLen  = 128
+	// Avoid indefinite blocking in Add when the send queue is full.
+	// This allows callers to implement ctx-aware retry loops instead of deadlocking.
+	maxDatagramSendQueueBlock = 50 * time.Millisecond
 )
 
 type datagramQueue struct {
@@ -47,6 +51,7 @@ func newDatagramQueue(hasData func(), logger utils.Logger) *datagramQueue {
 // Once that limit is reached, Add blocks until the queue size has reduced.
 func (h *datagramQueue) Add(f *wire.DatagramFrame) error {
 	h.sendMx.Lock()
+	deadline := time.Now().Add(maxDatagramSendQueueBlock)
 
 	for {
 		if h.sendQueue.Len() < maxDatagramSendQueueLen {
@@ -55,15 +60,28 @@ func (h *datagramQueue) Add(f *wire.DatagramFrame) error {
 			h.hasData()
 			return nil
 		}
+		if time.Now().After(deadline) {
+			h.sendMx.Unlock()
+			return ErrDatagramSendQueueFull
+		}
 		select {
 		case <-h.sent: // drain the queue so we don't loop immediately
 		default:
 		}
 		h.sendMx.Unlock()
+		remaining := time.Until(deadline)
+		if remaining < 0 {
+			remaining = 0
+		}
+		t := time.NewTimer(remaining)
 		select {
 		case <-h.closed:
+			t.Stop()
 			return h.closeErr
 		case <-h.sent:
+			t.Stop()
+		case <-t.C:
+			return ErrDatagramSendQueueFull
 		}
 		h.sendMx.Lock()
 	}

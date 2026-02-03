@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -16,6 +17,14 @@ import (
 )
 
 func main() {
+	// Default congestion control: enable CC and select BBRv2 unless the caller overrides.
+	if strings.TrimSpace(os.Getenv("QUIC_FEC_CC_BYPASS")) == "" {
+		_ = os.Setenv("QUIC_FEC_CC_BYPASS", "0")
+	}
+	if strings.TrimSpace(os.Getenv("QUIC_FEC_CC_ALGO")) == "" {
+		_ = os.Setenv("QUIC_FEC_CC_ALGO", "bbrv2")
+	}
+
 	var (
 		addr     = flag.String("addr", ":4445", "listen address")
 		alpn     = flag.String("alpn", "quic-raw", "ALPN protocol")
@@ -177,6 +186,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "[delay] delay_ms_avg=%.3f delay_samples=%d\n", avg, delayCnt)
 			}
 		}
+		fmt.Fprintf(os.Stderr, "[receiver-e2e] end_ns=%d ok=1 bytes=%d\n", time.Now().UnixNano(), n)
 		// Application-level ack so the client doesn't close the connection early.
 		_, _ = stream.Write([]byte{1})
 		_ = stream.Close()

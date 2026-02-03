@@ -10,9 +10,7 @@ PORT=${PORT:-45300}
 K=${K:-40}
 R0=${R0:-6}
 W=${W:-8}
-DDL_MS=${DDL_MS:-50}
 RSTEP=${RSTEP:-4}
-ALPHA=${ALPHA:-0.6}
 LOSS_MODE=${LOSS_MODE:-none}  # none | iid:5 | gemodel:p,r,h,k (h=GOOD loss%, k=BAD loss%)
 
 chmod +x "$ROOT/scripts"/*.sh
@@ -35,7 +33,7 @@ REPS=${REPS:-1}
 for run in $(seq 1 $REPS); do
   # Start server with DDL
   SRV_LOG=$(mktemp)
-  sudo ip netns exec "$NS" bash -lc "ulimit -n 1048576; '$BIN_DIR/quicfec-server' -addr 10.10.0.2:$PORT -out '$ROOT/go/test_data' -rx-ddl ${DDL_MS}ms -timeout 35s" >"$SRV_LOG" 2>&1 & SP=$!
+  sudo ip netns exec "$NS" bash -lc "ulimit -n 1048576; '$BIN_DIR/quicfec-server' -addr 10.10.0.2:$PORT -out '$ROOT/go/test_data' -timeout 35s" >"$SRV_LOG" 2>&1 & SP=$!
   sleep 0.4
 
   # Run client with ARQ and CC bypass
@@ -43,7 +41,7 @@ for run in $(seq 1 $REPS); do
   export QUIC_FEC_CC_BYPASS=1
   ACK_EVERY=${ACK_EVERY:-0}
   START=$(date +%s%N)
-  "$BIN_DIR/quicfec-client" -addr 10.10.0.2:$PORT -file "$FILE" -N $((K+R0)) -K "$K" -L 1200 -post-wait 1s -ack-every "$ACK_EVERY" -dgram-warn 1400 -arq -R0 "$R0" -W "$W" -Rstep "$RSTEP" -alpha "$ALPHA" -max-attempts 5 >"$CLI_LOG" 2>&1 || true
+  "$BIN_DIR/quicfec-client" -addr 10.10.0.2:$PORT -file "$FILE" -N $((K+R0)) -K "$K" -L 1200 -post-wait 1s -ack-every "$ACK_EVERY" -dgram-warn 1400 -arq -R0 "$R0" -W "$W" -Rstep "$RSTEP" -max-attempts 5 >"$CLI_LOG" 2>&1 || true
   END=$(date +%s%N)
   sleep 0.2; kill $SP 2>/dev/null || true
 
@@ -52,7 +50,7 @@ for run in $(seq 1 $REPS); do
   DUR_MS=$(( (END-START)/1000000 ))
   ARQ=$(grep -E "^\[arq-stats\]" "$CLI_LOG" | tail -n1 || true)
 
-  echo "[arq] run=$run loss=$LOSS_MODE K=$K R0=$R0 W=$W DDL=${DDL_MS}ms -> dur_ms=$DUR_MS md5_in=$IN md5_out=$OUT"
+  echo "[arq] run=$run loss=$LOSS_MODE K=$K R0=$R0 W=$W -> dur_ms=$DUR_MS md5_in=$IN md5_out=$OUT"
   echo "[arq] $ARQ"
   echo "--- client log (tail) ---"; tail -n 25 "$CLI_LOG"
   echo "--- server log (tail) ---"; tail -n 25 "$SRV_LOG"

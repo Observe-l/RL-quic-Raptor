@@ -128,12 +128,19 @@ func configWithNonZeroNonFunctionFields(t *testing.T) *Config {
 			f.Set(reflect.ValueOf(true))
 		case "EnableStreamResetPartialDelivery":
 			f.Set(reflect.ValueOf(true))
+		case "DatagramObserver":
+			f.Set(reflect.ValueOf(DatagramObserver(&mockDatagramObserver{})))
 		default:
 			t.Fatalf("all fields must be accounted for, but saw unknown field %q", fn)
 		}
 	}
 	return c
 }
+
+type mockDatagramObserver struct{}
+
+func (*mockDatagramObserver) OnDatagramAcked([]byte) {}
+func (*mockDatagramObserver) OnDatagramLost([]byte)  {}
 
 func TestConfigClone(t *testing.T) {
 	t.Run("function fields", func(t *testing.T) {

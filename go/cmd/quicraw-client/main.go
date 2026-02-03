@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -17,6 +18,14 @@ import (
 )
 
 func main() {
+	// Default congestion control: enable CC and select BBRv2 unless the caller overrides.
+	if strings.TrimSpace(os.Getenv("QUIC_FEC_CC_BYPASS")) == "" {
+		_ = os.Setenv("QUIC_FEC_CC_BYPASS", "0")
+	}
+	if strings.TrimSpace(os.Getenv("QUIC_FEC_CC_ALGO")) == "" {
+		_ = os.Setenv("QUIC_FEC_CC_ALGO", "bbrv2")
+	}
+
 	var (
 		addr         = flag.String("addr", "127.0.0.1:4445", "server address")
 		alpn         = flag.String("alpn", "quic-raw", "ALPN protocol")
@@ -93,6 +102,7 @@ func main() {
 	start := time.Now()
 	var n int64
 	if !*measureDelay {
+		fmt.Fprintf(os.Stderr, "[sender-e2e] start_ns=%d\n", time.Now().UnixNano())
 		tSend := time.Now()
 		n, err = io.CopyBuffer(stream, f, make([]byte, 256*1024))
 		if err != nil {
@@ -107,6 +117,7 @@ func main() {
 		}
 		buf := make([]byte, payloadLen)
 		seq := uint64(0)
+		fmt.Fprintf(os.Stderr, "[sender-e2e] start_ns=%d\n", time.Now().UnixNano())
 		tSend := time.Now()
 		for {
 			r, rerr := f.Read(buf)

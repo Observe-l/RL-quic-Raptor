@@ -20,10 +20,10 @@ gomock_reflect_*/
 results/
 test_data/
 tables/
-bin/
 docs/reports
 docs
 __pycache__/
 *.pyc
 wandb/
 .venv/
+tmp*/

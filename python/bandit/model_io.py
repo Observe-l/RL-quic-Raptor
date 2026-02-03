@@ -70,9 +70,8 @@ def save_checkpoint(
     # Minimal action set reconstruction data.
     action_meta = {
         "k_values": action_set.k_values,
-        "r0_pct_values": action_set.r0_pct_values,
+        "r0_values": action_set.r0_values,
         "rstep_values": action_set.rstep_values,
-        "ddl_ms_values": action_set.ddl_ms_values,
     }
 
     # ContextBuilder internal state (kept as JSON-friendly types).
@@ -131,9 +130,8 @@ def load_checkpoint(
     action_set_meta = dict(meta.get("action_set", {}))
     action_set = ActionSet(
         k_values=action_set_meta.get("k_values"),
-        r0_pct_values=action_set_meta.get("r0_pct_values"),
+        r0_values=action_set_meta.get("r0_values"),
         rstep_values=action_set_meta.get("rstep_values"),
-        ddl_ms_values=action_set_meta.get("ddl_ms_values"),
     )
 
     arr = np.load(npz_path)

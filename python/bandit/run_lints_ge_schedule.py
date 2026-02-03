@@ -406,8 +406,7 @@ def main() -> int:
 
     if loaded_from is None:
         # New DDL discretization for training.
-        ddl_ms_values = [25, 50, 75, 100, 125, 150, 175, 200]
-        action_set = ActionSet(ddl_ms_values=ddl_ms_values)
+        action_set = ActionSet()
         ctx_cfg = ContextConfig(ewma_alpha=float(args.ctx_alpha), window=int(args.ctx_window))
         ctx = ContextBuilder(ctx_cfg)
 
@@ -428,18 +427,15 @@ def main() -> int:
     try:
         n_actions = int(len(action_set))
         k_n = int(len(action_set.k_values))
-        r0_n = int(len(action_set.r0_pct_values))
+        r0_n = int(len(action_set.r0_values))
         rs_n = int(len(action_set.rstep_values))
-        ddl_n = int(len(action_set.ddl_ms_values))
         print(
-            f"[bandit] action_set: n={n_actions} = K({k_n})*R0pct({r0_n})*RSTEP({rs_n})*DDL({ddl_n}); "
-            f"ddl_ms_values={list(action_set.ddl_ms_values)}"
+            f"[bandit] action_set: n={n_actions} = K({k_n})*R0({r0_n})*RSTEP({rs_n})"
         )
     except Exception:
         pass
 
     # Env configured so that we only reset (and switch net params) every episode_steps.
-    # IMPORTANT: DDL discretization must match the action_set used by the bandit.
     env_cfg: Dict[str, Any] = {
         "episode_step": int(episode_steps),
         "rtt_ms": int(args.rtt_ms),
@@ -449,7 +445,6 @@ def main() -> int:
         "bitrate_mbps": int(args.bitrate_mbps),
         "timeout_sec": int(args.timeout_sec),
         "train_file_bytes": int(args.train_file_bytes),
-        "ddl_ms_values": list(action_set.ddl_ms_values),
         "reward_variant": str(args.reward_variant),
         "reward_w_goodput": float(args.reward_w_goodput),
         "reward_w_arq": float(args.reward_w_arq),
@@ -656,9 +651,7 @@ def main() -> int:
                 continue
             invalid_skips = 0
 
-            ddl_ms_levels = list(action_set.ddl_ms_values)
-            ddl_ms = int(ddl_ms_levels[int(a.ddl_idx)])
-            ctx.update_from_obs(obs=obs, ddl_ms=int(ddl_ms))
+            ctx.update_from_obs(obs=obs)
 
             if int(t) >= warmup:
                 ph = phi_fn(x=x, a_onehot=action_set.get_onehot(a_idx))
@@ -672,9 +665,7 @@ def main() -> int:
                     "k_idx": int(a.k_idx),
                     "r0_idx": int(a.r0_idx),
                     "rstep_idx": int(a.rstep_idx),
-                    "ddl_idx": int(a.ddl_idx),
                 },
-                "ddl_ms": int(ddl_ms),
                 "context": [float(v) for v in x.tolist()],
                 "env_info": info,
                 "sender_id": int(sender_id),

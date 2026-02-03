@@ -131,10 +131,33 @@ type packetPacker struct {
 	framer              frameSource
 	acks                ackFrameSource
 	datagramQueue       *datagramQueue
+	datagramObserver    DatagramObserver
 	retransmissionQueue *retransmissionQueue
 	rand                rand.Rand
 
 	numNonAckElicitingAcks int
+}
+
+type datagramObserverFrameHandler struct {
+	obs DatagramObserver
+}
+
+func (h datagramObserverFrameHandler) OnAcked(f wire.Frame) {
+	if h.obs == nil || f == nil {
+		return
+	}
+	if df, ok := f.(*wire.DatagramFrame); ok {
+		h.obs.OnDatagramAcked(df.Data)
+	}
+}
+
+func (h datagramObserverFrameHandler) OnLost(f wire.Frame) {
+	if h.obs == nil || f == nil {
+		return
+	}
+	if df, ok := f.(*wire.DatagramFrame); ok {
+		h.obs.OnDatagramLost(df.Data)
+	}
 }
 
 var _ packer = &packetPacker{}
@@ -150,6 +173,7 @@ func newPacketPacker(
 	framer frameSource,
 	acks ackFrameSource,
 	datagramQueue *datagramQueue,
+	datagramObserver DatagramObserver,
 	perspective protocol.Perspective,
 ) *packetPacker {
 	var b [16]byte
@@ -163,6 +187,7 @@ func newPacketPacker(
 		handshakeStream:     handshakeStream,
 		retransmissionQueue: retransmissionQueue,
 		datagramQueue:       datagramQueue,
+		datagramObserver:    datagramObserver,
 		perspective:         perspective,
 		framer:              framer,
 		acks:                acks,
@@ -657,7 +682,11 @@ func (p *packetPacker) composeNextPacket(
 		if f := p.datagramQueue.Peek(); f != nil {
 			size := f.Length(v)
 			if size <= maxPayloadSize-pl.length { // DATAGRAM frame fits
-				pl.frames = append(pl.frames, ackhandler.Frame{Frame: f})
+				var h ackhandler.FrameHandler
+				if p.datagramObserver != nil {
+					h = datagramObserverFrameHandler{obs: p.datagramObserver}
+				}
+				pl.frames = append(pl.frames, ackhandler.Frame{Frame: f, Handler: h})
 				pl.length += size
 				p.datagramQueue.Pop()
 			} else if !hasAck {

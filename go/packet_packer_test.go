@@ -65,6 +65,7 @@ func newTestPacketPacker(t *testing.T, mockCtrl *gomock.Controller, pers protoco
 			framer,
 			ackFramer,
 			datagramQueue,
+			nil,
 			pers,
 		),
 	}

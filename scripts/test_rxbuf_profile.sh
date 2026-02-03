@@ -26,7 +26,7 @@ setup() {
   sudo "$ROOT_DIR/scripts/setup_ns.sh" "$NS" "$V0" "$V1" "$HOST_IP" "$NS_IP"
   sudo ip netns exec "$NS" bash -lc "nohup $BIN_DIR/quicfec-grpc-server >/tmp/grpc-netem.log 2>&1 & echo $! >/tmp/grpc-netem.pid"
   sleep 0.5
-  sudo ip netns exec "$NS" bash -lc "nohup $BIN_DIR/quicfec-server -addr ':4242' -out $GO_DIR/test_data -rx-budget-bytes $((10*1024*1024)) -rx-ddl 50ms -rx-workers 2 >/tmp/quicfec-data.log 2>&1 & echo $! >/tmp/quicfec-data.pid"
+  sudo ip netns exec "$NS" bash -lc "nohup $BIN_DIR/quicfec-server -addr ':4242' -out $GO_DIR/test_data -rx-budget-bytes $((10*1024*1024)) -rx-workers 2 >/tmp/quicfec-data.log 2>&1 & echo $! >/tmp/quicfec-data.pid"
 }
 
 cleanup() {

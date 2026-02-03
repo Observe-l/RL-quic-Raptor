@@ -91,7 +91,7 @@ class ContextBuilder:
         )
         return np.clip(x, 0.0, 10.0)
 
-    def update_from_obs(self, *, obs: np.ndarray, ddl_ms: Optional[int] = None) -> None:
+    def update_from_obs(self, *, obs: np.ndarray) -> None:
         """Update context state using ONLY the environment observation vector.
 
         This is the bandit-safe path: it does not depend on `info`, which may
@@ -104,7 +104,6 @@ class ContextBuilder:
                     3: arq_attempts_mean
                     4: residual_erasures
                     5: fec_rate
-                    6: ddl_ms
         """
 
         cfg = self.cfg
@@ -126,9 +125,6 @@ class ContextBuilder:
         arq = _get(3)
         residual = _get(4)
         fec_rate = float(np.clip(_get(5), 0.0, 1.0))
-        # ddl_ms is included in the observation for logging/analysis; context does not
-        # depend on delay.
-        _ = int(max(1.0, _get(6))) if ddl_ms is None else int(ddl_ms)
         # No explicit timeout flag in obs; treat zero-goodput as timeout/failure.
         is_timeout = 1.0 if float(goodput) <= 1e-6 else 0.0
         res_flag = 1.0 if float(residual) > 0.0 else 0.0
@@ -146,7 +142,7 @@ class ContextBuilder:
 
         self._t += 1
 
-    def update(self, *, info: Dict[str, Any], ddl_ms: int) -> None:
+    def update(self, *, info: Dict[str, Any]) -> None:
         """Backward-compatible update path.
 
         New training/evaluation should call `update_from_obs()`.
@@ -164,15 +160,14 @@ class ContextBuilder:
                     float(raw_obs.get("arq_attempts_mean", 0.0)),
                     float(raw_obs.get("residual_erasures", 0.0)),
                     float(raw_obs.get("fec_rate", 0.0)),
-                    float(raw_obs.get("ddl_ms", ddl_ms)),
                 ],
                 dtype=np.float64,
             )
-            self.update_from_obs(obs=obs_vec, ddl_ms=ddl_ms)
+            self.update_from_obs(obs=obs_vec)
             return
 
         # Fall back to the minimal safe behavior.
-        self.update_from_obs(obs=np.zeros((7,), dtype=np.float64), ddl_ms=ddl_ms)
+        self.update_from_obs(obs=np.zeros((6,), dtype=np.float64))
 
     def _push(self, xs: list, v: float) -> None:
         xs.append(float(v))

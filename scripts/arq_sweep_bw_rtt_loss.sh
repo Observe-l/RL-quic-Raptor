@@ -21,9 +21,7 @@ OUT_AGG=${OUT_AGG:-/tmp/arq_sweep_10mbps_agg.csv}
 K=${K:-40}
 R0=${R0:-6}
 W=${W:-8}
-DDL_MS=${DDL_MS:-50}
 RSTEP=${RSTEP:-4}
-ALPHA=${ALPHA:-0.6}
 ACK_EVERY=${ACK_EVERY:-0}
 
 chmod +x "$ROOT/scripts"/*.sh
@@ -68,14 +66,14 @@ for rtt in "${RTTS[@]}"; do
     for run in $(seq 1 "$REPS"); do
       SRV_LOG=$(mktemp)
       # Start server
-      sudo ip netns exec "$NS" bash -lc "ulimit -n 1048576; '$BIN_DIR/quicfec-server' -addr 10.10.0.2:$PORT -out '$ROOT/go/test_data' -rx-ddl ${DDL_MS}ms -timeout 45s" >"$SRV_LOG" 2>&1 & SP=$!
+      sudo ip netns exec "$NS" bash -lc "ulimit -n 1048576; '$BIN_DIR/quicfec-server' -addr 10.10.0.2:$PORT -out '$ROOT/go/test_data' -timeout 45s" >"$SRV_LOG" 2>&1 & SP=$!
       sleep 0.4
       # Run client (CC bypass)
       CLI_LOG=$(mktemp)
       export QUIC_FEC_CC_BYPASS=1
       START=$(date +%s%N)
       "$BIN_DIR/quicfec-client" -addr 10.10.0.2:$PORT -file "$FILE" -N $((K+R0)) -K "$K" -L 1200 \
-        -post-wait 1s -ack-every "$ACK_EVERY" -dgram-warn 1400 -arq -R0 "$R0" -W "$W" -Rstep "$RSTEP" -alpha "$ALPHA" -max-attempts 5 \
+        -post-wait 1s -ack-every "$ACK_EVERY" -dgram-warn 1400 -arq -R0 "$R0" -W "$W" -Rstep "$RSTEP" -max-attempts 5 \
         >"$CLI_LOG" 2>&1 || true
       END=$(date +%s%N)
       sleep 0.2; kill $SP 2>/dev/null || true

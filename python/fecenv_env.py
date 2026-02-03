@@ -35,13 +35,11 @@ class EnvConfig:
 class Action:
     # Action space for QUIC-FEC control:
     # - K: source symbols per block
-    # - R0_pct: initial parity ratio relative to K
+    # - R0: initial parity symbols (integer)
     # - RSTEP: incremental repair step size
-    # - ddl_ms: receiver decode deadline used for ARQ/NACK timing
-    K: int = 30
-    R0_pct: float = 0.2
+    K: int = 12
+    R0: int = 0
     RSTEP: int = 4
-    ddl_ms: int = 450
 
 
 class QuicFecRunner:
@@ -228,15 +226,14 @@ class QuicFecRunner:
         # Keep SYMBOL_BYTES fixed to avoid MTU-triggered fragmentation.
         env["SYMBOL_BYTES"] = str(int(getattr(cfg, "symbol_bytes", 1200)))
 
-        # Map R0_pct -> integer R0.
-        # Discrete control: R0 = floor(K * R0_pct), allowing 0.
-        r0 = int(float(action.R0_pct) * float(k))
+        # Integer parity budget controlled by the policy.
+        r0 = int(getattr(action, "R0", 0))
         if r0 < 0:
             r0 = 0
+        # Keep semantics consistent with the legacy mapping (R0 never exceeded K).
         if r0 > int(k):
             r0 = int(k)
         env["R0"] = str(int(r0))
-        env["DDL_MS"] = str(int(action.ddl_ms))
 
         # ARQ policy (RSTEP is controlled by the policy).
         env["W"] = os.environ.get("W", "8")
@@ -446,29 +443,13 @@ class FecEnv(gym.Env):
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         cfg = config or {}
 
-        # DDL discretization (ms).
-        # This controls both the action space cardinality and the mapping from ddl_idx -> ddl_ms.
-        # Default kept for backward compatibility with older checkpoints.
-        default_ddl_ms_values = [100, 150, 200, 250, 300, 350]
-        ddl_ms_values_cfg = cfg.get("ddl_ms_values", default_ddl_ms_values)
-        try:
-            ddl_ms_values = [int(x) for x in list(ddl_ms_values_cfg)]
-        except Exception:
-            ddl_ms_values = list(default_ddl_ms_values)
-        ddl_ms_values = [int(x) for x in ddl_ms_values if int(x) > 0]
-        if not ddl_ms_values:
-            ddl_ms_values = list(default_ddl_ms_values)
-        # Keep deterministic mapping.
-        self._ddl_ms_values: List[int] = sorted({int(x) for x in ddl_ms_values})
-
         # Discrete action space (MultiDiscrete), matching the requirement that
         # controls are chosen from a finite set (not a clipped continuous Box).
-        # Order: [K_idx, R0_pct_idx, RSTEP_idx, ddl_idx]
-        #   K: 10..64                                -> 55 values
-        #   R0_pct: 0.0..1.0 step 0.05               -> 21 values
-        #   RSTEP: 1..8                              -> 8 values
-        #   ddl_ms: configured via ddl_ms_values     -> len(ddl_ms_values) values
-        self.action_space = spaces.MultiDiscrete([55, 21, 8, int(len(self._ddl_ms_values))])
+        # Order: [K_idx, R0_idx, RSTEP_idx]
+        #   K: 4..20      -> 17 values
+        #   R0: 0..20     -> 21 values
+        #   RSTEP: 1..20  -> 20 values
+        self.action_space = spaces.MultiDiscrete([17, 21, 20])
         # Policy observation keys.
         # Keep this strictly limited to the learning signal (no debug/leakage).
         # Layout (requested):
@@ -477,8 +458,7 @@ class FecEnv(gym.Env):
         #   ctrl_tx_nack_msgs,
         #   arq_attempts_mean,
         #   residual_erasures,
-        #   fec_rate (R0/K),
-        #   ddl_ms (executed)
+        #   fec_rate (R0/K)
         self._obs_keys: List[str] = [
             "goodput",
             "fec_overhead",
@@ -486,7 +466,6 @@ class FecEnv(gym.Env):
             "arq_attempts_mean",
             "residual_erasures",
             "fec_rate",
-            "ddl_ms",
         ]
         self.observation_space = spaces.Box(
             low=-5.0, high=+np.inf, shape=(len(self._obs_keys),), dtype=np.float32
@@ -661,28 +640,27 @@ class FecEnv(gym.Env):
 
     def step(self, action: np.ndarray):
         a = np.asarray(action).reshape(-1)
-        if a.size != 4:
-            raise ValueError("Action must be length-4 MultiDiscrete array")
+        if a.size != 3:
+            raise ValueError("Action must be length-3 MultiDiscrete array")
 
         k_idx = int(a[0])
         r0_idx = int(a[1])
         rstep_idx = int(a[2])
-        ddl_idx = int(a[3])
 
-        if not (0 <= k_idx <= 54):
+        if not (0 <= k_idx <= 16):
             raise ValueError(f"K index out of range: {k_idx}")
         if not (0 <= r0_idx <= 20):
-            raise ValueError(f"R0_pct index out of range: {r0_idx}")
-        if not (0 <= rstep_idx <= 7):
+            raise ValueError(f"R0 index out of range: {r0_idx}")
+        if not (0 <= rstep_idx <= 19):
             raise ValueError(f"RSTEP index out of range: {rstep_idx}")
-        if not (0 <= ddl_idx < int(len(self._ddl_ms_values))):
-            raise ValueError(f"ddl index out of range: {ddl_idx}")
 
-        K = 10 + k_idx
-        R0_pct = 0.05 * float(r0_idx)
+        K = 4 + k_idx
+        R0 = int(r0_idx)
+        # Keep semantics consistent with legacy behavior (R0 never exceeded K).
+        if R0 > int(K):
+            R0 = int(K)
         RSTEP = 1 + rstep_idx
-        ddl_ms = int(self._ddl_ms_values[int(ddl_idx)])
-        act = Action(K=int(K), R0_pct=float(R0_pct), RSTEP=int(RSTEP), ddl_ms=int(ddl_ms))
+        act = Action(K=int(K), R0=int(R0), RSTEP=int(RSTEP))
 
         obs_dict, _reward_unused, _done_transfer, info = self._runner.step(
             act,
@@ -726,10 +704,9 @@ class FecEnv(gym.Env):
         obs_dict["goodput"] = float(goodput_mbps)
 
         # Append control-derived observation fields.
-        # fec_rate is defined as R0/K where R0=floor(K*R0_pct) used by the sender.
-        r0_used = max(0, int(float(R0_pct) * float(K)))
+        # fec_rate is defined as R0/K where R0 is the integer parity used by the sender.
+        r0_used = max(0, int(R0))
         obs_dict["fec_rate"] = float(r0_used) / float(max(1, int(K)))
-        obs_dict["ddl_ms"] = float(ddl_ms)
 
         if not self._ignore_runner_errors and info and isinstance(info, dict) and info.get("error"):
             err = str(info.get("error"))
@@ -754,7 +731,7 @@ class FecEnv(gym.Env):
             reward = -1.0
             r_terms = {"timeout": 1.0}
         else:
-            reward, r_terms = self._compute_reward_satellite(obs_dict, ddl_ms)
+            reward, r_terms = self._compute_reward_satellite(obs_dict)
         # Build policy observation vector.
         obs_vec = self._obs_to_vec(obs_dict)
         if self._normalize_obs:
@@ -773,10 +750,9 @@ class FecEnv(gym.Env):
             "fec_cfg": {
                 "K": int(K),
                 "symbol_bytes": 1200,
-                "R0_pct": float(R0_pct),
                 "R0": int(r0_used),
+                "fec_rate": float(r0_used) / float(max(1, int(K))),
                 "RSTEP": int(RSTEP),
-                "ddl_ms": ddl_ms,
                 "cc_algo": str(getattr(self._runner.last_cfg or EnvConfig(), "cc_algo", "bbrv2")),
             },
             "bw_cap_mbps": float(self._capacity_mbps),
@@ -900,7 +876,7 @@ class FecEnv(gym.Env):
             h = max(0.0, min(100.0, 100.0 * (1.0 - 1.0 / max(1, LB))))
             self._loss_mode = f"gemodel:{pG},{r},{h},{pB}"
 
-    def _compute_reward_satellite(self, obs: Dict[str, Any], ddl_ms: int) -> Tuple[float, Dict[str, float]]:
+    def _compute_reward_satellite(self, obs: Dict[str, Any]) -> Tuple[float, Dict[str, float]]:
         g = float(obs.get("goodput", obs.get("goodput_mbps", obs.get("goodput_arrival_mbps", obs.get("goodput_decode_mbps", 0.0)))))
         e = float(obs.get("residual_erasures", 0.0))
         oh = float(obs.get("fec_overhead", 0.0))

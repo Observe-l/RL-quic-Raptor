@@ -102,7 +102,7 @@ func NewBBRv2Sender(clock Clock, rttStats *utils.RTTStats, initialMaxDatagramSiz
 		largestSentAtLastCutback: protocol.InvalidPacketNumber,
 	}
 	// Initial cwnd similar to quic-go defaults.
-	s.cwnd = initialCongestionWindow * initialMaxDatagramSize
+	s.cwnd = initialCwndPackets() * initialMaxDatagramSize
 	s.pacer = newPacer(s.bandwidthEstimateForPacer)
 	if s.tracer != nil && s.tracer.UpdatedCongestionState != nil {
 		s.lastQlg = logging.CongestionStateSlowStart
@@ -348,7 +348,7 @@ func (b *bbrv2Sender) OnRetransmissionTimeout(packetsRetransmitted bool) {
 	b.roundStarted = false
 	b.nextRoundEnd = protocol.InvalidPacketNumber
 	b.largestSentAtLastCutback = protocol.InvalidPacketNumber
-	b.cwnd = max(b.minCwnd(), initialCongestionWindow*b.maxDatagramSize)
+	b.cwnd = max(b.minCwnd(), initialCwndPackets()*b.maxDatagramSize)
 	if b.tracer != nil && b.tracer.UpdatedCongestionState != nil {
 		b.tracer.UpdatedCongestionState(logging.CongestionStateSlowStart)
 		b.lastQlg = logging.CongestionStateSlowStart

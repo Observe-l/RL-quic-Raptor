@@ -28,6 +28,12 @@ OUT_DIR=${OUT_DIR:-"$ROOT/go/test_data"}
 
 TIMEOUT_S=${TIMEOUT_S:-15}
 
+# Congestion control defaults:
+# - Always enable CC by default (bypass is lab-only).
+# - Default algorithm: BBRv2.
+export QUIC_FEC_CC_BYPASS=${QUIC_FEC_CC_BYPASS:-0}
+export QUIC_FEC_CC_ALGO=${QUIC_FEC_CC_ALGO:-bbrv2}
+
 # Training / experiment speed flags (match quicfec_run_once.sh semantics):
 #   SETUP_ONLY=1         Only prepare netns/tc (and optional build), then exit 0.
 #   SKIP_NETNS_RESET=1   Assume netns/veth already exist; do not recreate.
@@ -139,8 +145,6 @@ fi
 # Run client
 CLI_LOG=$(mktemp -t quic_raw_cli.XXXXXX.log)
 START=$(date +%s%N)
-QUIC_FEC_CC_BYPASS=${QUIC_FEC_CC_BYPASS:-0} \
-QUIC_FEC_CC_ALGO=${QUIC_FEC_CC_ALGO:-} \
 TIMED_OUT=0
 
 # Byte counters on host veth (network-layer; includes headers).
@@ -149,6 +153,27 @@ if [[ -r "/sys/class/net/${VETH_HOST}/statistics/tx_bytes" ]]; then
   TX0=$(cat "/sys/class/net/${VETH_HOST}/statistics/tx_bytes" 2>/dev/null || echo 0)
   RX0=$(cat "/sys/class/net/${VETH_HOST}/statistics/rx_bytes" 2>/dev/null || echo 0)
 fi
+
+# IMPORTANT: tc netem drops happen in the qdisc. Dropped packets usually do NOT
+# contribute to /sys tx_bytes, which would under-report overhead under loss.
+qdisc_dropped_pkts() {
+  # Count drops from the netem qdisc only (tbf also reports the same drop count).
+  # Token can appear as "(dropped" depending on tc version.
+  sudo tc -s qdisc show dev "$VETH_HOST" 2>/dev/null | awk '
+    /^qdisc/ { in_netem = ($2 == "netem"); next }
+    in_netem && /dropped/ {
+      for (i=1; i<=NF; i++) {
+        if ($i ~ /dropped/) {
+          v = $(i+1)
+          gsub(/[^0-9]/, "", v)
+          if (v != "") sum += v
+        }
+      }
+    }
+    END { print sum+0 }
+  '
+}
+DROP0=$(qdisc_dropped_pkts)
 if command -v timeout >/dev/null 2>&1; then
   timeout --signal=KILL ${TIMEOUT_S}s \
     "$BIN_DIR/quicraw-client" -addr ${SRV_IP}:$PORT -file "$FILE" -timeout ${TIMEOUT_S}s -measure-delay=true -packet-bytes 1200 \
@@ -167,6 +192,10 @@ if [[ "$RC" == "124" || "$RC" == "137" ]]; then
 fi
 END=$(date +%s%N)
 
+DROP1=$(qdisc_dropped_pkts)
+DROP_PKTS=$(( DROP1 - DROP0 ))
+if [[ "$DROP_PKTS" -lt 0 ]]; then DROP_PKTS=0; fi
+
 TX1=$TX0; RX1=$RX0
 if [[ -r "/sys/class/net/${VETH_HOST}/statistics/tx_bytes" ]]; then
   TX1=$(cat "/sys/class/net/${VETH_HOST}/statistics/tx_bytes" 2>/dev/null || echo "$TX0")
@@ -176,6 +205,12 @@ TX_BYTES=$(( TX1 - TX0 ))
 RX_BYTES=$(( RX1 - RX0 ))
 if [[ "$TX_BYTES" -lt 0 ]]; then TX_BYTES=0; fi
 if [[ "$RX_BYTES" -lt 0 ]]; then RX_BYTES=0; fi
+
+# Adjust tx_bytes to include locally-dropped packets (best-effort estimate).
+# quicraw-client uses -packet-bytes 1200; add a conservative wire-overhead fudge.
+EST_WIRE_BYTES=${EST_WIRE_BYTES:-1264}
+DROP_BYTES_EST=$(( DROP_PKTS * EST_WIRE_BYTES ))
+TX_BYTES_ADJ=$(( TX_BYTES + DROP_BYTES_EST ))
 
 # Wait for server to finish writing (bounded).
 IN_SIZE=$(stat -c%s "$FILE")
@@ -239,7 +274,28 @@ if [[ -n "${LOSS_MODE}" ]]; then
   LOSS_TAG="${LOSS_MODE}"
 fi
 
-echo "[run] proto=quic_raw bitrate=${BITRATE_MBPS}Mbps rtt=${RTT_MS}ms loss=${LOSS_TAG} dur_ms=${DUR_MS_SERVER} dur_ms_client=${DUR_MS_CLIENT} timed_out=${TIMED_OUT} client_ok=${CLIENT_OK} client_rc=${RC} md5_ok=${MD5_OK} s_mbps=${S_MBPS} file_bytes=${FILE_SIZE} tx_bytes=${TX_BYTES} rx_bytes=${RX_BYTES}" >&2
+OVERHEAD_SYS=""
+OVERHEAD=""
+if [[ "$FILE_SIZE" -gt 0 ]]; then
+  OVERHEAD_SYS=$(awk -v tb="$TX_BYTES" -v fb="$FILE_SIZE" 'BEGIN{printf "%.3f", (tb-fb)/fb}')
+  OVERHEAD=$(awk -v tb="$TX_BYTES_ADJ" -v fb="$FILE_SIZE" 'BEGIN{printf "%.3f", (tb-fb)/fb}')
+fi
+
+# Real E2E delay (sender start -> receiver finished writing all bytes), using shared host clock.
+SENDER_LINE=$(grep -E '^\[sender-e2e\] ' "$CLI_LOG" | tail -n1 || true)
+SENDER_START_NS=$(echo "$SENDER_LINE" | sed -n 's/.*start_ns=\([0-9]\+\).*/\1/p')
+RECV_LINE=$(grep -E '^\[receiver-e2e\] ' "$SRV_LOG" | tail -n1 || true)
+RECV_END_NS=$(echo "$RECV_LINE" | sed -n 's/.*end_ns=\([0-9]\+\).*/\1/p')
+RECV_OK=$(echo "$RECV_LINE" | sed -n 's/.*ok=\([0-9]\+\).*/\1/p')
+E2E_DELAY_MS="nan"
+if [[ -n "$SENDER_START_NS" && -n "$RECV_END_NS" && "${RECV_OK:-1}" == "1" ]]; then
+  E2E_DELAY_MS=$(awk -v a="$SENDER_START_NS" -v b="$RECV_END_NS" 'BEGIN{d=(b-a)/1000000.0; if(d<0)d=0; printf "%.3f", d}')
+fi
+
+echo "[run] proto=quic_raw bitrate=${BITRATE_MBPS}Mbps rtt=${RTT_MS}ms loss=${LOSS_TAG} dur_ms=${DUR_MS_SERVER} dur_ms_client=${DUR_MS_CLIENT} e2e_delay_ms=${E2E_DELAY_MS} sender_start_ns=${SENDER_START_NS:-} receiver_end_ns=${RECV_END_NS:-} srv_log=${SRV_LOG} cli_log=${CLI_LOG} timed_out=${TIMED_OUT} client_ok=${CLIENT_OK} client_rc=${RC} md5_ok=${MD5_OK} s_mbps=${S_MBPS} file_bytes=${FILE_SIZE} tx_bytes=${TX_BYTES} tx_bytes_adj=${TX_BYTES_ADJ} drop_pkts=${DROP_PKTS} overhead_sys=${OVERHEAD_SYS} overhead=${OVERHEAD} rx_bytes=${RX_BYTES}" >&2
+
+OVERHEAD_ADJ="${OVERHEAD}"
+echo "[run-adj] proto=quic_raw drop_pkts=${DROP_PKTS} tx_bytes_adj=${TX_BYTES_ADJ} overhead_adj=${OVERHEAD_ADJ}" >&2
 
 # Emit AoI-style average one-way delay from server output.
 DELAY_LINE=$(grep -E '^\[delay\] ' "$SRV_LOG" | tail -n1 || true)

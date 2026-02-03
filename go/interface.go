@@ -58,6 +58,13 @@ type TokenStore interface {
 // when the server rejects a 0-RTT connection attempt.
 var Err0RTTRejected = errors.New("0-RTT rejected")
 
+// ErrDatagramSendQueueFull is returned from [Conn.SendDatagram] when the internal
+// DATAGRAM send queue is full for an extended period of time.
+//
+// Note that this can happen under congestion / loss, since DATAGRAM frames are not
+// retransmitted and can therefore not be used for PTO-style probes.
+var ErrDatagramSendQueueFull = errors.New("datagram send queue full")
+
 // ConnectionTracingKey can be used to associate a [logging.ConnectionTracer] with a [Conn].
 // It is set on the Conn.Context() context,
 // as well as on the context passed to logging.Tracer.NewConnectionTracer.
@@ -104,6 +111,16 @@ type ConnectionIDGenerator interface {
 	// Implementations must return constant-length Connection IDs with lengths between 0 and 20 bytes.
 	// A length of 0 can only be used when an endpoint doesn't need to multiplex connections during migration.
 	ConnectionIDLen() int
+}
+
+// DatagramObserver can observe when DATAGRAM frames are acknowledged or declared lost.
+//
+// Note that QUIC DATAGRAMs are unreliable: even if a DATAGRAM frame is declared lost,
+// QUIC will not retransmit it. This hook exists to enable application-level recovery
+// mechanisms (e.g. FEC repair scheduling) based on QUIC's packet loss detection.
+type DatagramObserver interface {
+	OnDatagramAcked(data []byte)
+	OnDatagramLost(data []byte)
 }
 
 // Config contains all configuration data needed for a QUIC server or client.
@@ -186,6 +203,9 @@ type Config struct {
 	Allow0RTT bool
 	// Enable QUIC datagram support (RFC 9221).
 	EnableDatagrams bool
+	// DatagramObserver, if set, is notified when DATAGRAM frames are acknowledged or declared lost.
+	// It is only invoked for 1-RTT packets that contain DATAGRAM frames.
+	DatagramObserver DatagramObserver
 	// Enable QUIC Stream Resets with Partial Delivery.
 	// See https://datatracker.ietf.org/doc/html/draft-ietf-quic-reliable-stream-reset-07.
 	EnableStreamResetPartialDelivery bool

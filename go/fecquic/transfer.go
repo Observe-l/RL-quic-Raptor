@@ -12,7 +12,9 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,27 +36,22 @@ const (
 
 // SendOptions control ClientSendFile behavior.
 type SendOptions struct {
-	K, N, L     int
-	InsecureTLS bool
-	DropProb    float64
-	Seed        int64
-	PaceEach    time.Duration
-	BlockPause  time.Duration
-	// RxDDL is the receiver decode deadline per block.
-	// It is sent once in the FileHeader and applied by the server.
-	// 0 means "not specified".
-	RxDDL         time.Duration
+	K, N, L       int
+	InsecureTLS   bool
+	DropProb      float64
+	Seed          int64
+	PaceEach      time.Duration
+	BlockPause    time.Duration
 	WarnDgramSize int           // bytes; 0 disables
 	PostWait      time.Duration // linger before closing
 	AckEvery      int           // write 1B on a stream every N datagrams (ack-eliciting); <=0 uses default
 	Transport     string        // "dgram" (default) or "stream"
 	// ARQ options
-	UseARQ         bool    // enable ARQ control plane and on-demand repairs
-	InitialRepairs int     // R0: additional repairs to send initially (defaults to N-K if N provided)
-	WindowW        int     // max unfinished clusters in flight (0=unlimited)
-	RStep          int     // minimum repairs per NACK
-	Alpha          float64 // scaling for deficit in ΔR
-	MaxAttempts    int     // max ARQ attempts per cluster (0=no cap)
+	UseARQ         bool // enable ARQ control plane and on-demand repairs
+	InitialRepairs int  // R0: additional repairs to send initially (defaults to N-K if N provided)
+	WindowW        int  // max unfinished clusters in flight (0=unlimited)
+	RStep          int  // repairs to append per repair round
+	MaxAttempts    int  // max ARQ attempts per cluster (0=no cap)
 }
 
 // ClientSendFile connects and sends a file using QFEC header + RaptorQ symbols over datagrams.
@@ -95,8 +92,12 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		L = DefaultL
 	}
 	ackEvery := opts.AckEvery
-	if ackEvery < 0 {
-		ackEvery = 1 // negative => use default
+	// DATAGRAM-only packets are not ACK-eliciting. Without occasional ACK-eliciting
+	// frames (e.g. tiny STREAM writes), BBRv2 has weak ACK clocking and the sender
+	// may underfill the bottleneck even on no-loss links.
+	// Convention in our tooling: ackEvery=0 means "auto".
+	if ackEvery <= 0 {
+		ackEvery = 8
 	}
 
 	f, err := os.Open(path)
@@ -118,6 +119,14 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	var sum [32]byte // zero => receiver will skip SHA verification
 
 	tlsConf := &tls.Config{InsecureSkipVerify: opts.InsecureTLS, NextProtos: []string{alpn}}
+	// Sender-side loss observation (only used when ARQ / repair scheduling is enabled).
+	// This receives callbacks from the QUIC stack when DATAGRAM frames are ACKed or declared lost.
+	// We forward only (blockID, symID) metadata via a buffered channel.
+	dgramEvtCh := make(chan dgramEvt, 262144)
+	var dObs *datagramObserver
+	if opts.UseARQ {
+		dObs = &datagramObserver{ch: dgramEvtCh}
+	}
 	qconf := &quic.Config{
 		// attach our ECN tracer to observe CE/ECT counts
 		Tracer: func(ctx context.Context, p logging.Perspective, cid logging.ConnectionID) *logging.ConnectionTracer {
@@ -127,9 +136,20 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 			)
 		},
 		EnableDatagrams: true,
-		// Prevent idle timeouts; keep small to avoid tail delays on shutdown.
-		KeepAlivePeriod:                20 * time.Millisecond,
-		MaxIdleTimeout:                 6 * time.Second,
+		DatagramObserver: func() quic.DatagramObserver {
+			// Avoid taking a dependency on ARQ in the QUIC core; just return the fecquic observer.
+			if dObs == nil {
+				return nil
+			}
+			return dObs
+		}(),
+		// Reliability under loss/RTT:
+		// - Handshake can legitimately take multiple seconds under GE burst loss.
+		// - A very small KeepAlivePeriod (e.g. 20ms) adds lots of extra packets,
+		//   hurting short-flow goodput and inflating measured overhead.
+		HandshakeIdleTimeout:           30 * time.Second,
+		KeepAlivePeriod:                2 * time.Second,
+		MaxIdleTimeout:                 90 * time.Second,
 		InitialStreamReceiveWindow:     8 * 1024 * 1024,
 		InitialConnectionReceiveWindow: 16 * 1024 * 1024,
 	}
@@ -148,9 +168,6 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		return err
 	}
 	hdr := FileHeader{Version: 1, FileSize: uint64(size), SHA256: sum, ChunkL: uint32(L)}
-	if opts.RxDDL > 0 {
-		hdr.RxDDLMS = uint32(opts.RxDDL.Milliseconds())
-	}
 	if _, err := str.Write(hdr.MarshalBinary()); err != nil {
 		return err
 	}
@@ -221,6 +238,10 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	// Metrics counters
 	start := time.Now()
 	var sentDgrams, sentBytes, sendErrs, dtleCount int64
+	var sendQFullCount int64
+	var lastSendQFullLog time.Time
+	var lastSendErrLog time.Time
+	var sendErrLogCount int
 	var dgramsSinceAck int
 	var encTime time.Duration
 	var sendTime time.Duration
@@ -232,6 +253,10 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	var lastSend time.Time
 	var interSum time.Duration
 	var interCount int
+	sendBlocksDone := make(chan struct{})
+	// Reuse per-symbol buffers to reduce allocations / GC overhead.
+	// Safe because SendDatagram / Stream.Write copy from the provided slice before returning.
+	symBufPool := sync.Pool{New: func() any { return make([]byte, fecwire.HeaderLen+L) }}
 
 	sendSymbol := func(b []byte) error {
 		if opts.Transport == "stream" {
@@ -250,14 +275,39 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 				dgramsSinceAck = 0
 			}
 		}
-		if err := conn.SendDatagram(b); err != nil {
+		for {
+			err := conn.SendDatagram(b)
+			if err == nil {
+				return nil
+			}
+			now := time.Now()
+			// Avoid deadlocks: SendDatagram can block internally when the send queue is full.
+			// The QUIC stack will return ErrDatagramSendQueueFull after a bounded wait.
+			// Retry with ctx awareness instead of hanging forever.
+			if errors.Is(err, quic.ErrDatagramSendQueueFull) {
+				sendQFullCount++
+				if lastSendQFullLog.IsZero() || now.Sub(lastSendQFullLog) >= 1*time.Second {
+					lastSendQFullLog = now
+					fmt.Fprintf(os.Stderr, "[client-sendq] full; sent_dgrams=%d\n", sentDgrams)
+				}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(2 * time.Millisecond):
+					continue
+				}
+			}
 			var dtle *quic.DatagramTooLargeError
 			if errors.As(err, &dtle) {
 				dtleCount++
 			}
+			if sendErrLogCount < 16 && (lastSendErrLog.IsZero() || now.Sub(lastSendErrLog) >= 250*time.Millisecond) {
+				lastSendErrLog = now
+				sendErrLogCount++
+				fmt.Fprintf(os.Stderr, "[client-send] err=%T %v\n", err, err)
+			}
 			return err
 		}
-		return nil
 	}
 
 	// Live goodput printer
@@ -265,6 +315,10 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
+		stallDumped := false
+		lastProgressAt := time.Now()
+		lastBytes := int64(-1)
+		dumpOnStall := os.Getenv("QUIC_FEC_DUMP_ON_STALL") == "1"
 		for {
 			select {
 			case <-ctx.Done():
@@ -277,6 +331,22 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 					dur = 1e-6
 				}
 				b := sentBytes
+				if b != lastBytes {
+					lastBytes = b
+					lastProgressAt = time.Now()
+				} else if dumpOnStall && !stallDumped {
+					select {
+					case <-sendBlocksDone:
+						// send loop finished; stalls here are expected (waiting for ACK/DONE)
+					default:
+						if time.Since(lastProgressAt) >= 2*time.Second {
+							stallDumped = true
+							buf := make([]byte, 1<<20)
+							n := runtime.Stack(buf, true)
+							fmt.Fprintf(os.Stderr, "[stall] no tx progress for %s; dumping stacks\n%s\n", time.Since(lastProgressAt).Truncate(time.Millisecond), string(buf[:n]))
+						}
+					}
+				}
 				mbps := (float64(b) * 8 / 1e6) / dur
 				_, _, rx0, rx1, rxce, _ := ecnStats.Snapshot()
 				fmt.Fprintf(os.Stderr, "[live-client] tx_bytes=%d mbps=%.2f ecn_rx: CE=%d, ECT0=%d, ECT1=%d\n", b, mbps, rxce, rx0, rx1)
@@ -286,7 +356,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 
 	// Send symbols per block
 	sendBlocksStart := time.Now()
-	buf := make([]byte, K*L)
+	fmt.Fprintf(os.Stderr, "[sender-e2e] start_ns=%d\n", time.Now().UnixNano())
 	blockID := 0
 	// If ARQ window enforcement times out once, disable it for the remainder to avoid per-block 5s stalls
 	var arqWindowDisabled bool
@@ -301,22 +371,337 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	// ARQ: map of active block transmitters
 	type blockTx struct {
 		K, L       int
-		enc        *fec.RaptorQEncoder
-		nextESI    int // next repair ESI to send (>=K)
-		repairsOut int // how many repairs sent so far
-		attempt    int // last processed attempt idx
+		blockBytes []byte              // padded to exactly K*L
+		enc        *fec.RaptorQEncoder // lazily initialized when repairs are needed
+		nextESI    int                 // next repair ESI to send (>=K)
+		repairsOut int                 // how many repairs sent so far
+		// repair scheduling guards
+		sending      bool      // true while a repair batch is being appended
+		lastRepairAt time.Time // last time we finished appending a repair batch
+		nextRepairAt time.Time // next eligible time to append another repair batch (PTO-style)
+		lastAckAt    time.Time // last time we observed a new ACK for this block (PTO based on ack-progress)
+		armedAt      time.Time // time when we finished sending the initial codeword for this block
+		// sender-side loss accounting (based on QUIC packet loss detection)
+		totalSent  int
+		acked      [256]bool
+		lost       [256]bool
+		ackedCount int
+		lostCount  int
+		pending    bool
+		attempt    int // how many Rstep repair rounds we've appended
 	}
 	txMu := &sync.Mutex{}
 	active := make(map[uint16]*blockTx)
 	cond := sync.NewCond(txMu)
+
+	// Sender-side repair requests (loss-driven, based on QUIC's default packetThreshold=3).
+	// The receiver no longer sends NACK; it only sends a reliable ACK when a block decodes successfully.
+	type repairReq struct {
+		bid    uint16
+		n      int
+		reason string
+	}
+	repairReqCh := make(chan repairReq, 65536)
+	// Debounce repair batches per block. Without this, bursty/spurious loss signals can
+	// enqueue many back-to-back Rstep batches for the same block, inflating overhead.
+	// Override with QUIC_FEC_ARQ_REPAIR_COOLDOWN_MS (0 disables cooldown).
+	// Default is 0 because nextRepairAt (PTO-style gating) is the primary pacing mechanism.
+	repairCooldown := time.Duration(0)
+	if v := strings.TrimSpace(os.Getenv("QUIC_FEC_ARQ_REPAIR_COOLDOWN_MS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			if n <= 0 {
+				repairCooldown = 0
+			} else {
+				repairCooldown = time.Duration(n) * time.Millisecond
+			}
+		}
+	}
+	// PTO-style repair pacing: mimic QUIC retransmission behavior.
+	basePTO := 100 * time.Millisecond
+	if rttStr := strings.TrimSpace(os.Getenv("RTT_MS")); rttStr != "" {
+		if ms, err := strconv.Atoi(rttStr); err == nil && ms > 0 {
+			// Approximate PTO as 2*RTT.
+			basePTO = time.Duration(ms*2) * time.Millisecond
+		}
+	}
+	if ptoStr := strings.TrimSpace(os.Getenv("QUIC_FEC_ARQ_PTO_MS")); ptoStr != "" {
+		if ms, err := strconv.Atoi(ptoStr); err == nil {
+			if ms <= 0 {
+				basePTO = 0
+			} else {
+				basePTO = time.Duration(ms) * time.Millisecond
+			}
+		}
+	}
+	// Cap the burst size of a single repair batch.
+	maxBatch := maxInt(8, maxInt(1, opts.RStep)*4)
+	if s := strings.TrimSpace(os.Getenv("QUIC_FEC_ARQ_MAX_BATCH")); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			maxBatch = n
+		}
+	}
+	// Periodic scan tick for PTO-based repairs.
+	// Default: disabled. Probing can inflate overhead under burst/GE loss.
+	// Enable with QUIC_FEC_ARQ_SCAN_TICK_MS (e.g. 10).
+	scanTick := time.Duration(0)
+	if s := strings.TrimSpace(os.Getenv("QUIC_FEC_ARQ_SCAN_TICK_MS")); s != "" {
+		if n, err := strconv.Atoi(s); err == nil {
+			if n <= 0 {
+				scanTick = 0
+			} else {
+				scanTick = time.Duration(n) * time.Millisecond
+			}
+		}
+	}
+	computeDeficit := func(bt *blockTx) int {
+		maxDeliverable := bt.totalSent - bt.lostCount
+		if bt.K-maxDeliverable <= 0 {
+			return 0
+		}
+		return bt.K - maxDeliverable
+	}
+	computeBatchForLoss := func(bt *blockTx) int {
+		// Always use RStep-sized batches (capped by deficit) to avoid over-repair bursts.
+		r := opts.RStep
+		if r <= 0 {
+			r = 4
+		}
+		def := computeDeficit(bt)
+		if def <= 0 {
+			return 0
+		}
+		if def < r {
+			r = def
+		}
+		if r < 1 {
+			r = 1
+		}
+		return minInt(maxBatch, r)
+	}
+	computeBatchForPTO := func(bt *blockTx) int {
+		// Probe with RStep (or smaller if we can infer we're close), but always send at least 1.
+		r := opts.RStep
+		if r <= 0 {
+			r = 4
+		}
+		missing := bt.K - bt.ackedCount
+		if missing < 1 {
+			missing = 1
+		}
+		if missing < r {
+			r = missing
+		}
+		if r < 1 {
+			r = 1
+		}
+		return minInt(maxBatch, r)
+	}
+	// Tail rescue: for tail losses where QUIC doesn't quickly declare DATAGRAMs lost.
+	// Default: disabled (can inflate overhead under GE). Enable with QUIC_FEC_ARQ_TAIL_RESCUE_MS.
+	tailRescue := time.Duration(0)
+	if s := strings.TrimSpace(os.Getenv("QUIC_FEC_ARQ_TAIL_RESCUE_MS")); s != "" {
+		if n, err := strconv.Atoi(s); err == nil {
+			if n <= 0 {
+				tailRescue = 0
+			} else {
+				tailRescue = time.Duration(n) * time.Millisecond
+			}
+		}
+	}
+	if opts.UseARQ {
+		fmt.Fprintf(os.Stderr, "[arq-conf] use=1 base_pto_ms=%d scan_tick_ms=%d tail_rescue_ms=%d rstep=%d max_batch=%d\n",
+			basePTO.Milliseconds(), scanTick.Milliseconds(), tailRescue.Milliseconds(), opts.RStep, maxBatch)
+		// PTO-style repair timer: if a block is still missing symbols after PTO, send another batch
+		// even if no new loss callbacks arrive.
+		if scanTick > 0 {
+			go func() {
+				t := time.NewTicker(scanTick)
+				defer t.Stop()
+				lastHB := time.Time{}
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-t.C:
+						now := time.Now()
+						// heartbeat / debug snapshot (rate-limited)
+						var hbLine string
+						txMu.Lock()
+						if lastHB.IsZero() || now.Sub(lastHB) >= 1*time.Second {
+							activeN := len(active)
+							pendingN := 0
+							armedZero := 0
+							oldestMs := int64(0)
+							for _, bt := range active {
+								if bt == nil {
+									continue
+								}
+								if bt.pending {
+									pendingN++
+								}
+								if bt.armedAt.IsZero() {
+									armedZero++
+									continue
+								}
+								ageMs := now.Sub(bt.armedAt).Milliseconds()
+								if ageMs > oldestMs {
+									oldestMs = ageMs
+								}
+							}
+							hbLine = fmt.Sprintf("[arq-scan] active=%d pending=%d armed_zero=%d oldest_ms=%d\n", activeN, pendingN, armedZero, oldestMs)
+							lastHB = now
+						}
+						for bid, bt := range active {
+							if bt == nil || bt.pending || bt.sending {
+								continue
+							}
+							if basePTO <= 0 || bt.armedAt.IsZero() {
+								continue
+							}
+							// Don't probe immediately after the initial codeword.
+							// Loss-driven repairs are handled by the dgram ACK/loss handler.
+							if now.Sub(bt.armedAt) < basePTO {
+								continue
+							}
+							// Only fire when the per-block timer expires.
+							if !bt.nextRepairAt.IsZero() && now.Before(bt.nextRepairAt) {
+								continue
+							}
+							// Determine whether we should send PTO-based repairs:
+							// - If QUIC already declared loss for this block (hard deficit), recover.
+							// - If we've already started repairing (attempt>0), continue probing.
+							// - Else, tail-rescue after a longer delay *even if QUIC ACKed K packets*.
+							//   QUIC ACK only means the packet arrived, not that the receiver admitted
+							//   the symbol into its decode buffer.
+							needHard := computeDeficit(bt) > 0
+							needRepair := false
+							if needHard {
+								needRepair = true
+							} else if bt.attempt > 0 {
+								// If loss deficit is already covered and QUIC has ACKed >=K symbols,
+								// the receiver likely has enough to decode and we're just waiting on
+								// the success ACK. Probing too frequently here inflates overhead under GE.
+								if bt.ackedCount >= bt.K {
+									if tailRescue > 0 && !bt.lastRepairAt.IsZero() && now.Sub(bt.lastRepairAt) >= tailRescue {
+										needRepair = true
+									}
+								} else {
+									needRepair = true
+								}
+							} else if tailRescue > 0 && now.Sub(bt.armedAt) >= tailRescue {
+								needRepair = true
+							}
+							canRepair := opts.MaxAttempts <= 0 || bt.attempt < opts.MaxAttempts
+							if !needRepair || !canRepair {
+								continue
+							}
+							if repairCooldown > 0 && !bt.lastRepairAt.IsZero() && now.Sub(bt.lastRepairAt) < repairCooldown {
+								continue
+							}
+							bt.pending = true
+							n := computeBatchForPTO(bt)
+							select {
+							case repairReqCh <- repairReq{bid: bid, n: n, reason: "pto"}:
+								// Breadcrumb for diagnosing "no repairs sent" stalls.
+								fmt.Fprintf(os.Stderr, "[arq-scan] enqueue block=%d n=%d hard=%v attempt=%d age_ms=%d\n",
+									bid, n, needHard, bt.attempt, now.Sub(bt.armedAt).Milliseconds())
+							default:
+								// Don't wedge the block if the queue is temporarily full.
+								bt.pending = false
+							}
+						}
+						txMu.Unlock()
+						if hbLine != "" {
+							fmt.Fprint(os.Stderr, hbLine)
+						}
+					}
+				}
+			}()
+		}
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case e := <-dgramEvtCh:
+					if e.typ != dgramEvtAck && e.typ != dgramEvtLost {
+						continue
+					}
+					txMu.Lock()
+					bt := active[e.blockID]
+					if bt == nil {
+						txMu.Unlock()
+						continue
+					}
+					// Don't schedule repairs before the initial codeword for this block is fully sent.
+					// Otherwise repairs can overlap with initial sending and contend in the encoder.
+					armed := !bt.armedAt.IsZero()
+					idx := int(e.symID)
+					if idx >= 0 && idx < len(bt.acked) {
+						if e.typ == dgramEvtAck {
+							if !bt.acked[idx] {
+								bt.acked[idx] = true
+								bt.ackedCount++
+								bt.lastAckAt = time.Now()
+							}
+							// ACK overrides loss (QUIC may declare loss before a later ACK arrives).
+							if bt.lost[idx] {
+								bt.lost[idx] = false
+								if bt.lostCount > 0 {
+									bt.lostCount--
+								}
+							}
+						} else {
+							// Ignore loss if already ACKed.
+							if !bt.acked[idx] && !bt.lost[idx] {
+								bt.lost[idx] = true
+								bt.lostCount++
+							}
+						}
+					}
+					// If even in the best case (all non-lost packets arrive) we can't reach K symbols,
+					// append repairs (PTO-style, debounced per block).
+					needRepair := armed && computeDeficit(bt) > 0
+					canRepair := opts.MaxAttempts <= 0 || bt.attempt < opts.MaxAttempts
+					if needRepair && canRepair && !bt.pending && !bt.sending {
+						now := time.Now()
+						if !bt.nextRepairAt.IsZero() && now.Before(bt.nextRepairAt) {
+							// too early to send another batch for this block
+							txMu.Unlock()
+							continue
+						}
+						if repairCooldown > 0 && !bt.lastRepairAt.IsZero() && now.Sub(bt.lastRepairAt) < repairCooldown {
+							txMu.Unlock()
+							continue
+						}
+						bt.pending = true
+						n := computeBatchForLoss(bt)
+						if n <= 0 {
+							bt.pending = false
+							txMu.Unlock()
+							continue
+						}
+						select {
+						case repairReqCh <- repairReq{bid: e.blockID, n: n, reason: "loss"}:
+						default:
+							// Don't wedge the block if the queue is temporarily full.
+							bt.pending = false
+						}
+					}
+					txMu.Unlock()
+				}
+			}
+		}()
+	}
 
 	// DONE ACK (server->client) via control uni-stream.
 	// Enabled by default; disable with QUIC_FEC_WAIT_DONE=0.
 	waitDone := os.Getenv("QUIC_FEC_WAIT_DONE") != "0"
 	doneMsgCh := make(chan DoneFile, 1)
 	var doneSeen sync.Once
+	var doneObserved *DoneFile
 
-	// Control reader: accept server control uni stream(s) and react to NACK/ACK/DONE.
+	// Control reader: accept server control uni stream(s) and react to ACK/DONE.
 	go func() {
 		for {
 			us, err := conn.AcceptUniStream(ctx)
@@ -344,113 +729,47 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 							}
 						})
 						return
-					case arqMsgNACK:
-						if !opts.UseARQ {
-							continue
-						}
-						n := msg.(NackNeedMore)
-						bid := uint16(n.ClusterID)
-						txMu.Lock()
-						bt := active[bid]
-						txMu.Unlock()
-						if bt == nil {
-							continue
-						}
-						// ignore stale attempts (process each attempt index once)
-						if int(n.AttemptIdx) <= bt.attempt {
-							continue
-						}
-						// If we've reached the maximum number of ARQ attempts for this block, give up and free a window slot.
-						if opts.MaxAttempts > 0 && int(n.AttemptIdx) >= opts.MaxAttempts {
-							txMu.Lock()
-							delete(active, bid)
-							txMu.Unlock()
-							cond.Broadcast()
-							fmt.Fprintf(os.Stderr, "[arq] giveup block=%d at attempt=%d (max=%d)\n", bid, n.AttemptIdx, opts.MaxAttempts)
-							continue
-						}
-						toSend := int(n.RecommendExtra)
-						if toSend <= 0 {
-							toSend = 0
-						}
-						// ΔR policy: max(rec_extra, R_step, ceil(alpha * deficit))
-						deficit := 0
-						if bt.K-int(n.RxUnique) > 0 {
-							deficit = bt.K - int(n.RxUnique)
-						}
-						rstep := opts.RStep
-						if rstep <= 0 {
-							rstep = 4
-						}
-						alpha := opts.Alpha
-						if alpha <= 0 {
-							alpha = 0.6
-						}
-						cand := int(alpha*float64(deficit) + 0.9999)
-						if cand < rstep {
-							cand = rstep
-						}
-						if cand < toSend {
-							cand = toSend
-						}
-						if cand <= 0 {
-							cand = 1
-						}
-						if cand == 0 {
-							// nothing to append
-							continue
-						}
-						// send cand fresh repairs
-						for i := 0; i < cand; i++ {
-							esi := bt.nextESI
-							payload := bt.enc.GenSymbol(uint32(esi))
-							// Avoid per-packet allocation: reuse a fixed-size buffer.
-							// SendDatagram copies the slice before returning, so reuse is safe.
-							b := make([]byte, fecwire.HeaderLen+bt.L)
-							pay := b[fecwire.HeaderLen:]
-							if len(payload) == bt.L {
-								copy(pay, payload)
-							} else {
-								clear(pay)
-								copy(pay, payload)
-							}
-							// Guard N to avoid overflow and unrealistic growth
-							advN := minInt(255, bt.K+bt.repairsOut+1)
-							h := fecwire.FECHeader{
-								Version:    1,
-								Scheme:     fecwire.SchemeRaptorQ,
-								BlockID:    bid,
-								N:          uint8(advN),
-								K:          uint8(bt.K),
-								SymID:      uint8(esi),
-								PayloadLen: uint32(bt.L),
-							}
-							h.MarshalBinary(b[:fecwire.HeaderLen])
-							if err := sendSymbol(b); err == nil {
-								sentDgrams++
-								sentBytes += int64(len(b))
-								totalSymbols++
-								totalRepairs++
-							} else {
-								sendErrs++
-							}
-							bt.nextESI++
-							bt.repairsOut++
-							if pc != nil {
-								pc.AfterSend()
-							}
-						}
-						bt.attempt = int(n.AttemptIdx)
-						totalAttempts++
 					case arqMsgACK:
 						if !opts.UseARQ {
 							continue
 						}
 						a := msg.(AckSuccess)
 						bid := uint16(a.ClusterID)
+						var kickBid *uint16
+						kickN := 0
 						txMu.Lock()
 						delete(active, bid)
+						// If later blocks succeed but an earlier block is still pending, kick the earliest one.
+						var minPending uint16
+						found := false
+						for id := range active {
+							if id < bid {
+								if !found || id < minPending {
+									minPending = id
+									found = true
+								}
+							}
+						}
+						if found {
+							bt := active[minPending]
+							if bt != nil && !bt.pending && !bt.sending {
+								now := time.Now()
+								if (!bt.nextRepairAt.IsZero() && now.Before(bt.nextRepairAt)) || (repairCooldown > 0 && !bt.lastRepairAt.IsZero() && now.Sub(bt.lastRepairAt) < repairCooldown) {
+									// not eligible yet
+								} else {
+									bt.pending = true
+									kickBid = &minPending
+									kickN = computeBatchForPTO(bt)
+								}
+							}
+						}
 						txMu.Unlock()
+						if kickBid != nil {
+							select {
+							case repairReqCh <- repairReq{bid: *kickBid, n: kickN, reason: "out_of_order"}:
+							default:
+							}
+						}
 						cond.Broadcast()
 					}
 				}
@@ -458,48 +777,227 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		}
 	}()
 
+	// Sender-side repair appender: send fresh repair symbols for a block.
+	// Bounded by maxBatch and ESI space (0..255).
+	sendRepairs := func(bid uint16, n int, reason string) {
+		if !opts.UseARQ {
+			return
+		}
+		if n <= 0 {
+			n = 1
+		}
+		if n > maxBatch {
+			n = maxBatch
+		}
+		// Mark the block as actively sending repairs so we don't enqueue another batch
+		// mid-flight due to loss callbacks.
+		now := time.Now()
+		txMu.Lock()
+		bt0 := active[bid]
+		if bt0 == nil {
+			txMu.Unlock()
+			return
+		}
+		// Clear pending on batch start.
+		bt0.pending = false
+		bt0.sending = true
+		if basePTO > 0 {
+			cooldown := basePTO
+			// For FEC repairs, waiting a full PTO between batches is overly conservative.
+			// Use a shorter cooldown to recover GE bursts faster.
+			if reason != "window_full" {
+				short := basePTO / 4
+				if short < 20*time.Millisecond {
+					short = 20 * time.Millisecond
+				}
+				if short < cooldown {
+					cooldown = short
+				}
+			}
+			// Only the window-pressure kick should bypass the usual PTO-style spacing.
+			// Being too aggressive on ordinary loss callbacks can inflate repair overhead.
+			if reason == "window_full" {
+				if cooldown > 10*time.Millisecond {
+					cooldown = 10 * time.Millisecond
+				}
+			}
+			bt0.nextRepairAt = now.Add(cooldown)
+		} else {
+			bt0.nextRepairAt = time.Time{}
+		}
+		txMu.Unlock()
+		defer func() {
+			txMu.Lock()
+			if bt := active[bid]; bt != nil {
+				bt.sending = false
+			}
+			txMu.Unlock()
+		}()
+
+		sentAny := 0
+		for i := 0; i < n; i++ {
+			txMu.Lock()
+			bt := active[bid]
+			if bt == nil {
+				txMu.Unlock()
+				break
+			}
+			// Optional attempt cap (each repair batch counts as one attempt).
+			if opts.MaxAttempts > 0 && bt.attempt >= opts.MaxAttempts {
+				delete(active, bid)
+				txMu.Unlock()
+				cond.Broadcast()
+				fmt.Fprintf(os.Stderr, "[arq] giveup block=%d at attempt=%d (max=%d)\n", bid, bt.attempt, opts.MaxAttempts)
+				return
+			}
+			esi := bt.nextESI
+			if esi > 255 {
+				txMu.Unlock()
+				break
+			}
+			enc := bt.enc
+			blockBytes := bt.blockBytes
+			L := bt.L
+			K := bt.K
+			repairsOut := bt.repairsOut
+			txMu.Unlock()
+
+			if enc == nil {
+				// Lazily initialize encoder only if we actually need to generate repairs.
+				enc0, encErr := fec.NewRaptorQEncoder(blockBytes, K, L)
+				if encErr != nil {
+					sendErrs++
+					continue
+				}
+				txMu.Lock()
+				if bt2 := active[bid]; bt2 != nil {
+					if bt2.enc == nil {
+						bt2.enc = enc0
+					}
+					enc = bt2.enc
+				}
+				txMu.Unlock()
+				if enc == nil {
+					// Block was removed while initializing.
+					break
+				}
+			}
+
+			// IMPORTANT: never call GenSymbol while holding txMu.
+			// Under loss, repair scheduling can overlap with send-path bookkeeping.
+			// If GenSymbol blocks (or contends internally), holding txMu here can deadlock
+			// the main sender which needs txMu to update counters.
+			payload := enc.GenSymbol(uint32(esi))
+
+			b := symBufPool.Get().([]byte)
+			pay := b[fecwire.HeaderLen:]
+			if len(payload) == L {
+				copy(pay, payload)
+			} else {
+				clear(pay)
+				copy(pay, payload)
+			}
+			advN := minInt(255, K+repairsOut+1)
+			h := fecwire.FECHeader{
+				Version:    1,
+				Scheme:     fecwire.SchemeRaptorQ,
+				BlockID:    bid,
+				N:          uint8(advN),
+				K:          uint8(K),
+				SymID:      uint8(esi),
+				Flags:      uint8(minInt(255, n)),
+				PayloadLen: uint32(L),
+			}
+			h.MarshalBinary(b[:fecwire.HeaderLen])
+			err := sendSymbol(b)
+			symBufPool.Put(b)
+			if err == nil {
+				sentDgrams++
+				sentBytes += int64(len(b))
+				totalSymbols++
+				totalRepairs++
+				sentAny++
+				txMu.Lock()
+				if bt2 := active[bid]; bt2 != nil {
+					bt2.nextESI++
+					bt2.repairsOut++
+					bt2.totalSent++
+				}
+				txMu.Unlock()
+				if pc != nil {
+					pc.AfterSend()
+				}
+			} else {
+				sendErrs++
+			}
+		}
+		if sentAny > 0 {
+			totalAttempts++
+			txMu.Lock()
+			if bt := active[bid]; bt != nil {
+				bt.attempt++
+				bt.lastRepairAt = time.Now()
+				// Debug breadcrumb.
+				fmt.Fprintf(os.Stderr, "[arq] repair block=%d round=%d sent=%d reason=%s\n", bid, bt.attempt, sentAny, reason)
+			}
+			txMu.Unlock()
+		}
+	}
+
+	// Dedicated repair worker: single consumer of repairReqCh.
+	// This prevents deadlocks / races from having multiple goroutines call sendRepairs.
+	if opts.UseARQ {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case req := <-repairReqCh:
+					sendRepairs(req.bid, req.n, req.reason)
+				}
+			}
+		}()
+	}
+
 	for {
-		n, err := io.ReadFull(f, buf)
-		if err == io.ErrUnexpectedEOF || err == io.EOF { // last partial block
+		// Read a full padded block of size K*L. For the last partial block, the tail is already zero.
+		blockBytes := make([]byte, K*L)
+		n, err := io.ReadFull(f, blockBytes)
+		if err == io.EOF {
 			if n == 0 {
 				break
 			}
-			buf = buf[:n]
-		} else if err != nil && err != io.EOF {
+		} else if err == io.ErrUnexpectedEOF {
+			// last partial block; keep n
+		} else if err != nil {
 			return err
 		}
 		// Enforce ARQ window to limit unfinished clusters.
 		// If a timeout is hit once, disable further gating to avoid cumulative stalls.
 		if opts.UseARQ && opts.WindowW > 0 && !arqWindowDisabled {
-			deadline := time.Now().Add(1 * time.Second)
+			// Under GE burst loss, strict window gating can cause sender stalls and
+			// trigger overly aggressive window-pressure repairs. Keep this wait short.
+			deadline := time.Now().Add(50 * time.Millisecond)
 			for {
 				txMu.Lock()
-				n := len(active)
-				txMu.Unlock()
-				if n < opts.WindowW {
+				nActive := len(active)
+				if nActive < opts.WindowW {
+					txMu.Unlock()
 					break
 				}
+				txMu.Unlock()
 				if time.Now().After(deadline) {
-					fmt.Fprintf(os.Stderr, "[arq] window wait timeout; proceeding n=%d W=%d; disabling window gating\n", n, opts.WindowW)
+					fmt.Fprintf(os.Stderr, "[arq] window wait timeout; proceeding n=%d W=%d; disabling window gating\n", nActive, opts.WindowW)
 					arqWindowDisabled = true
 					break
 				}
-				time.Sleep(10 * time.Millisecond)
+				time.Sleep(2 * time.Millisecond)
 			}
 		}
-		// Prepare encoder for this block so we can generate on-demand repairs later.
-		// IMPORTANT: Always pad the source block to exactly K*L bytes. The RaptorQ
-		// encoder/decoder interpret ESIs relative to K; for the last partial block,
-		// failing to pad here can make repair symbols inconsistent with the padded
-		// systematic symbols we transmit (and what the receiver decodes).
-		blockBytes := make([]byte, K*L)
-		copy(blockBytes, buf)
-		tEnc := time.Now()
-		enc, encErr := fec.NewRaptorQEncoder(blockBytes, K, L)
-		if encErr != nil {
-			return encErr
-		}
-		encTime += time.Since(tEnc)
+		// Lazily initialize a RaptorQ encoder only if we actually need to send any
+		// repair symbols (initial repairs or ARQ later). This significantly improves
+		// goodput in the common case where the systematic codeword is sufficient.
+		var enc *fec.RaptorQEncoder
 		// Decide initial symbols count
 		initRepairs := opts.InitialRepairs
 		if initRepairs <= 0 {
@@ -510,37 +1008,39 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		if initN < K {
 			initN = K
 		}
-		// Initialize attempt to -1 so the first NACK with attempt_idx=0 is processed once.
-		bt := &blockTx{K: K, L: L, enc: enc, nextESI: K, repairsOut: 0, attempt: -1}
+		if initN > K {
+			tEnc := time.Now()
+			enc0, encErr := fec.NewRaptorQEncoder(blockBytes, K, L)
+			if encErr != nil {
+				return encErr
+			}
+			enc = enc0
+			encTime += time.Since(tEnc)
+		}
+		// attempt counts how many repair rounds we already appended for this block.
+		bt := &blockTx{K: K, L: L, blockBytes: blockBytes, enc: enc, nextESI: initN, repairsOut: maxInt(0, initN-K), attempt: 0}
 		txMu.Lock()
 		active[uint16(blockID)] = bt
 		txMu.Unlock()
 		// Emit initial symbols 0..initN-1
 		for esi := 0; esi < initN; esi++ {
-			// Avoid per-symbol allocation: build packet in a reusable fixed-size buffer.
-			b := make([]byte, fecwire.HeaderLen+L)
+			b := symBufPool.Get().([]byte)
 			pay := b[fecwire.HeaderLen:]
-			// Fast path: for systematic source symbols, avoid the RaptorQ library call.
-			// At high bitrates (e.g., 100 Mbps), per-symbol overhead can dominate and
-			// cap throughput well below the shaped rate. The RaptorQ systematic symbols
-			// are exactly the original data partitioned into L-byte chunks, with the
-			// final symbol padded with zeros if needed.
+			// Systematic source symbols are just L-byte chunks of the padded block.
 			if esi < K {
 				start := esi * L
-				if start < len(blockBytes) {
-					end := start + L
-					if end <= len(blockBytes) {
-						copy(pay, blockBytes[start:end])
-					} else {
-						// Last partial symbol: zero-pad to L bytes.
-						clear(pay)
-						copy(pay, blockBytes[start:])
-					}
-				} else {
-					// Beyond the end of the last partial block: pure padding.
-					clear(pay)
-				}
+				copy(pay, blockBytes[start:start+L])
 			} else {
+				// Repair symbol. Ensure encoder exists.
+				if enc == nil {
+					enc0, encErr := fec.NewRaptorQEncoder(blockBytes, K, L)
+					if encErr != nil {
+						symBufPool.Put(b)
+						return encErr
+					}
+					enc = enc0
+					// Note: encTime is best-effort diagnostics; only updated from the send loop.
+				}
 				payload := enc.GenSymbol(uint32(esi))
 				if len(payload) == L {
 					copy(pay, payload)
@@ -558,6 +1058,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 				N:          uint8(advN),
 				K:          uint8(K),
 				SymID:      uint8(esi),
+				Flags:      uint8(opts.RStep),
 				PayloadLen: uint32(L),
 			}
 			h.MarshalBinary(b[:fecwire.HeaderLen])
@@ -565,24 +1066,38 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 				fmt.Printf("warn: datagram size %d exceeds threshold %d; consider reducing L or header size\n", len(b), opts.WarnDgramSize)
 				opts.WarnDgramSize = 0 // warn once
 			}
-			if rng != nil && rng.Float64() < opts.DropProb {
+			dropped := rng != nil && rng.Float64() < opts.DropProb
+			if dropped {
 				// simulate sender drop
+				symBufPool.Put(b)
 			} else {
 				tSend := time.Now()
 				if err := sendSymbol(b); err != nil {
 					sendErrs++
 					if opts.Transport == "stream" {
+						symBufPool.Put(b)
 						return err
 					}
 					// For datagrams, attempt a single retry since packet size can shrink temporarily.
 					if err2 := sendSymbol(b); err2 == nil {
 						sentDgrams++
 						sentBytes += int64(len(b))
+						txMu.Lock()
+						bt.totalSent++
+						txMu.Unlock()
+					} else {
+						symBufPool.Put(b)
+						// Don't spin forever when the QUIC stack returns a persistent error.
+						return err2
 					}
 				} else {
 					sentDgrams++
 					sentBytes += int64(len(b))
+					txMu.Lock()
+					bt.totalSent++
+					txMu.Unlock()
 				}
+				symBufPool.Put(b)
 				// pacer: inter-send delta logging (avg every ~200 packets)
 				if !lastSend.IsZero() {
 					delta := tSend.Sub(lastSend)
@@ -609,10 +1124,22 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 			if pc != nil {
 				pc.AfterSend()
 			}
-			if esi >= K {
-				bt.nextESI = esi + 1
-				bt.repairsOut = (esi + 1) - K
-			}
+		}
+		// Publish repair counters for this block after the initial emission.
+		txMu.Lock()
+		bt.nextESI = initN
+		bt.repairsOut = maxInt(0, initN-K)
+		bt.enc = enc
+		txMu.Unlock()
+		// Arm the PTO timer for this block only after we finished emitting the initial codeword.
+		// This avoids sending repairs immediately just because ACKs haven't arrived yet.
+		if opts.UseARQ && basePTO > 0 {
+			now := time.Now()
+			txMu.Lock()
+			bt.armedAt = now
+			bt.lastAckAt = now
+			bt.nextRepairAt = time.Time{}
+			txMu.Unlock()
 		}
 		blockID++
 		if n < K*L { // done
@@ -621,13 +1148,8 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		if opts.BlockPause > 0 {
 			time.Sleep(opts.BlockPause)
 		}
-		// reset buf slice to full size for next block
-		if cap(buf) < K*L {
-			buf = make([]byte, K*L)
-		} else {
-			buf = buf[:K*L]
-		}
 	}
+	close(sendBlocksDone)
 	sendBlocksDur = time.Since(sendBlocksStart)
 	// If ARQ is enabled, drain outstanding blocks before closing.
 	// NOTE: Do not tie reliability to congestion control mode. Skipping this drain can
@@ -669,7 +1191,25 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		}
 		deadline := time.Now().Add(drainCap)
 		// Poll with short sleeps to avoid indefinite waits on missing broadcasts.
+		// IMPORTANT: if we already received a receiver DONE(ok=1), stop draining early.
+		// This avoids unstable tail waits due to delayed / lost per-block ACK control messages.
 		for time.Now().Before(deadline) {
+			doneOk := false
+			if waitDone && doneObserved == nil {
+				select {
+				case d := <-doneMsgCh:
+					dc := d
+					doneObserved = &dc
+					if d.Ok == 1 {
+						fmt.Fprintf(os.Stderr, "[fec-client-done] early_ok=1; ending arq_drain\n")
+						doneOk = true
+					}
+				default:
+				}
+			}
+			if doneOk {
+				break
+			}
 			txMu.Lock()
 			n := len(active)
 			txMu.Unlock()
@@ -710,11 +1250,18 @@ afterArqDrain:
 	// This is analogous to quic-raw's 1-byte completion ACK.
 	if waitDone {
 		t0 = time.Now()
-		select {
-		case d := <-doneMsgCh:
-			fmt.Fprintf(os.Stderr, "[fec-client-done] wait_ms=%d ok=%d written=%d\n", time.Since(t0).Milliseconds(), d.Ok, d.Written)
-		case <-ctx.Done():
-			return ctx.Err()
+		if doneObserved != nil {
+			d := *doneObserved
+			fmt.Fprintf(os.Stderr, "[fec-client-done] wait_ms=%d ok=%d written=%d cached=1\n", time.Since(t0).Milliseconds(), d.Ok, d.Written)
+		} else {
+			select {
+			case d := <-doneMsgCh:
+				dc := d
+				doneObserved = &dc
+				fmt.Fprintf(os.Stderr, "[fec-client-done] wait_ms=%d ok=%d written=%d\n", time.Since(t0).Milliseconds(), d.Ok, d.Written)
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
 	}
 	// Optional tail wait after ARQ drain
@@ -737,6 +1284,9 @@ afterArqDrain:
 	mbps := (float64(sentBytes) * 8 / 1e6) / dur
 	fmt.Fprintf(os.Stderr, "[client-stats] dgrams=%d bytes=%d dur_s=%.3f mbps=%.2f errs=%d dtle=%d enc_ms=%.1f send_ms=%.1f\n",
 		sentDgrams, sentBytes, dur, mbps, sendErrs, dtleCount, float64(encTime.Milliseconds()), float64(sendTime.Milliseconds()))
+	if sendQFullCount > 0 {
+		fmt.Fprintf(os.Stderr, "[client-sendq] full_hits=%d\n", sendQFullCount)
+	}
 	if opts.UseARQ {
 		txSourceSymbols := totalSymbols - totalRepairs
 		if txSourceSymbols < 0 {
@@ -802,10 +1352,6 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 		if err := hdr.UnmarshalBinary(hdrBytes); err != nil {
 			return "", err
 		}
-		// Client-controlled receiver deadline: when present, override RXOptions.DDL.
-		if hdr.RxDDLMS > 0 {
-			rx.DDL = time.Duration(hdr.RxDDLMS) * time.Millisecond
-		}
 		// Try read optional filename (u16 len + bytes); safe if EOF
 		var lb [2]byte
 		n, err := io.ReadFull(s, lb[:])
@@ -839,7 +1385,7 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 	if err != nil {
 		return "", err
 	}
-	// open a control uni stream to client for ACK/NACK
+	// open a control uni stream to client for ACK/DONE
 	ctrlStr, _ := conn.OpenUniStream()
 	if ctrlStr != nil {
 		rxm.ctrlW = ctrlStr
@@ -884,11 +1430,6 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 		lastDgramChange := time.Now()
 		// Make inactivity more tolerant for high-RTT/high-redundancy runs.
 		inactivity := 3 * time.Second
-		if rx.DDL > 0 {
-			if d := 2 * rx.DDL; d > inactivity {
-				inactivity = d
-			}
-		}
 		if inactivity < 6*time.Second {
 			inactivity = 6 * time.Second
 		}
@@ -1032,8 +1573,9 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 		writtenNow = rxm.delivered.Load()
 	}
 	fmt.Fprintf(os.Stderr, "[server-e2e] e2e_ms=%d ok=%d written=%d/%d\n", e2eDur.Milliseconds(), e2eOk, writtenNow, hdr.FileSize)
+	fmt.Fprintf(os.Stderr, "[receiver-e2e] end_ns=%d ok=%d written=%d/%d\n", time.Now().UnixNano(), e2eOk, writtenNow, hdr.FileSize)
 	// Server->client DONE ACK: best-effort notify sender that receive/decode finished.
-	// Use the same buffered control stream writer to avoid interleaving with ACK/NACK.
+	// Use the same buffered control stream writer to avoid interleaving with ACK/DONE.
 	if rxm != nil && rxm.ctrlOut != nil {
 		var b bytes.Buffer
 		_ = writeDone(&b, DoneFile{FileID: 0, Written: writtenNow, Ok: uint8(e2eOk)})
@@ -1249,11 +1791,8 @@ func (p *pacer) WaitN(slots int) {
 	p.mu.Unlock()
 
 	// Wait until due.
-	if p.interval < 2*time.Millisecond {
-		for time.Now().Before(due) {
-		}
-		return
-	}
+	// For very small intervals, avoid pure busy-spinning: it can monopolize a CPU
+	// core and starve QUIC's send/receive loops under loss.
 	for {
 		rem := time.Until(due)
 		if rem <= 0 {
@@ -1267,9 +1806,15 @@ func (p *pacer) WaitN(slots int) {
 			time.Sleep(rem - 400*time.Microsecond)
 			continue
 		}
+		if rem > 150*time.Microsecond {
+			time.Sleep(rem - 75*time.Microsecond)
+			continue
+		}
 		break
 	}
 	for time.Now().Before(due) {
+		// yield
+		time.Sleep(0)
 	}
 }
 
