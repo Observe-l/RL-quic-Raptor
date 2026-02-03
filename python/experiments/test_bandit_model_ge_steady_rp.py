@@ -37,26 +37,21 @@ class Trial:
     delay_ms_avg: float
     md5_ok: int
     timed_out: int
-    ddl_ms: int
     bandit_action_idx: int
 
 
-def _aligned_obs_vec_from_rl_observation(*, rl_obs: Dict[str, Any], ddl_ms: int, failed: bool) -> np.ndarray:
+def _aligned_obs_vec_from_rl_observation(*, rl_obs: Dict[str, Any], failed: bool) -> np.ndarray:
     """Construct the exact training observation vector.
 
     Layout must match `python/fecenv_env.py`:
-            [goodput, decode_latency_p95_ms, fec_overhead,
-       ctrl_tx_nack_msgs, arq_attempts_mean, residual_erasures,
-       fec_rate, ddl_ms]
+            [goodput, fec_overhead, tx_retx_rounds, residual_erasures, fec_rate]
     """
 
     if failed:
         # Mirror QuicFecRunner._default_obs(timeout=True) for the fields used in obs.
         goodput_mbps = 0.0
-        decode_latency_p95_ms = 0.0
         fec_overhead = 0.0
-        ctrl_tx_nack_msgs = 0.0
-        arq_attempts_mean = 2.0
+        tx_retx_rounds = 0.0
         residual_erasures = 1.0
         fec_rate = 0.0
     else:
@@ -65,21 +60,13 @@ def _aligned_obs_vec_from_rl_observation(*, rl_obs: Dict[str, Any], ddl_ms: int,
         except Exception:
             goodput_mbps = 0.0
         try:
-            decode_latency_p95_ms = float(rl_obs.get("decode_latency_p95_ms", 0.0))
-        except Exception:
-            decode_latency_p95_ms = 0.0
-        try:
             fec_overhead = float(rl_obs.get("fec_overhead", rl_obs.get("fec_overhead_pct_arrival", 0.0)))
         except Exception:
             fec_overhead = 0.0
         try:
-            ctrl_tx_nack_msgs = float(rl_obs.get("ctrl_tx_nack_msgs", 0.0))
+            tx_retx_rounds = float(rl_obs.get("tx_retx_rounds", rl_obs.get("tx_retx_rounds_mean", 0.0)))
         except Exception:
-            ctrl_tx_nack_msgs = 0.0
-        try:
-            arq_attempts_mean = float(rl_obs.get("arq_attempts_mean", 0.0))
-        except Exception:
-            arq_attempts_mean = 0.0
+            tx_retx_rounds = 0.0
         try:
             residual_erasures = float(rl_obs.get("residual_erasures", 0.0))
         except Exception:
@@ -92,13 +79,10 @@ def _aligned_obs_vec_from_rl_observation(*, rl_obs: Dict[str, Any], ddl_ms: int,
     return np.asarray(
         [
             goodput_mbps,
-            decode_latency_p95_ms,
             fec_overhead,
-            ctrl_tx_nack_msgs,
-            arq_attempts_mean,
+            tx_retx_rounds,
             residual_erasures,
             float(np.clip(fec_rate, 0.0, 1.0)),
-            float(int(ddl_ms)),
         ],
         dtype=np.float32,
     )
@@ -172,54 +156,14 @@ def _bandit_select_action_mean(*, agent, action_set: ActionSet, ctx: ContextBuil
     return a_idx, {"x": x.tolist(), "a_idx": a_idx, "score": float(scores[a_idx])}
 
 
-def _bandit_select_action_mean_with_fixed_ddl(
-    *,
-    agent,
-    action_set: ActionSet,
-    ctx: ContextBuilder,
-    fixed_ddl_ms: int,
-) -> Tuple[int, Dict[str, Any]]:
-    """Select best action under posterior mean, but with ddl forced to a fixed value."""
-
-    fixed_ddl_ms = int(fixed_ddl_ms)
-    ddl_ms_values = [100, 150, 200, 250, 300, 350]
-    if fixed_ddl_ms not in ddl_ms_values:
-        raise ValueError(f"fixed_ddl_ms must be one of {ddl_ms_values}")
-    fixed_ddl_idx = int(ddl_ms_values.index(fixed_ddl_ms))
-
-    x = ctx.get_context()
-    theta = np.asarray(agent.theta_hat, dtype=np.float64).reshape(-1)
-
-    best_idx: Optional[int] = None
-    best_score = None
-
-    # Evaluate only actions with ddl_idx matching the requested fixed value.
-    for i, a in action_set.iter_actions():
-        if int(a.ddl_idx) != int(fixed_ddl_idx):
-            continue
-        ph = phi_fn(x=x, a_onehot=action_set.get_onehot(i)).astype(np.float64)
-        score = float(ph @ theta)
-        if best_score is None or score > float(best_score):
-            best_score = score
-            best_idx = int(i)
-
-    if best_idx is None:
-        raise RuntimeError("No actions matched fixed ddl constraint")
-
-    return best_idx, {"x": x.tolist(), "a_idx": int(best_idx), "score": float(best_score), "fixed_ddl_ms": fixed_ddl_ms}
-
-
 def _action_to_env_vars(*, action_set: ActionSet, a_idx: int) -> Dict[str, str]:
     spec = action_set.get_action(a_idx)
     env_action = spec.to_env_action()
-    k_idx, r0_idx, rstep_idx, ddl_idx = (int(env_action[0]), int(env_action[1]), int(env_action[2]), int(env_action[3]))
+    k_idx, r0_idx, rstep_idx = (int(env_action[0]), int(env_action[1]), int(env_action[2]))
 
-    K = 10 + k_idx
-    r0_pct = 0.05 * float(r0_idx)
-    R0 = int(float(K) * r0_pct)
+    K = 20 + 2 * k_idx
+    R0 = int(r0_idx)
     RSTEP = 1 + rstep_idx
-    ddl_ms_values = [100, 150, 200, 250, 300, 350]
-    DDL_MS = int(ddl_ms_values[int(ddl_idx)])
 
     return {
         "K": str(int(K)),
@@ -227,8 +171,6 @@ def _action_to_env_vars(*, action_set: ActionSet, a_idx: int) -> Dict[str, str]:
         "R0": str(int(R0)),
         "W": os.environ.get("W", "8"),
         "RSTEP": str(int(RSTEP)),
-        "DDL_MS": str(int(DDL_MS)),
-        "ALPHA": os.environ.get("ALPHA", "0.6"),
         "MAX_ATTEMPTS": os.environ.get("MAX_ATTEMPTS", "5"),
         "USE_ARQ": os.environ.get("USE_ARQ", "1"),
         "QUIC_FEC_CC_BYPASS": "0",
@@ -286,17 +228,10 @@ def main() -> int:
     ap.add_argument("--timeout-transfer-s", type=int, default=15)
 
     ap.add_argument(
-        "--fixed-ddl-ms",
-        type=int,
-        default=0,
-        help="If set, forces ddl_ms by restricting bandit actions to the matching ddl_idx (allowed: 100..350 step 50).",
-    )
-
-    ap.add_argument(
         "--force-a-idx",
         type=int,
         default=-1,
-        help="If set (>=0), forces using this discrete action index for all reps (still respects --fixed-ddl-ms override).",
+        help="If set (>=0), forces using this discrete action index for all reps.",
     )
 
     ap.add_argument("--out-dir", type=str, default="")
@@ -334,20 +269,8 @@ def main() -> int:
                 a_idx = int(args.force_a_idx)
                 bandit_debug = {"x": ctx.get_context().tolist(), "a_idx": int(a_idx), "score": float("nan"), "forced": True}
             else:
-                if int(args.fixed_ddl_ms) == 300:
-                    a_idx, bandit_debug = _bandit_select_action_mean_with_fixed_ddl(
-                        agent=agent,
-                        action_set=action_set,
-                        ctx=ctx,
-                        fixed_ddl_ms=int(args.fixed_ddl_ms),
-                    )
-                else:
-                    a_idx, bandit_debug = _bandit_select_action_mean(agent=agent, action_set=action_set, ctx=ctx)
+                a_idx, bandit_debug = _bandit_select_action_mean(agent=agent, action_set=action_set, ctx=ctx)
             bandit_env = _action_to_env_vars(action_set=action_set, a_idx=a_idx)
-
-            # Ensure applied DDL is actually fixed when requested.
-            if int(args.fixed_ddl_ms) > 0:
-                bandit_env["DDL_MS"] = str(int(args.fixed_ddl_ms))
 
             common_env = {
                 "BITRATE_MBPS": str(int(args.bitrate_mbps)),
@@ -394,13 +317,11 @@ def main() -> int:
                 goodput = 0.0
                 delay_ms_avg = 0.0
 
-            ddl_ms = int(env.get("DDL_MS", "0") or 0)
-
             # Update context for next run using the *exact* training obs vector.
             failed = bool(timed_out or md5_ok != 1)
             rl_obs = obs if isinstance(obs, dict) else {}
-            aligned_obs = _aligned_obs_vec_from_rl_observation(rl_obs=rl_obs, ddl_ms=ddl_ms, failed=failed)
-            ctx.update_from_obs(obs=aligned_obs, ddl_ms=ddl_ms)
+            aligned_obs = _aligned_obs_vec_from_rl_observation(rl_obs=rl_obs, failed=failed)
+            ctx.update_from_obs(obs=aligned_obs)
 
             trials.append(
                 Trial(
@@ -409,14 +330,13 @@ def main() -> int:
                     delay_ms_avg=delay_ms_avg,
                     md5_ok=md5_ok,
                     timed_out=timed_out,
-                    ddl_ms=ddl_ms,
                     bandit_action_idx=a_idx,
                 )
             )
             action_rows.append({"rep": rep, **bandit_debug, **bandit_env})
 
             print(
-                f"rep={rep:02d} a_idx={a_idx:04d} ddl_ms={ddl_ms:4d} goodput_mbps={goodput:.3f} delay_ms_avg={delay_ms_avg:.3f} md5_ok={md5_ok} timed_out={timed_out}"
+                f"rep={rep:02d} a_idx={a_idx:04d} goodput_mbps={goodput:.3f} delay_ms_avg={delay_ms_avg:.3f} md5_ok={md5_ok} timed_out={timed_out}"
             )
     except KeyboardInterrupt:
         interrupted = True
@@ -425,7 +345,7 @@ def main() -> int:
     with out_trials.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(
             f,
-            fieldnames=["rep", "bandit_action_idx", "ddl_ms", "goodput_mbps", "delay_ms_avg", "md5_ok", "timed_out"],
+            fieldnames=["rep", "bandit_action_idx", "goodput_mbps", "delay_ms_avg", "md5_ok", "timed_out"],
         )
         w.writeheader()
         for t in trials:
@@ -433,7 +353,6 @@ def main() -> int:
                 {
                     "rep": t.rep,
                     "bandit_action_idx": t.bandit_action_idx,
-                    "ddl_ms": t.ddl_ms,
                     "goodput_mbps": f"{t.goodput_mbps:.6f}",
                     "delay_ms_avg": f"{t.delay_ms_avg:.6f}",
                     "md5_ok": t.md5_ok,
@@ -443,7 +362,7 @@ def main() -> int:
 
     out_actions = out_dir / "actions.csv"
     # Stable field order: rep, a_idx, score, then env vars.
-    fieldnames = ["rep", "a_idx", "score", "K", "R0", "RSTEP", "DDL_MS", "W", "ALPHA", "MAX_ATTEMPTS", "USE_ARQ", "SYMBOL_BYTES", "QUIC_FEC_CC_ALGO", "QUIC_FEC_CC_BYPASS", "PACE_US"]
+    fieldnames = ["rep", "a_idx", "score", "K", "R0", "RSTEP", "W", "MAX_ATTEMPTS", "USE_ARQ", "SYMBOL_BYTES", "QUIC_FEC_CC_ALGO", "QUIC_FEC_CC_BYPASS", "PACE_US"]
     with out_actions.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         w.writeheader()
@@ -466,7 +385,6 @@ def main() -> int:
         "timeout_transfer_s": int(args.timeout_transfer_s),
         "reps": int(args.reps),
         "forced_a_idx": (int(args.force_a_idx) if int(args.force_a_idx) >= 0 else None),
-        "fixed_ddl_ms": (int(args.fixed_ddl_ms) if int(args.fixed_ddl_ms) > 0 else None),
         "file": str(file_path),
         "mean_goodput_mbps": mean(goodputs) if goodputs else 0.0,
         "median_goodput_mbps": median(goodputs) if goodputs else 0.0,

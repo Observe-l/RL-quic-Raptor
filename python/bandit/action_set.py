@@ -23,7 +23,7 @@ class ActionSet:
 
     Notes on discretization:
     - The existing env uses MultiDiscrete indices:
-        K = 4 + k_idx, R0 = r0_idx, RSTEP = 1 + rstep_idx.
+        K = 20 + 2*k_idx, R0 = r0_idx, RSTEP = 1 + rstep_idx.
     """
 
     def __init__(
@@ -35,7 +35,7 @@ class ActionSet:
     ):
         # Defaults: representable, moderately sized, aligned with bandit.md intent.
         if k_values is None:
-            k_values = list(range(4, 21))
+            k_values = list(range(20, 61, 2))
         if r0_values is None:
             r0_values = list(range(0, 21))
         if rstep_values is None:
@@ -47,8 +47,10 @@ class ActionSet:
 
         self.actions: List[ActionSpec] = []
         for K in self.k_values:
-            k_idx = int(K) - 4
-            if not (0 <= k_idx <= 16):
+            k_idx = (int(K) - 20) // 2
+            if int(K) != int(20 + 2 * k_idx):
+                continue
+            if not (0 <= k_idx <= 20):
                 continue
             for R0 in self.r0_values:
                 r0_idx = int(np.clip(int(R0), 0, 20))

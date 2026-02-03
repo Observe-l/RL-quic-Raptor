@@ -143,14 +143,12 @@ def _bandit_select_action_mean(*, agent, action_set: ActionSet, ctx: ContextBuil
 def _action_to_env_vars(*, action_set: ActionSet, a_idx: int) -> Dict[str, str]:
     spec = action_set.get_action(a_idx)
     env_action = spec.to_env_action()
-    k_idx, r0_idx, rstep_idx, ddl_idx = (int(env_action[0]), int(env_action[1]), int(env_action[2]), int(env_action[3]))
+    k_idx, r0_idx, rstep_idx = (int(env_action[0]), int(env_action[1]), int(env_action[2]))
 
-    K = 10 + k_idx
-    r0_pct = 0.05 * float(r0_idx)
-    R0 = int(float(K) * r0_pct)
+    # Must match `python/fecenv_env.py` action decoding.
+    K = 20 + 2 * k_idx
+    R0 = int(r0_idx)
     RSTEP = 1 + rstep_idx
-    ddl_ms_values = [100, 150, 200, 250, 300, 350]
-    DDL_MS = int(ddl_ms_values[int(ddl_idx)])
 
     return {
         "K": str(int(K)),
@@ -158,8 +156,6 @@ def _action_to_env_vars(*, action_set: ActionSet, a_idx: int) -> Dict[str, str]:
         "R0": str(int(R0)),
         "W": os.environ.get("W", "8"),
         "RSTEP": str(int(RSTEP)),
-        "DDL_MS": str(int(DDL_MS)),
-        "ALPHA": os.environ.get("ALPHA", "0.6"),
         "MAX_ATTEMPTS": os.environ.get("MAX_ATTEMPTS", "5"),
         "USE_ARQ": os.environ.get("USE_ARQ", "1"),
         # Always CC enabled in our comparisons.
@@ -340,14 +336,13 @@ def main() -> int:
                 )
 
                 # Update context state for next run.
-                ddl_ms = int(env.get("DDL_MS", "0") or 0)
                 obs = extra.get("raw_obs") if isinstance(extra.get("raw_obs"), dict) else {}
                 # Update bandit context using only observation fields (no debug info).
                 raw_obs = obs if isinstance(obs, dict) else {}
                 if timed_out or md5_ok != 1:
                     if isinstance(raw_obs, dict):
                         raw_obs = {**raw_obs, "timeout_flag": 1.0}
-                ctx.update(info={"raw_obs": raw_obs}, ddl_ms=ddl_ms)
+                ctx.update(info={"raw_obs": raw_obs})
 
             rows.append(
                 TrialResult(

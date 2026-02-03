@@ -423,14 +423,8 @@ def _verify_loaded_checkpoint(*, agent, ctx_cfg: ContextConfig, action_set: Acti
     """Validate checkpoint consistency with feature construction used by compare."""
 
     n_actions = int(len(action_set))
-    try:
-        ddl_ms_values = list(action_set.ddl_ms_values)
-    except Exception as e:
-        raise RuntimeError("invalid checkpoint: action_set.ddl_ms_values missing") from e
     if n_actions <= 0:
         raise RuntimeError("invalid checkpoint: action_set is empty")
-    if not ddl_ms_values:
-        raise RuntimeError("invalid checkpoint: action_set.ddl_ms_values missing/empty")
 
     # Feature dim sanity: 1 + d + m + d*m
     ctx = ContextBuilder(cfg=ctx_cfg)
@@ -449,22 +443,16 @@ def _verify_loaded_checkpoint(*, agent, ctx_cfg: ContextConfig, action_set: Acti
     if int(ph.size) != int(dim_agent):
         raise RuntimeError(f"phi dim mismatch: phi.size={int(ph.size)} agent.dim={dim_agent}")
 
-    # ddl_idx mapping sanity for a few actions
+    # env_action mapping sanity for a few actions
     idxs = sorted({0, n_actions - 1, n_actions // 2})
     for i in idxs:
         spec = action_set.get_action(int(i))
         env_action = np.asarray(spec.to_env_action(), dtype=np.int64).reshape(-1)
-        if env_action.size != 4:
-            raise RuntimeError(f"env_action must have 4 dims, got {env_action}")
-        ddl_idx = int(env_action[3])
-        if not (0 <= ddl_idx < int(len(ddl_ms_values))):
-            raise RuntimeError(
-                f"ddl_idx out of range for action {i}: ddl_idx={ddl_idx} len(ddl_ms_values)={len(ddl_ms_values)}"
-            )
+        if env_action.size != 3:
+            raise RuntimeError(f"env_action must have 3 dims, got {env_action}")
 
     return {
         "n_actions": n_actions,
-        "ddl_ms_values": [int(x) for x in ddl_ms_values],
         "d": d,
         "m": m,
         "dim_expected": dim_expected,
@@ -475,18 +463,12 @@ def _verify_loaded_checkpoint(*, agent, ctx_cfg: ContextConfig, action_set: Acti
 def _action_to_env_vars(*, action_set: ActionSet, a_idx: int, symbol_bytes: int) -> Dict[str, str]:
     spec = action_set.get_action(a_idx)
     env_action = spec.to_env_action()
-    k_idx, r0_idx, rstep_idx, ddl_idx = (int(env_action[0]), int(env_action[1]), int(env_action[2]), int(env_action[3]))
+    k_idx, r0_idx, rstep_idx = (int(env_action[0]), int(env_action[1]), int(env_action[2]))
 
-    K = 10 + k_idx
-    r0_pct = 0.05 * float(r0_idx)
-    R0 = int(float(K) * r0_pct)
+    # Must match `python/fecenv_env.py` action decoding.
+    K = 20 + 2 * k_idx
+    R0 = int(r0_idx)
     RSTEP = 1 + rstep_idx
-
-    # DDL discretization comes from the bandit checkpoint's ActionSet.
-    ddl_ms_values = list(action_set.ddl_ms_values)
-    if not (0 <= int(ddl_idx) < int(len(ddl_ms_values))):
-        raise IndexError(f"ddl_idx out of range: ddl_idx={int(ddl_idx)} len(ddl_ms_values)={int(len(ddl_ms_values))}")
-    DDL_MS = int(ddl_ms_values[int(ddl_idx)])
 
     return {
         "K": str(int(K)),
@@ -494,8 +476,6 @@ def _action_to_env_vars(*, action_set: ActionSet, a_idx: int, symbol_bytes: int)
         "R0": str(int(R0)),
         "W": os.environ.get("W", "8"),
         "RSTEP": str(int(RSTEP)),
-        "DDL_MS": str(int(DDL_MS)),
-        "ALPHA": os.environ.get("ALPHA", "0.6"),
         "MAX_ATTEMPTS": os.environ.get("MAX_ATTEMPTS", "5"),
         "USE_ARQ": os.environ.get("USE_ARQ", "1"),
         "QUIC_FEC_CC_BYPASS": "0",
@@ -504,21 +484,17 @@ def _action_to_env_vars(*, action_set: ActionSet, a_idx: int, symbol_bytes: int)
     }
 
 
-def _aligned_obs_vec_from_rl_observation(*, rl_obs: Optional[Dict[str, Any]], ddl_ms: int, failed: bool) -> np.ndarray:
+def _aligned_obs_vec_from_rl_observation(*, rl_obs: Optional[Dict[str, Any]], failed: bool) -> np.ndarray:
     """Construct training observation vector.
 
         Layout matches python/fecenv_env.py:
-            [goodput, decode_latency_p95_ms, fec_overhead,
-       ctrl_tx_nack_msgs, arq_attempts_mean, residual_erasures,
-       fec_rate, ddl_ms]
+            [goodput, fec_overhead, tx_retx_rounds, residual_erasures, fec_rate]
     """
 
     if failed or not isinstance(rl_obs, dict):
         goodput_mbps = 0.0
-        decode_latency_p95_ms = 0.0
         fec_overhead = 0.0
-        ctrl_tx_nack_msgs = 0.0
-        arq_attempts_mean = 2.0
+        tx_retx_rounds = 0.0
         residual_erasures = 1.0
         fec_rate = 0.0
     else:
@@ -529,23 +505,18 @@ def _aligned_obs_vec_from_rl_observation(*, rl_obs: Optional[Dict[str, Any]], dd
                 return default
 
         goodput_mbps = _f("goodput", _f("goodput_mbps", _f("goodput_arrival_mbps", _f("goodput_decode_mbps", 0.0))))
-        decode_latency_p95_ms = _f("decode_latency_p95_ms", 0.0)
         fec_overhead = _f("fec_overhead", _f("fec_overhead_pct_arrival", 0.0))
-        ctrl_tx_nack_msgs = _f("ctrl_tx_nack_msgs", 0.0)
-        arq_attempts_mean = _f("arq_attempts_mean", 0.0)
+        tx_retx_rounds = _f("tx_retx_rounds", _f("tx_retx_rounds_mean", 0.0))
         residual_erasures = _f("residual_erasures", 0.0)
         fec_rate = _f("fec_rate", 0.0)
 
     return np.asarray(
         [
             float(goodput_mbps),
-            float(decode_latency_p95_ms),
             float(fec_overhead),
-            float(ctrl_tx_nack_msgs),
-            float(arq_attempts_mean),
+            float(tx_retx_rounds),
             float(residual_erasures),
             float(np.clip(float(fec_rate), 0.0, 1.0)),
-            float(int(ddl_ms)),
         ],
         dtype=np.float32,
     )
@@ -837,15 +808,13 @@ def _load_sender_ge(*, params_path: Path, sender_id: int, ge_key: str) -> Dict[s
     return ge
 
 
-def _method_env_fixed_fec(*, k: int, r0: int, rstep: int, ddl_ms: int, symbol_bytes: int) -> Dict[str, str]:
+def _method_env_fixed_fec(*, k: int, r0: int, rstep: int, symbol_bytes: int) -> Dict[str, str]:
     return {
         "K": str(int(k)),
         "SYMBOL_BYTES": str(int(symbol_bytes)),
         "R0": str(int(r0)),
         "W": os.environ.get("W", "8"),
         "RSTEP": str(int(rstep)),
-        "DDL_MS": str(int(ddl_ms)),
-        "ALPHA": os.environ.get("ALPHA", "0.6"),
         "MAX_ATTEMPTS": os.environ.get("MAX_ATTEMPTS", "5"),
         "USE_ARQ": os.environ.get("USE_ARQ", "1"),
         "QUIC_FEC_CC_BYPASS": "0",
@@ -1195,8 +1164,7 @@ def main() -> int:
     agent, _cfg, _ctx0, ctx_cfg, action_set, _t0 = load_checkpoint(path_prefix=model_prefix)
 
     # Print action set summary to make mismatches obvious.
-    ddl_vals = list(action_set.ddl_ms_values)
-    print(f"[bandit] action_set_n={len(action_set)} ddl_ms_values={ddl_vals}")
+    print(f"[bandit] action_set_n={len(action_set)} onehot_dim={int(getattr(action_set, 'onehot_dim', -1))}")
 
     # Verify checkpoint identity & consistency.
     sig = _ckpt_signature(model_prefix)
@@ -1342,7 +1310,6 @@ def main() -> int:
 
             for w_i, warmup_idx in enumerate(warmup_indices):
                 warmup_env = _action_to_env_vars(action_set=action_set, a_idx=int(warmup_idx), symbol_bytes=int(args.symbol_bytes))
-                warmup_ddl_ms = int(warmup_env.get("DDL_MS", "100"))
                 if use_fast:
                     warmup_env.update({"SKIP_BUILD": "1", "SKIP_NETNS_RESET": "1", "SKIP_SYSCTL": "1"})
                 m, stderr = _run_one(
@@ -1362,8 +1329,8 @@ def main() -> int:
                 dur_record = int(m.get(duration_field, m.get("dur_ms", 0)) or 0)
                 overhead_ratio = float(m.get("overhead_ratio", 0.0) or 0.0)
                 fec_overhead_ratio = _overhead_ratio_from_rl_observation(rl_obs)
-                obs_vec = _aligned_obs_vec_from_rl_observation(rl_obs=rl_obs, ddl_ms=warmup_ddl_ms, failed=failed)
-                ctx.update_from_obs(obs=obs_vec, ddl_ms=warmup_ddl_ms)
+                obs_vec = _aligned_obs_vec_from_rl_observation(rl_obs=rl_obs, failed=failed)
+                ctx.update_from_obs(obs=obs_vec)
                 rows.append(
                     Row(
                         task=task,
@@ -1424,7 +1391,6 @@ def main() -> int:
                 else:
                     raise ValueError(f"unknown --bandit-policy: {pol}")
                 fec_env = _action_to_env_vars(action_set=action_set, a_idx=a_idx, symbol_bytes=int(args.symbol_bytes))
-                ddl_ms = int(fec_env.get("DDL_MS", "100"))
                 if use_fast:
                     fec_env.update({"SKIP_BUILD": "1", "SKIP_NETNS_RESET": "1", "SKIP_SYSCTL": "1"})
 
@@ -1445,8 +1411,8 @@ def main() -> int:
                 dur_record = int(m.get(duration_field, m.get("dur_ms", 0)) or 0)
                 overhead_ratio = float(m.get("overhead_ratio", 0.0) or 0.0)
                 fec_overhead_ratio = _overhead_ratio_from_rl_observation(rl_obs)
-                obs_vec = _aligned_obs_vec_from_rl_observation(rl_obs=rl_obs, ddl_ms=ddl_ms, failed=failed)
-                ctx.update_from_obs(obs=obs_vec, ddl_ms=ddl_ms)
+                obs_vec = _aligned_obs_vec_from_rl_observation(rl_obs=rl_obs, failed=failed)
+                ctx.update_from_obs(obs=obs_vec)
 
                 rows.append(
                     Row(
@@ -1516,7 +1482,7 @@ def main() -> int:
                 )
 
                 # Fixed FEC #1
-                env_f1 = _method_env_fixed_fec(k=20, r0=2, rstep=2, ddl_ms=100, symbol_bytes=int(args.symbol_bytes))
+                env_f1 = _method_env_fixed_fec(k=20, r0=2, rstep=2, symbol_bytes=int(args.symbol_bytes))
                 if use_fast:
                     env_f1.update({"SKIP_BUILD": "1", "SKIP_NETNS_RESET": "1", "SKIP_SYSCTL": "1"})
                 m3, stderr3 = _run_one(
@@ -1551,7 +1517,7 @@ def main() -> int:
                         overhead_ratio=float(overhead3),
                         a_idx=-1,
                         extra={
-                            "fec": {"K": 20, "R0": 2, "RSTEP": 2, "DDL_MS": 100},
+                            "fec": {"K": 20, "R0": 2, "RSTEP": 2},
                             "fec_overhead_ratio": float(fec_overhead3),
                             "rtt_ms": int(rtt_ms_group),
                             "dur_ms_server": int(m3.get("dur_ms", 0) or 0),
@@ -1563,7 +1529,7 @@ def main() -> int:
                 )
 
                 # Fixed FEC #2
-                env_f2 = _method_env_fixed_fec(k=20, r0=6, rstep=4, ddl_ms=100, symbol_bytes=int(args.symbol_bytes))
+                env_f2 = _method_env_fixed_fec(k=20, r0=6, rstep=4, symbol_bytes=int(args.symbol_bytes))
                 if use_fast:
                     env_f2.update({"SKIP_BUILD": "1", "SKIP_NETNS_RESET": "1", "SKIP_SYSCTL": "1"})
                 m4, stderr4 = _run_one(
@@ -1598,7 +1564,7 @@ def main() -> int:
                         overhead_ratio=float(overhead4),
                         a_idx=-1,
                         extra={
-                            "fec": {"K": 20, "R0": 6, "RSTEP": 4, "DDL_MS": 100},
+                            "fec": {"K": 20, "R0": 6, "RSTEP": 4},
                             "fec_overhead_ratio": float(fec_overhead4),
                             "rtt_ms": int(rtt_ms_group),
                             "dur_ms_server": int(m4.get("dur_ms", 0) or 0),

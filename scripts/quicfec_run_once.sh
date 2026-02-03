@@ -474,8 +474,9 @@ payload = {
   'goodput': 0.0,
   'goodput_mbps': 0.0,
   'fec_overhead': 0.0,
-  'ctrl_tx_nack_msgs': 0,
-  'arq_attempts_mean': 0.0,
+  # tx_retx_rounds: sender-side count of repair rounds appended (RSTEP-trigger events)
+  # in this transfer. This is the new policy signal replacing old NACK/ARQ metrics.
+  'tx_retx_rounds': 0,
   'residual_erasures': int(residual_erasures),
   'fec_rate': float(R0) / float(max(1, K)),
   # Validity markers (not used by the policy; env uses them to ignore invalid runs).
@@ -568,15 +569,13 @@ if isinstance(arqj, dict) and arqj:
   except Exception:
     arq_clusters_total = 0
 
-  # ctrl_tx_nack_msgs: sender-side count of NACK messages received.
-  # The client reports total "attempts" (NACK rounds processed).
-  payload['ctrl_tx_nack_msgs'] = int(max(0, arq_attempts_total))
+  # tx_retx_rounds: sender-side count of repair rounds appended.
+  # The client reports total "attempts" (each non-empty repair batch increments it).
+  payload['tx_retx_rounds'] = int(max(0, arq_attempts_total))
 
-  # ARQ attempts mean per cluster (tx-side).
+  # Keep derived debug-only field (not used by policy) for analysis.
   if arq_clusters_total > 0:
-    payload['arq_attempts_mean'] = float(arq_attempts_total) / float(arq_clusters_total)
-  else:
-    payload['arq_attempts_mean'] = 0.0
+    payload['tx_retx_rounds_mean'] = float(arq_attempts_total) / float(arq_clusters_total)
 
   # fec_overhead: repairs/source across initial R0 and ARQ appended repairs.
   try:

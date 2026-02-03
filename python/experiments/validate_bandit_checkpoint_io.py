@@ -28,12 +28,9 @@ def _assert(cond: bool, msg: str) -> None:
 
 
 def _summarize(action_set) -> Dict[str, Any]:
-    ddl_vals = list(action_set.ddl_ms_values)
-
     return {
         "n_actions": int(len(action_set)),
         "onehot_dim": int(getattr(action_set, "onehot_dim", -1)),
-        "ddl_ms_values": [int(x) for x in ddl_vals],
     }
 
 
@@ -80,20 +77,16 @@ def _check_actionset_indices(action_set) -> None:
     n = int(len(action_set))
     _assert(n > 0, "action_set empty")
 
-    ddl_vals = list(action_set.ddl_ms_values)
-    _assert(len(ddl_vals) > 0, "ddl_ms_values empty")
-
     # Spot-check a few actions (evenly spaced) for index validity.
     idxs = sorted({0, n - 1, n // 2, n // 3, (2 * n) // 3})
     for i in idxs:
         spec = action_set.get_action(int(i))
         env_action = spec.to_env_action().astype(int).reshape(-1)
-        _assert(env_action.size == 4, f"env_action must have 4 dims; got {env_action}")
-        k_idx, r0_idx, rstep_idx, ddl_idx = map(int, env_action.tolist())
-        _assert(0 <= k_idx <= 54, f"k_idx out of range: {k_idx}")
+        _assert(env_action.size == 3, f"env_action must have 3 dims; got {env_action}")
+        k_idx, r0_idx, rstep_idx = map(int, env_action.tolist())
+        _assert(0 <= k_idx <= 20, f"k_idx out of range: {k_idx}")
         _assert(0 <= r0_idx <= 20, f"r0_idx out of range: {r0_idx}")
-        _assert(0 <= rstep_idx <= 7, f"rstep_idx out of range: {rstep_idx}")
-        _assert(0 <= ddl_idx < len(ddl_vals), f"ddl_idx out of range: {ddl_idx} (len={len(ddl_vals)})")
+        _assert(0 <= rstep_idx <= 19, f"rstep_idx out of range: {rstep_idx}")
 
 
 def _rng_fingerprint(agent) -> Dict[str, Any]:
@@ -211,7 +204,7 @@ def main() -> int:
 
     print("[ok] checkpoint IO validated")
     print(f"[model] prefix={os.path.abspath(prefix)} step_t={int(step_t)}")
-    print(f"[action_set] n={report['action_set']['n_actions']} ddl_ms_values={report['action_set']['ddl_ms_values']}")
+    print(f"[action_set] n={report['action_set']['n_actions']}")
     print(f"[agent] dim={report['agent']['dim']} sym_err={report['agent']['sym_err']:.3e}")
 
     if int(args.print_json) != 0:

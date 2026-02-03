@@ -80,8 +80,7 @@ def save_checkpoint(
         "ewma": {
             "goodput": float(getattr(ctx, "_ewma_goodput", 0.0)),
             "overhead": float(getattr(ctx, "_ewma_overhead", 0.0)),
-            "nack": float(getattr(ctx, "_ewma_nack", 0.0)),
-            "arq": float(getattr(ctx, "_ewma_arq", 0.0)),
+            "retx": float(getattr(ctx, "_ewma_retx", 0.0)),
             "residual": float(getattr(ctx, "_ewma_residual", 0.0)),
         },
         "last": {
@@ -89,9 +88,8 @@ def save_checkpoint(
         },
         "hists": {
             "residual": list(getattr(ctx, "_residual_hist", [])),
-            "timeout": list(getattr(ctx, "_timeout_hist", [])),
-            "residual_value": list(getattr(ctx, "_residual_value_hist", [])),
         },
+        "version": 2,
     }
 
     meta: Dict[str, Any] = {
@@ -156,15 +154,14 @@ def load_checkpoint(
             ewma = ctx_state.get("ewma", {}) if isinstance(ctx_state.get("ewma"), dict) else {}
             setattr(ctx, "_ewma_goodput", float(ewma.get("goodput", 0.0)))
             setattr(ctx, "_ewma_overhead", float(ewma.get("overhead", 0.0)))
-            setattr(ctx, "_ewma_nack", float(ewma.get("nack", 0.0)))
-            setattr(ctx, "_ewma_arq", float(ewma.get("arq", 0.0)))
+            # Backward-compat: older checkpoints may store "arq" or "nack".
+            # Prefer explicit "retx" (new), otherwise fall back to "arq".
+            setattr(ctx, "_ewma_retx", float(ewma.get("retx", ewma.get("arq", 0.0))))
             setattr(ctx, "_ewma_residual", float(ewma.get("residual", 0.0)))
             last = ctx_state.get("last", {}) if isinstance(ctx_state.get("last"), dict) else {}
             setattr(ctx, "_last_fec_rate", float(last.get("fec_rate", 0.0)))
             hists = ctx_state.get("hists", {}) if isinstance(ctx_state.get("hists"), dict) else {}
             setattr(ctx, "_residual_hist", list(hists.get("residual", [])))
-            setattr(ctx, "_timeout_hist", list(hists.get("timeout", [])))
-            setattr(ctx, "_residual_value_hist", list(hists.get("residual_value", [])))
         except Exception:
             pass
 

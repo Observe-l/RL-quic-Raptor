@@ -238,7 +238,6 @@ class QuicFecRunner:
         # ARQ policy (RSTEP is controlled by the policy).
         env["W"] = os.environ.get("W", "8")
         env["RSTEP"] = str(int(getattr(action, "RSTEP", int(os.environ.get("RSTEP", "4")))))
-        env["ALPHA"] = os.environ.get("ALPHA", "0.6")
         env["MAX_ATTEMPTS"] = os.environ.get("MAX_ATTEMPTS", "5")
 
         # CC is always enabled with BBRv2.
@@ -403,8 +402,8 @@ class QuicFecRunner:
             "ctrl_tx_dropped_msgs": 0,
             "arq_attempts_mean": 2.0,
             "arq_attempts_p95": 3.0,
-            "rx_unique_at_ddl_mean": 0.0,
-            "rx_unique_at_ddl_p95": 0.0,
+            "tx_retx_rounds": 0,
+            "tx_retx_rounds_mean": 0.0,
             "estimated_available_bw_mbps": 0.0,
             # peak removed; only robust estimate is used
         }
@@ -446,24 +445,22 @@ class FecEnv(gym.Env):
         # Discrete action space (MultiDiscrete), matching the requirement that
         # controls are chosen from a finite set (not a clipped continuous Box).
         # Order: [K_idx, R0_idx, RSTEP_idx]
-        #   K: 4..20      -> 17 values
+        #   K: 20..60 (step=2) -> 21 values
         #   R0: 0..20     -> 21 values
         #   RSTEP: 1..20  -> 20 values
-        self.action_space = spaces.MultiDiscrete([17, 21, 20])
+        self.action_space = spaces.MultiDiscrete([21, 21, 20])
         # Policy observation keys.
         # Keep this strictly limited to the learning signal (no debug/leakage).
         # Layout (requested):
         #   goodput,
         #   fec_overhead,
-        #   ctrl_tx_nack_msgs,
-        #   arq_attempts_mean,
+        #   tx_retx_rounds (RSTEP-trigger count on sender),
         #   residual_erasures,
         #   fec_rate (R0/K)
         self._obs_keys: List[str] = [
             "goodput",
             "fec_overhead",
-            "ctrl_tx_nack_msgs",
-            "arq_attempts_mean",
+            "tx_retx_rounds",
             "residual_erasures",
             "fec_rate",
         ]
@@ -647,14 +644,14 @@ class FecEnv(gym.Env):
         r0_idx = int(a[1])
         rstep_idx = int(a[2])
 
-        if not (0 <= k_idx <= 16):
+        if not (0 <= k_idx <= 20):
             raise ValueError(f"K index out of range: {k_idx}")
         if not (0 <= r0_idx <= 20):
             raise ValueError(f"R0 index out of range: {r0_idx}")
         if not (0 <= rstep_idx <= 19):
             raise ValueError(f"RSTEP index out of range: {rstep_idx}")
 
-        K = 4 + k_idx
+        K = 20 + 2 * k_idx
         R0 = int(r0_idx)
         # Keep semantics consistent with legacy behavior (R0 never exceeded K).
         if R0 > int(K):
@@ -880,7 +877,9 @@ class FecEnv(gym.Env):
         g = float(obs.get("goodput", obs.get("goodput_mbps", obs.get("goodput_arrival_mbps", obs.get("goodput_decode_mbps", 0.0)))))
         e = float(obs.get("residual_erasures", 0.0))
         oh = float(obs.get("fec_overhead", 0.0))
-        a_mean = float(obs.get("arq_attempts_mean", 0.0))
+        # New policy signal: sender-side repair rounds appended in this transfer.
+        # Prefer tx_retx_rounds, but fall back to arq_attempts_mean for legacy logs.
+        a_mean = float(obs.get("tx_retx_rounds", obs.get("arq_attempts_mean", 0.0)))
 
         if self._reward_variant == "legacy":
             # Previous shaping (kept for reproducibility)
@@ -892,7 +891,7 @@ class FecEnv(gym.Env):
             # Legacy overhead term: treat fec_overhead as a ratio (repairs/source).
             # Penalize overhead above ~0.5, saturating by ~2.0.
             oh_term = -lam_o * max(0.0, (oh - 0.5) / 1.5)
-            arq_term = -min(0.3, 0.08 * a_mean)
+            arq_term = -min(0.3, 0.02 * a_mean)
             r = tp_term + resid_term + oh_term + arq_term
             return float(r), {
                 "tp_term": float(tp_term),
@@ -911,7 +910,7 @@ class FecEnv(gym.Env):
             l_tilde = float(e > 0.0)
         else:
             l_tilde = float(e / (1.0 + max(0.0, e)))
-        arq_tilde = float(np.clip(a_mean / 2.0, 0.0, 1.0))
+        arq_tilde = float(np.clip(a_mean / 10.0, 0.0, 1.0))
 
         resid_term = -float(self._reward_w_residual) * float(l_tilde)
         oh_term = float(self._reward_w_overhead) * float(1.0 / (1.0 + (float(oh) / 0.3) ** 2))

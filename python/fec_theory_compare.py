@@ -33,8 +33,7 @@ class RunResult:
     duration_arrival_ms: Optional[int]
     residual_erasures: Optional[int]
     fec_overhead: Optional[float]
-    ctrl_tx_nack_msgs: Optional[int]
-    arq_attempts_p95: Optional[float]
+    tx_retx_rounds: Optional[int]
 
 
 def _compute_r0_theory(k: int, loss_pct: float) -> int:
@@ -148,7 +147,6 @@ def _run_once(
     rep: int,
     r0_target: float,
     goodput_key: str,
-    ddl_ms: int,
     cc_algo: str,
 ) -> RunResult:
     env = os.environ.copy()
@@ -166,9 +164,6 @@ def _run_once(
     env["SYMBOL_BYTES"] = str(int(symbol_bytes))
     env["R0"] = str(int(r0))
     env["R0_TARGET"] = str(float(r0_target))
-    # Receiver-side decode deadline (also drives ARQ scheduling / backoff). A large DDL (e.g. 900ms)
-    # makes any rare ARQ event add a big tail, which is the main reason for W-shaped goodput.
-    env["DDL_MS"] = str(int(ddl_ms))
 
     if force_build:
         env["FORCE_BUILD"] = "1"
@@ -221,8 +216,7 @@ def _run_once(
     duration_transfer_ms = None
     residual_erasures = None
     fec_overhead = None
-    ctrl_tx_nack = None
-    arq_attempts_p95 = None
+    tx_retx_rounds = None
     if obs is not None:
         try:
             goodput_decode = float(obs.get("goodput_decode_mbps"))
@@ -249,13 +243,9 @@ def _run_once(
         except Exception:
             fec_overhead = None
         try:
-            ctrl_tx_nack = int(obs.get("ctrl_tx_nack_msgs"))
+            tx_retx_rounds = int(obs.get("tx_retx_rounds"))
         except Exception:
-            ctrl_tx_nack = None
-        try:
-            arq_attempts_p95 = float(obs.get("arq_attempts_p95"))
-        except Exception:
-            arq_attempts_p95 = None
+            tx_retx_rounds = None
 
     if goodput_key == "decode":
         goodput = goodput_decode
@@ -287,8 +277,7 @@ def _run_once(
         duration_arrival_ms=duration_arrival_ms,
         residual_erasures=residual_erasures,
         fec_overhead=fec_overhead,
-        ctrl_tx_nack_msgs=ctrl_tx_nack,
-        arq_attempts_p95=arq_attempts_p95,
+        tx_retx_rounds=tx_retx_rounds,
     )
 
 
@@ -340,8 +329,7 @@ def _write_csv(path: Path, rows: List[RunResult]) -> None:
                 "duration_arrival_ms",
                 "residual_erasures",
                 "fec_overhead",
-                "ctrl_tx_nack_msgs",
-                "arq_attempts_p95",
+                "tx_retx_rounds",
             ],
         )
         w.writeheader()
@@ -365,8 +353,7 @@ def _write_csv(path: Path, rows: List[RunResult]) -> None:
                     "duration_arrival_ms": r.duration_arrival_ms,
                     "residual_erasures": r.residual_erasures,
                     "fec_overhead": r.fec_overhead,
-                    "ctrl_tx_nack_msgs": r.ctrl_tx_nack_msgs,
-                    "arq_attempts_p95": r.arq_attempts_p95,
+                    "tx_retx_rounds": r.tx_retx_rounds,
                 }
             )
 
@@ -459,12 +446,6 @@ def main() -> int:
         default="cubic",
         help="Congestion control algorithm when CC is enabled (cc_bypass=0).",
     )
-    ap.add_argument(
-        "--ddl-ms",
-        type=int,
-        default=150,
-        help="Server rx DDL in ms (drives ARQ/NACK timing). Smaller reduces tail latency under loss.",
-    )
     ap.add_argument("--reps", type=int, default=5, help="Repetitions per point (median is plotted)")
     ap.add_argument(
         "--cc-mode",
@@ -519,7 +500,6 @@ def main() -> int:
                     rep=rep,
                     r0_target=float(args.r0_target),
                     goodput_key=str(args.goodput_key),
-                    ddl_ms=int(args.ddl_ms),
                     cc_algo=str(args.cc_algo),
                 )
                 force_build_first = False

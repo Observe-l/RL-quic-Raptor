@@ -216,13 +216,17 @@ def _extract_last_rl_observation(stderr: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _aligned_obs_vec_from_rl_observation(*, rl_obs: Optional[Dict[str, Any]], ddl_ms: int, failed: bool) -> np.ndarray:
+def _aligned_obs_vec_from_rl_observation(*, rl_obs: Optional[Dict[str, Any]], failed: bool) -> np.ndarray:
+    """Construct the exact training observation vector.
+
+    Layout must match `python/fecenv_env.py`:
+            [goodput, fec_overhead, tx_retx_rounds, residual_erasures, fec_rate]
+    """
+
     if failed or not isinstance(rl_obs, dict):
         goodput_mbps = 0.0
-        decode_latency_p95_ms = 0.0
         fec_overhead = 0.0
-        ctrl_tx_nack_msgs = 0.0
-        arq_attempts_mean = 2.0
+        tx_retx_rounds = 0.0
         residual_erasures = 1.0
         fec_rate = 0.0
     else:
@@ -237,23 +241,18 @@ def _aligned_obs_vec_from_rl_observation(*, rl_obs: Optional[Dict[str, Any]], dd
             "goodput",
             _f("goodput_mbps", _f("goodput_arrival_mbps", _f("goodput_decode_mbps", 0.0))),
         )
-        decode_latency_p95_ms = _f("decode_latency_p95_ms", 0.0)
         fec_overhead = _f("fec_overhead", _f("fec_overhead_pct_arrival", 0.0))
-        ctrl_tx_nack_msgs = _f("ctrl_tx_nack_msgs", 0.0)
-        arq_attempts_mean = _f("arq_attempts_mean", 0.0)
+        tx_retx_rounds = _f("tx_retx_rounds", _f("tx_retx_rounds_mean", 0.0))
         residual_erasures = _f("residual_erasures", 0.0)
         fec_rate = _f("fec_rate", 0.0)
 
     return np.asarray(
         [
             float(goodput_mbps),
-            float(decode_latency_p95_ms),
             float(fec_overhead),
-            float(ctrl_tx_nack_msgs),
-            float(arq_attempts_mean),
+            float(tx_retx_rounds),
             float(residual_erasures),
             float(np.clip(float(fec_rate), 0.0, 1.0)),
-            float(int(ddl_ms)),
         ],
         dtype=np.float32,
     )
@@ -309,7 +308,6 @@ def _load_sender_ge(*, params_path: Path, sender_id: int, ge_key: str) -> Dict[s
 class RunRow:
     sender_id: int
     loss_mode: str
-    proto_ddl_ms: int  # protocol rx-ddl used for this run
     method: str
     rep: int
     timed_out: int
@@ -332,7 +330,6 @@ def _load_runrows_from_runs_csv(runs_csv: Path) -> List[RunRow]:
                     RunRow(
                         sender_id=int(row.get("sender_id", "0") or "0"),
                         loss_mode=str(row.get("loss_mode", "")),
-                        proto_ddl_ms=int(row.get("proto_ddl_ms", "0") or "0"),
                         method=str(row.get("method", "")),
                         rep=int(row.get("rep", "0") or "0"),
                         timed_out=int(row.get("timed_out", "0") or "0"),
@@ -395,7 +392,6 @@ def _load_flec_runrows_from_jsonl(flec_jsonl: Path) -> List[RunRow]:
                 RunRow(
                     sender_id=int(sender_id),
                     loss_mode=str(loss_mode),
-                    proto_ddl_ms=0,
                     method="flec",
                     rep=int(rep),
                     timed_out=0 if ok == 1 else 1,
@@ -411,15 +407,13 @@ def _load_flec_runrows_from_jsonl(flec_jsonl: Path) -> List[RunRow]:
     return out
 
 
-def _fixed_fec_env(*, ddl_ms: int, symbol_bytes: int, k: int, r0: int, rstep: int) -> Dict[str, str]:
+def _fixed_fec_env(*, symbol_bytes: int, k: int, r0: int, rstep: int) -> Dict[str, str]:
     return {
         "K": str(int(k)),
         "SYMBOL_BYTES": str(int(symbol_bytes)),
         "R0": str(int(r0)),
         "W": os.environ.get("W", "8"),
         "RSTEP": str(int(rstep)),
-        "DDL_MS": str(int(ddl_ms)),
-        "ALPHA": os.environ.get("ALPHA", "0.6"),
         "MAX_ATTEMPTS": os.environ.get("MAX_ATTEMPTS", "5"),
         "USE_ARQ": os.environ.get("USE_ARQ", "1"),
         "QUIC_FEC_CC_BYPASS": "0",
@@ -433,26 +427,15 @@ def _action_to_env_vars(
     action_set: ActionSet,
     a_idx: int,
     symbol_bytes: int,
-    ddl_ms_override: int = 0,
 ) -> Dict[str, str]:
     spec = action_set.get_action(a_idx)
     env_action = spec.to_env_action()
-    k_idx, r0_idx, rstep_idx, ddl_idx = (
-        int(env_action[0]),
-        int(env_action[1]),
-        int(env_action[2]),
-        int(env_action[3]),
-    )
+    k_idx, r0_idx, rstep_idx = (int(env_action[0]), int(env_action[1]), int(env_action[2]))
 
-    K = 10 + k_idx
-    r0_pct = 0.05 * float(r0_idx)
-    R0 = int(float(K) * r0_pct)
+    # Must match `python/fecenv_env.py` action decoding.
+    K = 20 + 2 * k_idx
+    R0 = int(r0_idx)
     RSTEP = 1 + rstep_idx
-
-    ddl_ms_values = [100, 150, 200, 250, 300, 350]
-    ddl_ms = int(ddl_ms_values[int(ddl_idx)])
-    if int(ddl_ms_override) > 0:
-        ddl_ms = int(ddl_ms_override)
 
     return {
         "K": str(int(K)),
@@ -460,8 +443,6 @@ def _action_to_env_vars(
         "R0": str(int(R0)),
         "W": os.environ.get("W", "8"),
         "RSTEP": str(int(RSTEP)),
-        "DDL_MS": str(int(ddl_ms)),
-        "ALPHA": os.environ.get("ALPHA", "0.6"),
         "MAX_ATTEMPTS": os.environ.get("MAX_ATTEMPTS", "5"),
         "USE_ARQ": os.environ.get("USE_ARQ", "1"),
         "QUIC_FEC_CC_BYPASS": "0",
@@ -589,21 +570,9 @@ def main() -> int:
         default="150,250,350,450",
         help="Comma list of DDL thresholds (ms) used only for completion-ratio calculation / plotting.",
     )
-    ap.add_argument(
-        "--proto-ddl-ms",
-        type=int,
-        default=0,
-        help="If >0, overrides DDL_MS for all QUIC-FEC runs (bandit + fixed). Default 0 keeps compare-style per-method DDL_MS.",
-    )
     ap.add_argument("--symbol-bytes", type=int, default=1200)
     ap.add_argument("--fixed1", type=str, default="20,2,2", help="Fixed FEC #1 as k,r0,rstep (default: 20,2,2)")
     ap.add_argument("--fixed2", type=str, default="20,6,4", help="Fixed FEC #2 as k,r0,rstep (default: 20,6,4)")
-    ap.add_argument(
-        "--fixed-ddl-ms",
-        type=int,
-        default=150,
-        help="DDL_MS for fixed-FEC baselines (default: 150, to match compare delay experiment)",
-    )
 
     ap.add_argument("--out-dir", type=str, default="")
 
@@ -626,7 +595,6 @@ def main() -> int:
         raise ValueError("empty --ddl-ms")
 
     ddl_list = sorted(list({int(x) for x in ddl_list}))
-    proto_ddl_ms = int(args.proto_ddl_ms)
 
     def _parse_fixed(s: str) -> Tuple[int, int, int]:
         parts = [p.strip() for p in str(s).split(",") if p.strip()]
@@ -687,7 +655,6 @@ def main() -> int:
         method_f2 = f"fec_k{int(fixed2[0])}_r0_{int(fixed2[1])}_rstep_{int(fixed2[2])}"
         methods = ["bandit", "quic_bbrv2", method_f1, method_f2]
 
-    print(f"[ddl-override] {proto_ddl_ms}ms" if int(proto_ddl_ms) > 0 else "[ddl-override] disabled")
     print(f"[ddl-thresholds] {ddl_list}")
     print(f"[senders] {sender_ids}")
 
@@ -708,9 +675,7 @@ def main() -> int:
             action_set=action_set,
             a_idx=warmup_idx,
             symbol_bytes=int(args.symbol_bytes),
-            ddl_ms_override=int(proto_ddl_ms),
         )
-        warmup_ddl_ms = int(warmup_env.get("DDL_MS", "150"))
         m_w, stderr_w = _run_one(
             method="bandit",
             loss_mode=loss_mode,
@@ -723,8 +688,8 @@ def main() -> int:
         )
         rl_obs = _extract_last_rl_observation(stderr_w)
         failed = bool(int(m_w["timed_out"]) or int(m_w["md5_ok"]) != 1)
-        obs_vec = _aligned_obs_vec_from_rl_observation(rl_obs=rl_obs, ddl_ms=int(warmup_ddl_ms), failed=failed)
-        ctx.update_from_obs(obs=obs_vec, ddl_ms=int(warmup_ddl_ms))
+        obs_vec = _aligned_obs_vec_from_rl_observation(rl_obs=rl_obs, failed=failed)
+        ctx.update_from_obs(obs=obs_vec)
 
         for rep in range(int(args.reps)):
             # Bandit
@@ -733,9 +698,7 @@ def main() -> int:
                 action_set=action_set,
                 a_idx=int(a_idx),
                 symbol_bytes=int(args.symbol_bytes),
-                ddl_ms_override=int(proto_ddl_ms),
             )
-            ddl_ms_used = int(bandit_env.get("DDL_MS", "150"))
             m, stderr = _run_one(
                 method="bandit",
                 loss_mode=loss_mode,
@@ -748,13 +711,12 @@ def main() -> int:
             )
             rl_obs2 = _extract_last_rl_observation(stderr)
             failed2 = bool(int(m["timed_out"]) or int(m["md5_ok"]) != 1)
-            obs_vec2 = _aligned_obs_vec_from_rl_observation(rl_obs=rl_obs2, ddl_ms=int(ddl_ms_used), failed=failed2)
-            ctx.update_from_obs(obs=obs_vec2, ddl_ms=int(ddl_ms_used))
+            obs_vec2 = _aligned_obs_vec_from_rl_observation(rl_obs=rl_obs2, failed=failed2)
+            ctx.update_from_obs(obs=obs_vec2)
             rows.append(
                 RunRow(
                     sender_id=int(sender_id),
                     loss_mode=str(loss_mode),
-                    proto_ddl_ms=int(ddl_ms_used),
                     method="bandit",
                     rep=int(rep),
                     timed_out=int(m["timed_out"]),
@@ -782,7 +744,6 @@ def main() -> int:
                 RunRow(
                     sender_id=int(sender_id),
                     loss_mode=str(loss_mode),
-                    proto_ddl_ms=int(proto_ddl_ms),
                     method="quic_bbrv2",
                     rep=int(rep),
                     timed_out=int(m_q["timed_out"]),
@@ -798,13 +759,11 @@ def main() -> int:
 
             # Fixed FEC #1
             env_f1 = _fixed_fec_env(
-                ddl_ms=int(proto_ddl_ms) if int(proto_ddl_ms) > 0 else int(args.fixed_ddl_ms),
                 symbol_bytes=int(args.symbol_bytes),
                 k=int(fixed1[0]),
                 r0=int(fixed1[1]),
                 rstep=int(fixed1[2]),
             )
-            ddl_f1 = int(env_f1.get("DDL_MS", str(int(args.fixed_ddl_ms))))
             m_f1, _stderr_f1 = _run_one(
                 method=method_f1,
                 loss_mode=loss_mode,
@@ -819,7 +778,6 @@ def main() -> int:
                 RunRow(
                     sender_id=int(sender_id),
                     loss_mode=str(loss_mode),
-                    proto_ddl_ms=int(ddl_f1),
                     method=method_f1,
                     rep=int(rep),
                     timed_out=int(m_f1["timed_out"]),
@@ -835,13 +793,11 @@ def main() -> int:
 
             # Fixed FEC #2
             env_f2 = _fixed_fec_env(
-                ddl_ms=int(proto_ddl_ms) if int(proto_ddl_ms) > 0 else int(args.fixed_ddl_ms),
                 symbol_bytes=int(args.symbol_bytes),
                 k=int(fixed2[0]),
                 r0=int(fixed2[1]),
                 rstep=int(fixed2[2]),
             )
-            ddl_f2 = int(env_f2.get("DDL_MS", str(int(args.fixed_ddl_ms))))
             m_f2, _stderr_f2 = _run_one(
                 method=method_f2,
                 loss_mode=loss_mode,
@@ -856,7 +812,6 @@ def main() -> int:
                 RunRow(
                     sender_id=int(sender_id),
                     loss_mode=str(loss_mode),
-                    proto_ddl_ms=int(ddl_f2),
                     method=method_f2,
                     rep=int(rep),
                     timed_out=int(m_f2["timed_out"]),
@@ -887,7 +842,6 @@ def main() -> int:
             fieldnames=[
                 "sender_id",
                 "loss_mode",
-                "proto_ddl_ms",
                 "method",
                 "rep",
                 "timed_out",
@@ -906,7 +860,6 @@ def main() -> int:
                 {
                     "sender_id": r.sender_id,
                     "loss_mode": r.loss_mode,
-                    "proto_ddl_ms": r.proto_ddl_ms,
                     "method": r.method,
                     "rep": r.rep,
                     "timed_out": r.timed_out,
@@ -1017,8 +970,6 @@ def main() -> int:
                 "timeout_s": int(args.timeout_s),
                 "file_bytes": int(args.file_bytes),
                 "reps": int(args.reps),
-                "ddl_override_ms": int(proto_ddl_ms),
-                "fixed_ddl_ms": int(args.fixed_ddl_ms),
                 "symbol_bytes": int(args.symbol_bytes),
                 "warmup_a_idx": int(args.warmup_a_idx),
                 "fixed1": {"k": int(fixed1[0]), "r0": int(fixed1[1]), "rstep": int(fixed1[2])},

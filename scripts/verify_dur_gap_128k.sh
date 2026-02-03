@@ -117,8 +117,9 @@ emit_stats() {
   local proto="$1"
   local csv_in="$2"
   python3 - <<PY
-import csv, math
+import csv, math, sys
 from pathlib import Path
+proto = "$proto"
 p=Path("$csv_in")
 rows=[]
 with p.open() as f:
@@ -134,7 +135,7 @@ with p.open() as f:
 rows.sort()
 print(f"[stats] proto={proto} ok_samples={len(rows)}")
 if not rows:
-  return
+  sys.exit(0)
 
 def pct(x, p):
   if not x: return math.nan
@@ -189,7 +190,7 @@ for i in $(seq 1 "$REPS"); do
         gap_ms=$((dur_ms_client - dur_ms))
       fi
 
-      printf "%s\n" "quic_fec,$i,$attempt,$BITRATE_MBPS,$RTT_MS,$LOSS_MODE,$FILE_SIZE_BYTES,${md5_ok:-},${client_ok:-},${client_rc:-},${timed_out:-},${dur_ms:-},${dur_ms_client:-},${gap_ms:-}" >>"$CSV"
+      printf "%s\n" "quic_fec,$i,$attempt,$BITRATE_MBPS,$RTT_MS,\"$LOSS_MODE\",$FILE_SIZE_BYTES,${md5_ok:-},${client_ok:-},${client_rc:-},${timed_out:-},${dur_ms:-},${dur_ms_client:-},${gap_ms:-}" >>"$CSV"
 
       if [[ "$md5_ok" == "1" && "$client_ok" == "1" ]]; then
         break
@@ -224,7 +225,7 @@ for i in $(seq 1 "$REPS"); do
       gap_ms=$((dur_ms_client - dur_ms))
     fi
 
-    printf "%s\n" "quic_raw,$i,1,$BITRATE_MBPS,$RTT_MS,$LOSS_MODE,$FILE_SIZE_BYTES,${md5_ok:-},${client_ok:-},${client_rc:-},${timed_out:-},${dur_ms:-},${dur_ms_client:-},${gap_ms:-}" >>"$CSV"
+    printf "%s\n" "quic_raw,$i,1,$BITRATE_MBPS,$RTT_MS,\"$LOSS_MODE\",$FILE_SIZE_BYTES,${md5_ok:-},${client_ok:-},${client_rc:-},${timed_out:-},${dur_ms:-},${dur_ms_client:-},${gap_ms:-}" >>"$CSV"
 
     if [[ "${md5_ok:-0}" != "1" || "${client_ok:-0}" != "1" ]]; then
       fails=$((fails+1))
