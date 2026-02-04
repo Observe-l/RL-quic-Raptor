@@ -99,6 +99,12 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		ackEvery = 1 // negative => use default
 	}
 
+	enableQuicStats := os.Getenv("QUIC_FEC_STATS") == "1"
+	var quicStats *quicConnStats
+	if enableQuicStats {
+		quicStats = newQuicConnStats()
+	}
+
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -121,10 +127,14 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	qconf := &quic.Config{
 		// attach our ECN tracer to observe CE/ECT counts
 		Tracer: func(ctx context.Context, p logging.Perspective, cid logging.ConnectionID) *logging.ConnectionTracer {
-			return logging.NewMultiplexedConnectionTracer(
+			base := logging.NewMultiplexedConnectionTracer(
 				NewECNConnTracer(ecnStats),
 				NewCCDebugConnTracer(),
 			)
+			if !enableQuicStats {
+				return base
+			}
+			return logging.NewMultiplexedConnectionTracer(base, newQuicConnStatsTracer(quicStats))
 		},
 		EnableDatagrams: true,
 		// Prevent idle timeouts; keep small to avoid tail delays on shutdown.
@@ -494,6 +504,13 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		// systematic symbols we transmit (and what the receiver decodes).
 		blockBytes := make([]byte, K*L)
 		copy(blockBytes, buf)
+		blockDataLen := n
+		if blockDataLen < 0 {
+			blockDataLen = 0
+		}
+		if blockDataLen > K*L {
+			blockDataLen = K * L
+		}
 		tEnc := time.Now()
 		enc, encErr := fec.NewRaptorQEncoder(blockBytes, K, L)
 		if encErr != nil {
@@ -517,9 +534,9 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		txMu.Unlock()
 		// Emit initial symbols 0..initN-1
 		for esi := 0; esi < initN; esi++ {
-			// Avoid per-symbol allocation: build packet in a reusable fixed-size buffer.
-			b := make([]byte, fecwire.HeaderLen+L)
-			pay := b[fecwire.HeaderLen:]
+			var b []byte
+			var pay []byte
+			payloadLen := L
 			// Fast path: for systematic source symbols, avoid the RaptorQ library call.
 			// At high bitrates (e.g., 100 Mbps), per-symbol overhead can dominate and
 			// cap throughput well below the shaped rate. The RaptorQ systematic symbols
@@ -527,20 +544,22 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 			// final symbol padded with zeros if needed.
 			if esi < K {
 				start := esi * L
-				if start < len(blockBytes) {
-					end := start + L
-					if end <= len(blockBytes) {
-						copy(pay, blockBytes[start:end])
-					} else {
-						// Last partial symbol: zero-pad to L bytes.
-						clear(pay)
-						copy(pay, blockBytes[start:])
+				payloadLen = 0
+				if start < blockDataLen {
+					payloadLen = blockDataLen - start
+					if payloadLen > L {
+						payloadLen = L
 					}
-				} else {
-					// Beyond the end of the last partial block: pure padding.
-					clear(pay)
+				}
+				// Send only the non-padding bytes. Receiver will treat missing tail as zeros.
+				b = make([]byte, fecwire.HeaderLen+payloadLen)
+				pay = b[fecwire.HeaderLen:]
+				if payloadLen > 0 {
+					copy(pay, blockBytes[start:start+payloadLen])
 				}
 			} else {
+				b = make([]byte, fecwire.HeaderLen+L)
+				pay = b[fecwire.HeaderLen:]
 				payload := enc.GenSymbol(uint32(esi))
 				if len(payload) == L {
 					copy(pay, payload)
@@ -558,7 +577,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 				N:          uint8(advN),
 				K:          uint8(K),
 				SymID:      uint8(esi),
-				PayloadLen: uint32(L),
+				PayloadLen: uint32(payloadLen),
 			}
 			h.MarshalBinary(b[:fecwire.HeaderLen])
 			if opts.WarnDgramSize > 0 && len(b) > opts.WarnDgramSize {
@@ -751,6 +770,9 @@ afterArqDrain:
 	}
 	fmt.Fprintf(os.Stderr, "[fec-client-stages] dial_ms=%d header_ms=%d send_blocks_ms=%d arq_drain_ms=%d tx_stats_ms=%d post_wait_ms=%d keep_stop_ms=%d total_ms=%d\n",
 		dialDur.Milliseconds(), hdrDur.Milliseconds(), sendBlocksDur.Milliseconds(), arqDrainDur.Milliseconds(), txStatsDur.Milliseconds(), postWaitDur.Milliseconds(), keepStopDur.Milliseconds(), time.Since(startTotal).Milliseconds())
+	if enableQuicStats {
+		fmt.Fprintln(os.Stderr, quicStats.Format("[fec-client-quic-stats]"))
+	}
 	return nil
 }
 
@@ -1001,7 +1023,7 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 						return
 					}
 					plen := int(fh.PayloadLen)
-					if plen <= 0 || plen > 1<<20 {
+					if plen < 0 || plen > 1<<20 {
 						return
 					}
 					buf := make([]byte, plen)

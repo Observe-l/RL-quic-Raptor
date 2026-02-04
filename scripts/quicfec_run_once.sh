@@ -221,6 +221,13 @@ fi
 CLI_LOG=$(mktemp -t quic_fec_cli.XXXXXX.log)
 export QUIC_FEC_CC_BYPASS=${QUIC_FEC_CC_BYPASS:-1}
 
+# Optional QUIC-layer stats (disabled by default to avoid affecting performance).
+# When enabled, fecquic.ClientSendFile prints one line: [fec-client-quic-stats] key=value...
+FEC_STATS=${FEC_STATS:-0}
+if [[ "$FEC_STATS" == "1" ]]; then
+  export QUIC_FEC_STATS=1
+fi
+
 # Byte counters on host veth (network-layer; includes headers). These are used
 # to estimate overhead (extra transmitted bytes over the file payload).
 TX0=0; RX0=0
@@ -287,6 +294,31 @@ TX_BYTES=$(( TX1 - TX0 ))
 RX_BYTES=$(( RX1 - RX0 ))
 if [[ "$TX_BYTES" -lt 0 ]]; then TX_BYTES=0; fi
 if [[ "$RX_BYTES" -lt 0 ]]; then RX_BYTES=0; fi
+
+# Overhead ratio: extra transmitted bytes over payload bytes.
+OVERHEAD_RATIO=0
+if [[ "$FILE_SIZE" -gt 0 && "$TX_BYTES" -gt 0 ]]; then
+  OVERHEAD_RATIO=$(awk -v tx="$TX_BYTES" -v fb="$FILE_SIZE" 'BEGIN{v=(tx-fb)/fb; if(v<0)v=0; printf "%.6f", v}')
+fi
+
+# Capture netem stats (host egress), to validate realized loss.
+NETEM_SENT_PKTS=0
+NETEM_DROPPED_PKTS=0
+NETEM_SENT_BYTES=0
+if command -v tc >/dev/null 2>&1; then
+  netem_sent_line=$(tc -s qdisc show dev "$VETH_HOST" 2>/dev/null | awk '/qdisc netem 10:/{f=1} f && /Sent [0-9]+ bytes/{print; exit}')
+  if [[ -n "$netem_sent_line" ]]; then
+    NETEM_SENT_BYTES=$(echo "$netem_sent_line" | sed -n 's/.*Sent \([0-9]\+\) bytes.*/\1/p')
+    NETEM_SENT_PKTS=$(echo "$netem_sent_line" | sed -n 's/.* bytes \([0-9]\+\) pkt.*/\1/p')
+    NETEM_DROPPED_PKTS=$(echo "$netem_sent_line" | sed -n 's/.*(dropped \([0-9]\+\).*/\1/p')
+  fi
+fi
+
+# Netem drop rate: dropped / (sent + dropped).
+NETEM_DROP_RATE=
+if [[ "$NETEM_SENT_PKTS" -gt 0 || "$NETEM_DROPPED_PKTS" -gt 0 ]]; then
+  NETEM_DROP_RATE=$(awk -v s="$NETEM_SENT_PKTS" -v d="$NETEM_DROPPED_PKTS" 'BEGIN{t=s+d; if(t<=0){print "0"; exit} printf "%.6f", d/t}')
+fi
 
 # Wait for server to emit the observation before stopping it (cap by OBS_WAIT_SECS)
 tries=0
@@ -579,7 +611,39 @@ run_tail=""
 if [[ -n "$S_MBPS_TOTAL" ]]; then
   run_tail=" s_mbps_total=${S_MBPS_TOTAL}"
 fi
-echo "[run] proto=quic_fec bitrate=${BITRATE_MBPS}Mbps rtt=${RTT_MS}ms loss=${LOSS_DESC} dur_ms=${DUR_MS} dur_ms_client=${DUR_MS_CLIENT} timed_out=${TIMED_OUT} client_ok=${CLIENT_OK} client_rc=${RC} md5_ok=${MD5_OK} s_mbps=${S_MBPS}${run_tail} file_bytes=${FILE_SIZE} tx_bytes=${TX_BYTES} rx_bytes=${RX_BYTES}" >&2
+
+# Optional QUIC-layer stats (attempted sends, including packets later dropped by qdisc).
+FEC_QUIC_SENT_PKTS=
+FEC_QUIC_SENT_BYTES=
+FEC_QUIC_SENT_SHORT_PKTS=
+FEC_QUIC_SENT_SHORT_BYTES=
+FEC_QUIC_LOST_1RTT_PKTS=
+FEC_QUIC_ACKED_1RTT_PKTS=
+FEC_QUIC_OVERHEAD_RATIO=
+FEC_QUIC_LINE=$(grep -E '^\[fec-client-quic-stats\] ' "$CLI_LOG" | tail -n1 || true)
+if [[ -n "$FEC_QUIC_LINE" ]]; then
+  FEC_QUIC_SENT_PKTS=$(echo "$FEC_QUIC_LINE" | sed -n 's/.*sent_pkts=\([0-9]\+\).*/\1/p')
+  FEC_QUIC_SENT_BYTES=$(echo "$FEC_QUIC_LINE" | sed -n 's/.*sent_bytes=\([0-9]\+\).*/\1/p')
+  FEC_QUIC_SENT_SHORT_PKTS=$(echo "$FEC_QUIC_LINE" | sed -n 's/.*sent_short_pkts=\([0-9]\+\).*/\1/p')
+  FEC_QUIC_SENT_SHORT_BYTES=$(echo "$FEC_QUIC_LINE" | sed -n 's/.*sent_short_bytes=\([0-9]\+\).*/\1/p')
+  FEC_QUIC_LOST_1RTT_PKTS=$(echo "$FEC_QUIC_LINE" | sed -n 's/.*lost_1rtt_pkts=\([0-9]\+\).*/\1/p')
+  FEC_QUIC_ACKED_1RTT_PKTS=$(echo "$FEC_QUIC_LINE" | sed -n 's/.*acked_1rtt_pkts=\([0-9]\+\).*/\1/p')
+  if [[ -n "${FEC_QUIC_SENT_BYTES}" && "$FILE_SIZE" -gt 0 ]]; then
+    FEC_QUIC_OVERHEAD_RATIO=$(awk -v tx="$FEC_QUIC_SENT_BYTES" -v fb="$FILE_SIZE" 'BEGIN{v=(tx-fb)/fb; if(v<0)v=0; printf "%.6f", v}')
+  fi
+fi
+
+# Sender-side ARQ counters (helps attribute overhead to appended repairs).
+FEC_ARQ_TX_SOURCE_SYMBOLS=
+FEC_ARQ_TX_REPAIRS=
+FEC_ARQ_FEC_OVERHEAD=
+if [[ -n "${ARQ_STATS:-}" ]]; then
+  FEC_ARQ_TX_SOURCE_SYMBOLS=$(echo "$ARQ_STATS" | sed -n 's/.*tx_source_symbols=\([0-9]\+\).*/\1/p')
+  FEC_ARQ_TX_REPAIRS=$(echo "$ARQ_STATS" | sed -n 's/.*tx_repairs=\([0-9]\+\).*/\1/p')
+  FEC_ARQ_FEC_OVERHEAD=$(echo "$ARQ_STATS" | sed -n 's/.*fec_overhead=\([0-9.\-]\+\).*/\1/p')
+fi
+
+echo "[run] proto=quic_fec bitrate=${BITRATE_MBPS}Mbps rtt=${RTT_MS}ms loss=${LOSS_DESC} dur_ms=${DUR_MS} dur_ms_client=${DUR_MS_CLIENT} timed_out=${TIMED_OUT} client_ok=${CLIENT_OK} client_rc=${RC} md5_ok=${MD5_OK} s_mbps=${S_MBPS}${run_tail} overhead_ratio=${OVERHEAD_RATIO} file_bytes=${FILE_SIZE} tx_bytes=${TX_BYTES} rx_bytes=${RX_BYTES} netem_sent_pkts=${NETEM_SENT_PKTS} netem_dropped_pkts=${NETEM_DROPPED_PKTS} netem_sent_bytes=${NETEM_SENT_BYTES} netem_drop_rate=${NETEM_DROP_RATE:-} fec_quic_sent_pkts=${FEC_QUIC_SENT_PKTS:-} fec_quic_sent_bytes=${FEC_QUIC_SENT_BYTES:-} fec_quic_sent_short_pkts=${FEC_QUIC_SENT_SHORT_PKTS:-} fec_quic_sent_short_bytes=${FEC_QUIC_SENT_SHORT_BYTES:-} fec_quic_lost_1rtt_pkts=${FEC_QUIC_LOST_1RTT_PKTS:-} fec_quic_acked_1rtt_pkts=${FEC_QUIC_ACKED_1RTT_PKTS:-} fec_quic_overhead_ratio=${FEC_QUIC_OVERHEAD_RATIO:-} arq_tx_source_symbols=${FEC_ARQ_TX_SOURCE_SYMBOLS:-} arq_tx_repairs=${FEC_ARQ_TX_REPAIRS:-} arq_fec_overhead=${FEC_ARQ_FEC_OVERHEAD:-}" >&2
 
 # Cleanup temp logs
 # - Keep logs when a failure occurs (no RL_OBS) or residual_erasures=1.

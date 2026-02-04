@@ -139,8 +139,19 @@ fi
 # Run client
 CLI_LOG=$(mktemp -t quic_raw_cli.XXXXXX.log)
 START=$(date +%s%N)
-QUIC_FEC_CC_BYPASS=${QUIC_FEC_CC_BYPASS:-0} \
-QUIC_FEC_CC_ALGO=${QUIC_FEC_CC_ALGO:-} \
+
+# Congestion control selection (kept consistent with quicfec_run_once.sh):
+# These env vars are consumed by the Go binaries.
+export QUIC_FEC_CC_BYPASS=${QUIC_FEC_CC_BYPASS:-0}
+export QUIC_FEC_CC_ALGO=${QUIC_FEC_CC_ALGO:-bbrv2}
+
+# Optional QUIC-layer stats (disabled by default to avoid affecting performance).
+# When enabled, quicraw-client prints one line: [raw-client-quic-stats] key=value...
+RAW_STATS=${RAW_STATS:-0}
+if [[ "$RAW_STATS" == "1" ]]; then
+  export QUIC_RAW_STATS=1
+fi
+
 TIMED_OUT=0
 
 # Byte counters on host veth (network-layer; includes headers).
@@ -176,6 +187,27 @@ TX_BYTES=$(( TX1 - TX0 ))
 RX_BYTES=$(( RX1 - RX0 ))
 if [[ "$TX_BYTES" -lt 0 ]]; then TX_BYTES=0; fi
 if [[ "$RX_BYTES" -lt 0 ]]; then RX_BYTES=0; fi
+
+# Capture netem stats (host egress), to validate realized loss.
+NETEM_SENT_PKTS=0
+NETEM_DROPPED_PKTS=0
+NETEM_SENT_BYTES=0
+if command -v tc >/dev/null 2>&1; then
+  # Example line:
+  #   Sent 123456 bytes 789 pkt (dropped 12, overlimits 0 requeues 0)
+  netem_sent_line=$(tc -s qdisc show dev "$VETH_HOST" 2>/dev/null | awk '/qdisc netem 10:/{f=1} f && /Sent [0-9]+ bytes/{print; exit}')
+  if [[ -n "$netem_sent_line" ]]; then
+    NETEM_SENT_BYTES=$(echo "$netem_sent_line" | sed -n 's/.*Sent \([0-9]\+\) bytes.*/\1/p')
+    NETEM_SENT_PKTS=$(echo "$netem_sent_line" | sed -n 's/.* bytes \([0-9]\+\) pkt.*/\1/p')
+    NETEM_DROPPED_PKTS=$(echo "$netem_sent_line" | sed -n 's/.*(dropped \([0-9]\+\).*/\1/p')
+  fi
+fi
+
+# Netem drop rate: dropped / (sent + dropped).
+NETEM_DROP_RATE=
+if [[ "$NETEM_SENT_PKTS" -gt 0 || "$NETEM_DROPPED_PKTS" -gt 0 ]]; then
+  NETEM_DROP_RATE=$(awk -v s="$NETEM_SENT_PKTS" -v d="$NETEM_DROPPED_PKTS" 'BEGIN{t=s+d; if(t<=0){print "0"; exit} printf "%.6f", d/t}')
+fi
 
 # Wait for server to finish writing (bounded).
 IN_SIZE=$(stat -c%s "$FILE")
@@ -214,6 +246,12 @@ fi
 
 FILE_SIZE=$(stat -c%s "$FILE")
 
+# Overhead ratio: extra transmitted bytes over payload bytes.
+OVERHEAD_RATIO=0
+if [[ "$FILE_SIZE" -gt 0 && "$TX_BYTES" -gt 0 ]]; then
+  OVERHEAD_RATIO=$(awk -v tx="$TX_BYTES" -v fb="$FILE_SIZE" 'BEGIN{v=(tx-fb)/fb; if(v<0)v=0; printf "%.6f", v}')
+fi
+
 # Throughput metric:
 # - s_mbps: computed from dur_ms (server duration when available), so it matches dur_ms.
 S_MBPS=0
@@ -234,12 +272,33 @@ if [[ -n "$TOTAL_MS" ]]; then
   DUR_MS_CLIENT=$TOTAL_MS
 fi
 
+# Optional QUIC-layer stats (attempted sends, including packets later dropped by qdisc).
+RAW_QUIC_SENT_PKTS=
+RAW_QUIC_SENT_BYTES=
+RAW_QUIC_SENT_SHORT_PKTS=
+RAW_QUIC_SENT_SHORT_BYTES=
+RAW_QUIC_LOST_1RTT_PKTS=
+RAW_QUIC_ACKED_1RTT_PKTS=
+RAW_QUIC_OVERHEAD_RATIO=
+RAW_QUIC_LINE=$(grep -E '^\[raw-client-quic-stats\] ' "$CLI_LOG" | tail -n1 || true)
+if [[ -n "$RAW_QUIC_LINE" ]]; then
+  RAW_QUIC_SENT_PKTS=$(echo "$RAW_QUIC_LINE" | sed -n 's/.*sent_pkts=\([0-9]\+\).*/\1/p')
+  RAW_QUIC_SENT_BYTES=$(echo "$RAW_QUIC_LINE" | sed -n 's/.*sent_bytes=\([0-9]\+\).*/\1/p')
+  RAW_QUIC_SENT_SHORT_PKTS=$(echo "$RAW_QUIC_LINE" | sed -n 's/.*sent_short_pkts=\([0-9]\+\).*/\1/p')
+  RAW_QUIC_SENT_SHORT_BYTES=$(echo "$RAW_QUIC_LINE" | sed -n 's/.*sent_short_bytes=\([0-9]\+\).*/\1/p')
+  RAW_QUIC_LOST_1RTT_PKTS=$(echo "$RAW_QUIC_LINE" | sed -n 's/.*lost_1rtt_pkts=\([0-9]\+\).*/\1/p')
+  RAW_QUIC_ACKED_1RTT_PKTS=$(echo "$RAW_QUIC_LINE" | sed -n 's/.*acked_1rtt_pkts=\([0-9]\+\).*/\1/p')
+  if [[ -n "${RAW_QUIC_SENT_BYTES}" && "$FILE_SIZE" -gt 0 ]]; then
+    RAW_QUIC_OVERHEAD_RATIO=$(awk -v tx="$RAW_QUIC_SENT_BYTES" -v fb="$FILE_SIZE" 'BEGIN{v=(tx-fb)/fb; if(v<0)v=0; printf "%.6f", v}')
+  fi
+fi
+
 LOSS_TAG="${LOSS_PCT}%"
 if [[ -n "${LOSS_MODE}" ]]; then
   LOSS_TAG="${LOSS_MODE}"
 fi
 
-echo "[run] proto=quic_raw bitrate=${BITRATE_MBPS}Mbps rtt=${RTT_MS}ms loss=${LOSS_TAG} dur_ms=${DUR_MS_SERVER} dur_ms_client=${DUR_MS_CLIENT} timed_out=${TIMED_OUT} client_ok=${CLIENT_OK} client_rc=${RC} md5_ok=${MD5_OK} s_mbps=${S_MBPS} file_bytes=${FILE_SIZE} tx_bytes=${TX_BYTES} rx_bytes=${RX_BYTES}" >&2
+echo "[run] proto=quic_raw bitrate=${BITRATE_MBPS}Mbps rtt=${RTT_MS}ms loss=${LOSS_TAG} dur_ms=${DUR_MS_SERVER} dur_ms_client=${DUR_MS_CLIENT} timed_out=${TIMED_OUT} client_ok=${CLIENT_OK} client_rc=${RC} md5_ok=${MD5_OK} s_mbps=${S_MBPS} overhead_ratio=${OVERHEAD_RATIO} file_bytes=${FILE_SIZE} tx_bytes=${TX_BYTES} rx_bytes=${RX_BYTES} netem_sent_pkts=${NETEM_SENT_PKTS} netem_dropped_pkts=${NETEM_DROPPED_PKTS} netem_sent_bytes=${NETEM_SENT_BYTES} netem_drop_rate=${NETEM_DROP_RATE:-} raw_quic_sent_pkts=${RAW_QUIC_SENT_PKTS:-} raw_quic_sent_bytes=${RAW_QUIC_SENT_BYTES:-} raw_quic_sent_short_pkts=${RAW_QUIC_SENT_SHORT_PKTS:-} raw_quic_sent_short_bytes=${RAW_QUIC_SENT_SHORT_BYTES:-} raw_quic_lost_1rtt_pkts=${RAW_QUIC_LOST_1RTT_PKTS:-} raw_quic_acked_1rtt_pkts=${RAW_QUIC_ACKED_1RTT_PKTS:-} raw_quic_overhead_ratio=${RAW_QUIC_OVERHEAD_RATIO:-}" >&2
 
 # Emit AoI-style average one-way delay from server output.
 DELAY_LINE=$(grep -E '^\[delay\] ' "$SRV_LOG" | tail -n1 || true)

@@ -8,7 +8,7 @@ set -euo pipefail
 #   reps = 50
 #   bw = 10 Mbps
 #   rtt = 50 ms
-#   loss_mode = gemodel:1.905626,10.377358,0.000000,99.000000
+#   loss_mode = gemodel:5.15463917,78.571428571,0.000000,99.000000
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
@@ -19,7 +19,7 @@ OUT_DIR=${OUT_DIR:-/tmp/quicfec_out_verify}
 
 BITRATE_MBPS=${BITRATE_MBPS:-10}
 RTT_MS=${RTT_MS:-50}
-LOSS_MODE=${LOSS_MODE:-gemodel:1.905626,10.377358,0.000000,99.000000}
+LOSS_MODE=${LOSS_MODE:-gemodel:5.15463917,78.571428571,0.000000,99.000000}
 
 TIMEOUT_S=${TIMEOUT_S:-15}
 RETRY_PER_RUN=${RETRY_PER_RUN:-2}

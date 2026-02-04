@@ -36,9 +36,19 @@ func main() {
 
 	tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{*alpn}}
 
+	enableStats := os.Getenv("QUIC_RAW_STATS") == "1"
+	var connStats *rawConnStats
+	if enableStats {
+		connStats = newRawConnStats()
+	}
 	qconf := &quic.Config{
 		Tracer: func(ctx context.Context, p logging.Perspective, cid logging.ConnectionID) *logging.ConnectionTracer {
-			return fecquic.NewCCDebugConnTracer()
+			ccTracer := fecquic.NewCCDebugConnTracer()
+			if !enableStats {
+				return ccTracer
+			}
+			statsTracer := newRawConnStatsTracer(connStats)
+			return logging.NewMultiplexedConnectionTracer(ccTracer, statsTracer)
 		},
 	}
 	t0 := time.Now()
@@ -169,6 +179,9 @@ func main() {
 		postWaitDur = time.Since(t0)
 	}
 	_ = conn.CloseWithError(0, "")
+	if enableStats {
+		fmt.Fprintln(os.Stderr, connStats.Format("[raw-client-quic-stats]"))
+	}
 
 	dur := time.Since(start)
 	mbps := (float64(n) * 8 / 1e6) / dur.Seconds()

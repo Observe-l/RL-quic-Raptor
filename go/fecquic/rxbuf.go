@@ -391,7 +391,7 @@ func (m *rxManager) start(rx RXOptions) {
 				if now.After(b.nextDDL) || now.Equal(b.nextDDL) {
 					// Calculate NACK recommendation under lock for deficit cases.
 					if m.ctrlOut != nil {
-						rxu := len(b.syms)
+						rxu := b.srcSeenCount + len(b.syms)
 						deficit := b.K - rxu
 						if deficit > 0 {
 							// Debounce: avoid spamming NACKs when nothing changes.
@@ -419,7 +419,9 @@ func (m *rxManager) start(rx RXOptions) {
 								// If totalBlocks is known, use [0,totalBlocks) so missing tail blocks are recoverable.
 								inRange := false
 								if m.totalBlocks > 0 {
-									inRange = int(b.id) >= 0 && int(b.id) < m.totalBlocks
+									// IMPORTANT: Don't NACK future blocks that we haven't observed yet.
+									// Only NACK unseen placeholders that are within the observed range.
+									inRange = (m.minSeen >= 0 && int(b.id) >= m.minSeen && int(b.id) <= m.maxSeen)
 								} else {
 									inRange = (m.minSeen >= 0 && int(b.id) >= m.minSeen && int(b.id) <= m.maxSeen)
 								}
