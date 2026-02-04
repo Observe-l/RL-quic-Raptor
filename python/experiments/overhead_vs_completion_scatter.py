@@ -99,6 +99,13 @@ def _to_int(d: Dict[str, str], k: str, default: int = 0) -> int:
         return default
 
 
+def _to_float(d: Dict[str, str], k: str, default: float = 0.0) -> float:
+    try:
+        return float(d.get(k, str(default)))
+    except Exception:
+        return default
+
+
 def _ensure_file_of_size(*, file_path: Path, file_bytes: int) -> None:
     file_path.parent.mkdir(parents=True, exist_ok=True)
     if not file_path.exists() or file_path.stat().st_size != int(file_bytes):
@@ -314,10 +321,18 @@ class RunRow:
     md5_ok: int
     success: int
     dur_ms: int
+    e2e_delay_ms: float
     tx_bytes: int
     rx_bytes: int
     file_bytes: int
     overhead_ratio: float
+
+
+def _row_delay_ms(r: RunRow) -> float:
+    v = float(getattr(r, "e2e_delay_ms", 0.0) or 0.0)
+    if np.isfinite(v) and v > 0.0:
+        return v
+    return float(r.dur_ms)
 
 
 def _load_runrows_from_runs_csv(runs_csv: Path) -> List[RunRow]:
@@ -336,6 +351,7 @@ def _load_runrows_from_runs_csv(runs_csv: Path) -> List[RunRow]:
                         md5_ok=int(row.get("md5_ok", "0") or "0"),
                         success=int(row.get("success", "0") or "0"),
                         dur_ms=int(row.get("dur_ms", "0") or "0"),
+                        e2e_delay_ms=float(row.get("e2e_delay_ms", "0") or "0"),
                         tx_bytes=int(row.get("tx_bytes", "0") or "0"),
                         rx_bytes=int(row.get("rx_bytes", "0") or "0"),
                         file_bytes=int(row.get("file_bytes", "0") or "0"),
@@ -398,6 +414,7 @@ def _load_flec_runrows_from_jsonl(flec_jsonl: Path) -> List[RunRow]:
                     md5_ok=int(ok),
                     success=int(ok),
                     dur_ms=int(dur_ms),
+                    e2e_delay_ms=float(dur_ms),
                     tx_bytes=int(tx_total),
                     rx_bytes=0,
                     file_bytes=int(file_bytes),
@@ -506,6 +523,7 @@ def _run_one(
     kv = _parse_kv_from_run_line(run_line)
 
     dur_ms = _to_int(kv, "dur_ms", 0)
+    e2e_delay_ms = _to_float(kv, "e2e_delay_ms", 0.0)
     timed_out = _to_int(kv, "timed_out", 0)
     md5_ok = _to_int(kv, "md5_ok", 0)
     tx_bytes = _to_int(kv, "tx_bytes", 0)
@@ -519,6 +537,7 @@ def _run_one(
 
     return {
         "dur_ms": int(dur_ms),
+        "e2e_delay_ms": float(e2e_delay_ms),
         "timed_out": int(timed_out),
         "md5_ok": int(md5_ok),
         "success": int(success),
@@ -571,8 +590,8 @@ def main() -> int:
         help="Comma list of DDL thresholds (ms) used only for completion-ratio calculation / plotting.",
     )
     ap.add_argument("--symbol-bytes", type=int, default=1200)
-    ap.add_argument("--fixed1", type=str, default="20,2,2", help="Fixed FEC #1 as k,r0,rstep (default: 20,2,2)")
-    ap.add_argument("--fixed2", type=str, default="20,6,4", help="Fixed FEC #2 as k,r0,rstep (default: 20,6,4)")
+    ap.add_argument("--fixed1", type=str, default="30,0,4", help="Fixed FEC #1 as k,r0,rstep (default: 30,0,4)")
+    ap.add_argument("--fixed2", type=str, default="30,10,10", help="Fixed FEC #2 as k,r0,rstep (default: 30,10,10)")
 
     ap.add_argument("--out-dir", type=str, default="")
 
@@ -723,6 +742,7 @@ def main() -> int:
                     md5_ok=int(m["md5_ok"]),
                     success=int(m["success"]),
                     dur_ms=int(m["dur_ms"]),
+                    e2e_delay_ms=float(m.get("e2e_delay_ms", 0.0) or 0.0),
                     tx_bytes=int(m["tx_bytes"]),
                     rx_bytes=int(m["rx_bytes"]),
                     file_bytes=int(m["file_bytes"]),
@@ -750,6 +770,7 @@ def main() -> int:
                     md5_ok=int(m_q["md5_ok"]),
                     success=int(m_q["success"]),
                     dur_ms=int(m_q["dur_ms"]),
+                    e2e_delay_ms=float(m_q.get("e2e_delay_ms", 0.0) or 0.0),
                     tx_bytes=int(m_q["tx_bytes"]),
                     rx_bytes=int(m_q["rx_bytes"]),
                     file_bytes=int(m_q["file_bytes"]),
@@ -784,6 +805,7 @@ def main() -> int:
                     md5_ok=int(m_f1["md5_ok"]),
                     success=int(m_f1["success"]),
                     dur_ms=int(m_f1["dur_ms"]),
+                    e2e_delay_ms=float(m_f1.get("e2e_delay_ms", 0.0) or 0.0),
                     tx_bytes=int(m_f1["tx_bytes"]),
                     rx_bytes=int(m_f1["rx_bytes"]),
                     file_bytes=int(m_f1["file_bytes"]),
@@ -818,6 +840,7 @@ def main() -> int:
                     md5_ok=int(m_f2["md5_ok"]),
                     success=int(m_f2["success"]),
                     dur_ms=int(m_f2["dur_ms"]),
+                    e2e_delay_ms=float(m_f2.get("e2e_delay_ms", 0.0) or 0.0),
                     tx_bytes=int(m_f2["tx_bytes"]),
                     rx_bytes=int(m_f2["rx_bytes"]),
                     file_bytes=int(m_f2["file_bytes"]),
@@ -828,10 +851,10 @@ def main() -> int:
             if rep % 10 == 0:
                 print(
                     f"  rep={rep:03d} "
-                    f"bandit ok={m['success']} dur={m['dur_ms']} ovh={m['overhead_ratio']:.3f} | "
-                    f"quic ok={m_q['success']} dur={m_q['dur_ms']} ovh={m_q['overhead_ratio']:.3f} | "
-                    f"fec1 ok={m_f1['success']} dur={m_f1['dur_ms']} ovh={m_f1['overhead_ratio']:.3f} | "
-                    f"fec2 ok={m_f2['success']} dur={m_f2['dur_ms']} ovh={m_f2['overhead_ratio']:.3f}"
+                    f"bandit ok={m['success']} dur={float(m.get('e2e_delay_ms', m['dur_ms']) or 0):.1f} ovh={m['overhead_ratio']:.3f} | "
+                    f"quic ok={m_q['success']} dur={float(m_q.get('e2e_delay_ms', m_q['dur_ms']) or 0):.1f} ovh={m_q['overhead_ratio']:.3f} | "
+                    f"fec1 ok={m_f1['success']} dur={float(m_f1.get('e2e_delay_ms', m_f1['dur_ms']) or 0):.1f} ovh={m_f1['overhead_ratio']:.3f} | "
+                    f"fec2 ok={m_f2['success']} dur={float(m_f2.get('e2e_delay_ms', m_f2['dur_ms']) or 0):.1f} ovh={m_f2['overhead_ratio']:.3f}"
                 )
 
     # Save raw per-run CSV
@@ -848,6 +871,7 @@ def main() -> int:
                 "md5_ok",
                 "success",
                 "dur_ms",
+                "e2e_delay_ms",
                 "tx_bytes",
                 "rx_bytes",
                 "file_bytes",
@@ -866,6 +890,7 @@ def main() -> int:
                     "md5_ok": r.md5_ok,
                     "success": r.success,
                     "dur_ms": r.dur_ms,
+                    "e2e_delay_ms": f"{float(_row_delay_ms(r)):.3f}",
                     "tx_bytes": r.tx_bytes,
                     "rx_bytes": r.rx_bytes,
                     "file_bytes": r.file_bytes,
@@ -893,7 +918,7 @@ def main() -> int:
             for ddl_ms in ddl_list:
                 complete_n = 0
                 for r in rs:
-                    if r.success == 1 and r.dur_ms > 0 and r.dur_ms <= int(ddl_ms):
+                    if r.success == 1 and _row_delay_ms(r) > 0 and _row_delay_ms(r) <= float(ddl_ms):
                         complete_n += 1
                 complete_ratio = float(complete_n) / float(len(rs))
 
@@ -947,7 +972,7 @@ def main() -> int:
         "ddl_ms": ddl_list,
         "methods": methods,
         "overhead_definition": "(tx_bytes - file_bytes)/file_bytes using host veth0 tx_bytes delta; includes headers",
-        "complete_definition": "success && dur_ms <= ddl_ms (ddl thresholds used only in post-processing)",
+        "complete_definition": "success && delay_ms <= ddl_ms, where delay_ms=e2e_delay_ms (preferred) else dur_ms",
         "plot_only": bool(plot_only),
     }
     if plot_only:

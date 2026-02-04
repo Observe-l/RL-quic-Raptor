@@ -538,7 +538,8 @@ class Row:
     timed_out: int
     md5_ok: int
     success: int
-    dur_ms: int
+    dur_ms: int  # server-side completion time
+    e2e_delay_ms: float  # true e2e delay from sender/receiver timestamps
     goodput_mbps: float
     overhead_ratio: float
     a_idx: int
@@ -548,25 +549,41 @@ class Row:
 _METHOD_ORDER = [
     "bandit",
     "quic_bbrv2",
-    "fec_k20_r0_2_rstep_2",
-    "fec_k20_r0_6_rstep_4",
+    "fec_k30_r0_0_rstep_4",
+    "fec_k30_r0_10_rstep_10",
 ]
 
 _METHOD_LABELS = {
     "bandit": "QUIC-FEC-Bandit",
     "quic_bbrv2": "QUIC",
-    "fec_k20_r0_2_rstep_2": "QUIC-FEC(K=20,R0=2,Rstep=2)",
-    "fec_k20_r0_6_rstep_4": "QUIC-FEC(K=20,R0=6,Rstep=4)",
+    "fec_k30_r0_0_rstep_4": "QUIC-FEC(K=30,R0=0,Rstep=4)",
+    "fec_k30_r0_10_rstep_10": "QUIC-FEC(K=30,R0=10,Rstep=10)",
     "flec": "FLEC",
 }
 
 _METHOD_COLORS = {
     "bandit": "#1f77b4",
     "quic_bbrv2": "#ff7f0e",
-    "fec_k20_r0_2_rstep_2": "#2ca02c",
-    "fec_k20_r0_6_rstep_4": "#d62728",
+    "fec_k30_r0_0_rstep_4": "#2ca02c",
+    "fec_k30_r0_10_rstep_10": "#d62728",
     "flec": "#9467bd",
 }
+
+
+def _row_duration_ms(r: Row, field: str) -> float:
+    field = str(field or "e2e_delay_ms").strip()
+    if field == "dur_ms":
+        return float(r.dur_ms)
+    if field == "dur_ms_client":
+        try:
+            return float(r.extra.get("dur_ms_client", 0) or 0)
+        except Exception:
+            return 0.0
+    # default: e2e_delay_ms with fallback to dur_ms
+    v = float(r.e2e_delay_ms or 0.0)
+    if np.isfinite(v) and v > 0.0:
+        return v
+    return float(r.dur_ms)
 
 
 def _load_rows_from_results_jsonl(results_jsonl: Path) -> List[Row]:
@@ -583,6 +600,10 @@ def _load_rows_from_results_jsonl(results_jsonl: Path) -> List[Row]:
             if not isinstance(d, dict):
                 continue
             try:
+                extra = d.get("extra", {}) if isinstance(d.get("extra", {}), dict) else {}
+                e2e_delay_ms = d.get("e2e_delay_ms", None)
+                if e2e_delay_ms is None:
+                    e2e_delay_ms = extra.get("e2e_delay_ms", 0.0)
                 out.append(
                     Row(
                         task=str(d.get("task", "")),
@@ -595,10 +616,11 @@ def _load_rows_from_results_jsonl(results_jsonl: Path) -> List[Row]:
                         md5_ok=int(d.get("md5_ok", 0) or 0),
                         success=int(d.get("success", 0) or 0),
                         dur_ms=int(d.get("dur_ms", 0) or 0),
+                        e2e_delay_ms=float(e2e_delay_ms or 0.0),
                         goodput_mbps=float(d.get("goodput_mbps", 0.0) or 0.0),
                         overhead_ratio=float(d.get("overhead_ratio", 0.0) or 0.0),
                         a_idx=int(d.get("a_idx", -1) or -1),
-                        extra=d.get("extra", {}) if isinstance(d.get("extra", {}), dict) else {},
+                        extra=extra,
                     )
                 )
             except Exception:
@@ -875,6 +897,7 @@ def _run_one(
 
     dur_ms = _to_int(kv, "dur_ms", 0)
     dur_ms_client = _to_int(kv, "dur_ms_client", 0)
+    e2e_delay_ms = _to_float(kv, "e2e_delay_ms", 0.0)
     timed_out = _to_int(kv, "timed_out", 0)
     md5_ok = _to_int(kv, "md5_ok", 0)
     goodput = _to_float(kv, "s_mbps", 0.0)
@@ -893,6 +916,7 @@ def _run_one(
     return {
         "dur_ms": int(dur_ms),
         "dur_ms_client": int(dur_ms_client),
+        "e2e_delay_ms": float(e2e_delay_ms),
         "timed_out": int(timed_out),
         "md5_ok": int(md5_ok),
         "client_ok": int(client_ok),
@@ -966,11 +990,12 @@ def main() -> int:
     ap.add_argument(
         "--duration-field",
         type=str,
-        default="dur_ms",
-        choices=["dur_ms", "dur_ms_client"],
+        default="e2e_delay_ms",
+        choices=["e2e_delay_ms", "dur_ms", "dur_ms_client"],
         help=(
-            "Which duration to record as dur_ms in results/plots. "
-            "dur_ms=server-side e2e completion when available (recommended for fairness); "
+            "Which duration to use for delay plots/summary/prints (results always store both dur_ms and e2e_delay_ms). "
+            "e2e_delay_ms=true end-to-end delay from sender/receiver timestamps (recommended for delay plots); "
+            "dur_ms=server-side e2e completion when available; "
             "dur_ms_client=client wall-clock total (includes ARQ drain / ack wait)."
         ),
     )
@@ -1065,6 +1090,8 @@ def main() -> int:
 
     args = ap.parse_args()
 
+    duration_field = str(getattr(args, "duration_field", "e2e_delay_ms") or "e2e_delay_ms").strip()
+
     # Plot-only mode: read existing results.jsonl and optionally add flec.
     if str(getattr(args, "results_jsonl", "")).strip():
         results_jsonl = Path(str(args.results_jsonl)).expanduser()
@@ -1084,7 +1111,12 @@ def main() -> int:
         delay_series: List[Tuple[str, Sequence[float], float]] = []
         for m in _METHOD_ORDER:
             rs = _filter_rows("delay_128kb", m)
-            d_ok = [float(r.dur_ms) for r in rs if r.success == 1 and r.dur_ms > 0]
+            d_ok = [
+                float(v)
+                for r in rs
+                for v in [_row_duration_ms(r, duration_field)]
+                if r.success == 1 and np.isfinite(v) and v > 0.0
+            ]
             ok_rate = (sum([1 for r in rs if r.success == 1]) / float(len(rs))) if rs else 0.0
             delay_series.append((m, d_ok, ok_rate))
 
@@ -1188,7 +1220,7 @@ def main() -> int:
     if int(args.verify_only) != 0:
         return 0
 
-    duration_field = str(getattr(args, "duration_field", "dur_ms") or "dur_ms").strip()
+    duration_field = str(getattr(args, "duration_field", "e2e_delay_ms") or "e2e_delay_ms").strip()
     use_fast = bool(int(getattr(args, "fast", 1) or 0) != 0)
 
     net_env = _netns_env_for_tag(str(getattr(args, "run_tag", "") or ""))
@@ -1326,7 +1358,10 @@ def main() -> int:
                 )
                 rl_obs = _extract_last_rl_observation(stderr)
                 failed = bool(int(m["timed_out"]) or int(m["md5_ok"]) != 1)
-                dur_record = int(m.get(duration_field, m.get("dur_ms", 0)) or 0)
+                dur_record = float(m.get(duration_field, 0.0) or 0.0)
+                if duration_field != "e2e_delay_ms":
+                    # dur_ms / dur_ms_client are integer-ish; keep stable output formatting.
+                    dur_record = float(int(dur_record))
                 overhead_ratio = float(m.get("overhead_ratio", 0.0) or 0.0)
                 fec_overhead_ratio = _overhead_ratio_from_rl_observation(rl_obs)
                 obs_vec = _aligned_obs_vec_from_rl_observation(rl_obs=rl_obs, failed=failed)
@@ -1342,7 +1377,8 @@ def main() -> int:
                         timed_out=int(m["timed_out"]),
                         md5_ok=int(m["md5_ok"]),
                         success=1 if (int(m["timed_out"]) == 0 and int(m["md5_ok"]) == 1) else 0,
-                        dur_ms=int(dur_record),
+                        dur_ms=int(m.get("dur_ms", 0) or 0),
+                        e2e_delay_ms=float(m.get("e2e_delay_ms", 0.0) or 0.0),
                         goodput_mbps=float(m["goodput_mbps"]),
                         overhead_ratio=float(overhead_ratio),
                         a_idx=int(warmup_idx),
@@ -1354,6 +1390,7 @@ def main() -> int:
                             "fec_overhead_ratio": float(fec_overhead_ratio),
                             "dur_ms_server": int(m.get("dur_ms", 0) or 0),
                             "dur_ms_client": int(m.get("dur_ms_client", 0) or 0),
+                            "e2e_delay_ms": float(m.get("e2e_delay_ms", 0.0) or 0.0),
                             "client_ok": int(m.get("client_ok", 1) or 1),
                             "client_rc": int(m.get("client_rc", 0) or 0),
                         },
@@ -1408,7 +1445,9 @@ def main() -> int:
                 )
                 rl_obs = _extract_last_rl_observation(stderr)
                 failed = bool(int(m["timed_out"]) or int(m["md5_ok"]) != 1)
-                dur_record = int(m.get(duration_field, m.get("dur_ms", 0)) or 0)
+                dur_record = float(m.get(duration_field, 0.0) or 0.0)
+                if duration_field != "e2e_delay_ms":
+                    dur_record = float(int(dur_record))
                 overhead_ratio = float(m.get("overhead_ratio", 0.0) or 0.0)
                 fec_overhead_ratio = _overhead_ratio_from_rl_observation(rl_obs)
                 obs_vec = _aligned_obs_vec_from_rl_observation(rl_obs=rl_obs, failed=failed)
@@ -1425,7 +1464,8 @@ def main() -> int:
                         timed_out=int(m["timed_out"]),
                         md5_ok=int(m["md5_ok"]),
                         success=1 if (int(m["timed_out"]) == 0 and int(m["md5_ok"]) == 1) else 0,
-                        dur_ms=int(dur_record),
+                        dur_ms=int(m.get("dur_ms", 0) or 0),
+                        e2e_delay_ms=float(m.get("e2e_delay_ms", 0.0) or 0.0),
                         goodput_mbps=float(m["goodput_mbps"]),
                         overhead_ratio=float(overhead_ratio),
                         a_idx=int(a_idx),
@@ -1436,6 +1476,7 @@ def main() -> int:
                             "fec_overhead_ratio": float(fec_overhead_ratio),
                             "dur_ms_server": int(m.get("dur_ms", 0) or 0),
                             "dur_ms_client": int(m.get("dur_ms_client", 0) or 0),
+                            "e2e_delay_ms": float(m.get("e2e_delay_ms", 0.0) or 0.0),
                             "client_ok": int(m.get("client_ok", 1) or 1),
                             "client_rc": int(m.get("client_rc", 0) or 0),
                         },
@@ -1455,7 +1496,9 @@ def main() -> int:
                     net_env=run_env,
                 )
                 overhead2 = float(m2.get("overhead_ratio", 0.0) or 0.0)
-                dur2_record = int(m2.get(duration_field, m2.get("dur_ms", 0)) or 0)
+                dur2_record = float(m2.get(duration_field, 0.0) or 0.0)
+                if duration_field != "e2e_delay_ms":
+                    dur2_record = float(int(dur2_record))
                 rows.append(
                     Row(
                         task=task,
@@ -1467,7 +1510,8 @@ def main() -> int:
                         timed_out=int(m2["timed_out"]),
                         md5_ok=int(m2["md5_ok"]),
                         success=1 if (int(m2["timed_out"]) == 0 and int(m2["md5_ok"]) == 1) else 0,
-                        dur_ms=int(dur2_record),
+                        dur_ms=int(m2.get("dur_ms", 0) or 0),
+                        e2e_delay_ms=float(m2.get("e2e_delay_ms", 0.0) or 0.0),
                         goodput_mbps=float(m2["goodput_mbps"]),
                         overhead_ratio=float(overhead2),
                         a_idx=-1,
@@ -1475,6 +1519,7 @@ def main() -> int:
                             "rtt_ms": int(rtt_ms_group),
                             "dur_ms_server": int(m2.get("dur_ms", 0) or 0),
                             "dur_ms_client": int(m2.get("dur_ms_client", 0) or 0),
+                            "e2e_delay_ms": float(m2.get("e2e_delay_ms", 0.0) or 0.0),
                             "client_ok": int(m2.get("client_ok", 1) or 1),
                             "client_rc": int(m2.get("client_rc", 0) or 0),
                         },
@@ -1482,11 +1527,11 @@ def main() -> int:
                 )
 
                 # Fixed FEC #1
-                env_f1 = _method_env_fixed_fec(k=20, r0=2, rstep=2, symbol_bytes=int(args.symbol_bytes))
+                env_f1 = _method_env_fixed_fec(k=30, r0=0, rstep=4, symbol_bytes=int(args.symbol_bytes))
                 if use_fast:
                     env_f1.update({"SKIP_BUILD": "1", "SKIP_NETNS_RESET": "1", "SKIP_SYSCTL": "1"})
                 m3, stderr3 = _run_one(
-                    method="fec_k20_r0_2_rstep_2",
+                    method="fec_k30_r0_0_rstep_4",
                     task=task,
                     loss_mode=loss_mode,
                     bitrate_mbps=int(args.bitrate_mbps),
@@ -1500,11 +1545,13 @@ def main() -> int:
                 rl3 = _extract_last_rl_observation(stderr3)
                 overhead3 = float(m3.get("overhead_ratio", 0.0) or 0.0)
                 fec_overhead3 = _overhead_ratio_from_rl_observation(rl3)
-                dur3_record = int(m3.get(duration_field, m3.get("dur_ms", 0)) or 0)
+                dur3_record = float(m3.get(duration_field, 0.0) or 0.0)
+                if duration_field != "e2e_delay_ms":
+                    dur3_record = float(int(dur3_record))
                 rows.append(
                     Row(
                         task=task,
-                        method="fec_k20_r0_2_rstep_2",
+                        method="fec_k30_r0_0_rstep_4",
                         sender_id=int(scenario_id),
                         loss_mode=str(loss_mode),
                         rep=int(rep),
@@ -1512,16 +1559,18 @@ def main() -> int:
                         timed_out=int(m3["timed_out"]),
                         md5_ok=int(m3["md5_ok"]),
                         success=1 if (int(m3["timed_out"]) == 0 and int(m3["md5_ok"]) == 1) else 0,
-                        dur_ms=int(dur3_record),
+                        dur_ms=int(m3.get("dur_ms", 0) or 0),
+                        e2e_delay_ms=float(m3.get("e2e_delay_ms", 0.0) or 0.0),
                         goodput_mbps=float(m3["goodput_mbps"]),
                         overhead_ratio=float(overhead3),
                         a_idx=-1,
                         extra={
-                            "fec": {"K": 20, "R0": 2, "RSTEP": 2},
+                            "fec": {"K": 30, "R0": 0, "RSTEP": 4},
                             "fec_overhead_ratio": float(fec_overhead3),
                             "rtt_ms": int(rtt_ms_group),
                             "dur_ms_server": int(m3.get("dur_ms", 0) or 0),
                             "dur_ms_client": int(m3.get("dur_ms_client", 0) or 0),
+                            "e2e_delay_ms": float(m3.get("e2e_delay_ms", 0.0) or 0.0),
                             "client_ok": int(m3.get("client_ok", 1) or 1),
                             "client_rc": int(m3.get("client_rc", 0) or 0),
                         },
@@ -1529,11 +1578,11 @@ def main() -> int:
                 )
 
                 # Fixed FEC #2
-                env_f2 = _method_env_fixed_fec(k=20, r0=6, rstep=4, symbol_bytes=int(args.symbol_bytes))
+                env_f2 = _method_env_fixed_fec(k=30, r0=10, rstep=10, symbol_bytes=int(args.symbol_bytes))
                 if use_fast:
                     env_f2.update({"SKIP_BUILD": "1", "SKIP_NETNS_RESET": "1", "SKIP_SYSCTL": "1"})
                 m4, stderr4 = _run_one(
-                    method="fec_k20_r0_6_rstep_4",
+                    method="fec_k30_r0_10_rstep_10",
                     task=task,
                     loss_mode=loss_mode,
                     bitrate_mbps=int(args.bitrate_mbps),
@@ -1547,11 +1596,13 @@ def main() -> int:
                 rl4 = _extract_last_rl_observation(stderr4)
                 overhead4 = float(m4.get("overhead_ratio", 0.0) or 0.0)
                 fec_overhead4 = _overhead_ratio_from_rl_observation(rl4)
-                dur4_record = int(m4.get(duration_field, m4.get("dur_ms", 0)) or 0)
+                dur4_record = float(m4.get(duration_field, 0.0) or 0.0)
+                if duration_field != "e2e_delay_ms":
+                    dur4_record = float(int(dur4_record))
                 rows.append(
                     Row(
                         task=task,
-                        method="fec_k20_r0_6_rstep_4",
+                        method="fec_k30_r0_10_rstep_10",
                         sender_id=int(scenario_id),
                         loss_mode=str(loss_mode),
                         rep=int(rep),
@@ -1559,16 +1610,18 @@ def main() -> int:
                         timed_out=int(m4["timed_out"]),
                         md5_ok=int(m4["md5_ok"]),
                         success=1 if (int(m4["timed_out"]) == 0 and int(m4["md5_ok"]) == 1) else 0,
-                        dur_ms=int(dur4_record),
+                        dur_ms=int(m4.get("dur_ms", 0) or 0),
+                        e2e_delay_ms=float(m4.get("e2e_delay_ms", 0.0) or 0.0),
                         goodput_mbps=float(m4["goodput_mbps"]),
                         overhead_ratio=float(overhead4),
                         a_idx=-1,
                         extra={
-                            "fec": {"K": 20, "R0": 6, "RSTEP": 4},
+                            "fec": {"K": 30, "R0": 10, "RSTEP": 10},
                             "fec_overhead_ratio": float(fec_overhead4),
                             "rtt_ms": int(rtt_ms_group),
                             "dur_ms_server": int(m4.get("dur_ms", 0) or 0),
                             "dur_ms_client": int(m4.get("dur_ms_client", 0) or 0),
+                            "e2e_delay_ms": float(m4.get("e2e_delay_ms", 0.0) or 0.0),
                             "client_ok": int(m4.get("client_ok", 1) or 1),
                             "client_rc": int(m4.get("client_rc", 0) or 0),
                         },
@@ -1576,9 +1629,9 @@ def main() -> int:
                 )
 
                 print(
-                    f"rep={rep:02d} rtt_ms={int(rtt_ms_group)} bandit(a={a_idx}) dur_ms={dur_record} "
+                    f"rep={rep:02d} rtt_ms={int(rtt_ms_group)} bandit(a={a_idx}) dur_ms={dur_record:.1f} "
                     f"ok={1-int(m['timed_out'])==1 and int(m['md5_ok'])==1} | "
-                    f"quic_bbrv2 dur_ms={dur2_record} | fec1 dur_ms={dur3_record} | fec2 dur_ms={dur4_record}"
+                    f"quic_bbrv2 dur_ms={dur2_record:.1f} | fec1 dur_ms={dur3_record:.1f} | fec2 dur_ms={dur4_record:.1f}"
                 )
 
     # Save raw results
@@ -1598,6 +1651,7 @@ def main() -> int:
                         "md5_ok": r.md5_ok,
                         "success": r.success,
                         "dur_ms": r.dur_ms,
+                        "e2e_delay_ms": r.e2e_delay_ms,
                         "goodput_mbps": r.goodput_mbps,
                         "overhead_ratio": r.overhead_ratio,
                         "a_idx": r.a_idx,
@@ -1623,6 +1677,7 @@ def main() -> int:
                 "md5_ok",
                 "success",
                 "dur_ms",
+                "e2e_delay_ms",
                 "goodput_mbps",
                 "overhead_ratio",
                 "a_idx",
@@ -1642,6 +1697,7 @@ def main() -> int:
                     "md5_ok": r.md5_ok,
                     "success": r.success,
                     "dur_ms": r.dur_ms,
+                    "e2e_delay_ms": f"{float(r.e2e_delay_ms):.3f}",
                     "goodput_mbps": f"{r.goodput_mbps:.6f}",
                     "overhead_ratio": f"{float(r.overhead_ratio):.6f}",
                     "a_idx": r.a_idx,
@@ -1667,6 +1723,7 @@ def main() -> int:
         "scenarios": [{"sender_id": int(sid), "loss_mode": str(lm)} for sid, lm in scenarios],
         "timeout_transfer_s": int(args.timeout_transfer_s),
         "timeout_s": int(args.timeout_s),
+        "duration_field": str(duration_field),
         "reps": int(args.reps),
         "bandit_policy": str(args.bandit_policy),
         "seed": int(args.seed),
@@ -1693,7 +1750,12 @@ def main() -> int:
         delay_series: List[Tuple[str, Sequence[float], float]] = []
         for m in _METHOD_ORDER:
             rs = _filter_rows("delay_128kb", m)
-            d_ok = [float(r.dur_ms) for r in rs if r.success == 1 and r.dur_ms > 0]
+            d_ok = [
+                float(v)
+                for r in rs
+                for v in [_row_duration_ms(r, duration_field)]
+                if r.success == 1 and np.isfinite(v) and v > 0.0
+            ]
             ok_rate = (sum([1 for r in rs if r.success == 1]) / float(len(rs))) if rs else 0.0
             delay_series.append((m, d_ok, ok_rate))
 
@@ -1753,7 +1815,12 @@ def main() -> int:
         if "delay_128kb" in ran_tasks:
             rs_d = _filter_rows("delay_128kb", m)
             ok_rate_d = (sum([1 for r in rs_d if r.success == 1]) / float(len(rs_d))) if rs_d else 0.0
-            d_ok = [float(r.dur_ms) for r in rs_d if r.success == 1 and r.dur_ms > 0]
+            d_ok = [
+                float(v)
+                for r in rs_d
+                for v in [_row_duration_ms(r, duration_field)]
+                if r.success == 1 and np.isfinite(v) and v > 0.0
+            ]
             summary["delay_128kb"][m] = {"ok_rate": float(ok_rate_d), **_stats(d_ok)}
 
         if "goodput_3mb" in ran_tasks:

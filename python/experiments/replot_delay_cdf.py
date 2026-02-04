@@ -17,22 +17,22 @@ import matplotlib.pyplot as plt  # noqa: E402
 _METHOD_ORDER = [
     "bandit",
     "quic_bbrv2",
-    "fec_k20_r0_2_rstep_2",
-    "fec_k20_r0_6_rstep_4",
+    "fec_k30_r0_0_rstep_4",
+    "fec_k30_r0_10_rstep_10",
 ]
 
 _METHOD_LABELS = {
     "bandit": "QUIC-FEC-Bandit",
     "quic_bbrv2": "QUIC",
-    "fec_k20_r0_2_rstep_2": "QUIC-FEC(K=20,R0=2,Rstep=2)",
-    "fec_k20_r0_6_rstep_4": "QUIC-FEC(K=20,R0=6,Rstep=4)",
+    "fec_k30_r0_0_rstep_4": "QUIC-FEC(K=30,R0=0,Rstep=4)",
+    "fec_k30_r0_10_rstep_10": "QUIC-FEC(K=30,R0=10,Rstep=10)",
 }
 
 _METHOD_COLORS = {
     "bandit": "#1f77b4",
     "quic_bbrv2": "#ff7f0e",
-    "fec_k20_r0_2_rstep_2": "#2ca02c",
-    "fec_k20_r0_6_rstep_4": "#d62728",
+    "fec_k30_r0_0_rstep_4": "#2ca02c",
+    "fec_k30_r0_10_rstep_10": "#d62728",
 }
 
 
@@ -81,7 +81,7 @@ def _load_delay_samples(*, csv_path: Path) -> Dict[str, List[float]]:
                     continue
                 if int(float(row.get("success") or 0)) != 1:
                     continue
-                dur_ms = float(row.get("dur_ms") or 0)
+                dur_ms = float(row.get("e2e_delay_ms") or row.get("dur_ms") or 0)
             except Exception:
                 continue
             if dur_ms <= 0:

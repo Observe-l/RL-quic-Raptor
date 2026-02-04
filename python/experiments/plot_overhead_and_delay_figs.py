@@ -19,24 +19,24 @@ import matplotlib.pyplot as plt  # noqa: E402
 _METHOD_ORDER = [
     "bandit",
     "quic_bbrv2",
-    "fec_k20_r0_2_rstep_2",
-    "fec_k20_r0_6_rstep_4",
+    "fec_k30_r0_0_rstep_4",
+    "fec_k30_r0_10_rstep_10",
     "flec",
 ]
 
 _METHOD_LABELS = {
     "bandit": "QUIC-FEC-Bandit",
     "quic_bbrv2": "QUIC",
-    "fec_k20_r0_2_rstep_2": "QUIC-FEC(K=20,R0=2,Rstep=2)",
-    "fec_k20_r0_6_rstep_4": "QUIC-FEC(K=20,R0=6,Rstep=4)",
+    "fec_k30_r0_0_rstep_4": "QUIC-FEC(K=30,R0=0,Rstep=4)",
+    "fec_k30_r0_10_rstep_10": "QUIC-FEC(K=30,R0=10,Rstep=10)",
     "flec": "FLEC",
 }
 
 _METHOD_COLORS = {
     "bandit": "#1f77b4",
     "quic_bbrv2": "#ff7f0e",
-    "fec_k20_r0_2_rstep_2": "#2ca02c",
-    "fec_k20_r0_6_rstep_4": "#d62728",
+    "fec_k30_r0_0_rstep_4": "#2ca02c",
+    "fec_k30_r0_10_rstep_10": "#d62728",
     "flec": "#9467bd",
 }
 
@@ -44,8 +44,8 @@ _METHOD_MARKERS = {
     "bandit": "o",
     "quic_bbrv2": "^",
     "flec": "x",
-    "fec_k20_r0_2_rstep_2": "s",
-    "fec_k20_r0_6_rstep_4": "D",
+    "fec_k30_r0_0_rstep_4": "s",
+    "fec_k30_r0_10_rstep_10": "D",
 }
 
 
@@ -127,6 +127,7 @@ class Trial:
     is_warmup: int
     success: int
     dur_ms: int
+    e2e_delay_ms: float
     goodput_mbps: float
     overhead_ratio: float
 
@@ -181,6 +182,7 @@ def _load_flec_trials(*, flec_jsonl: Path) -> List[Trial]:
                     is_warmup=0,
                     success=int(ok),
                     dur_ms=int(dur_ms),
+                    e2e_delay_ms=float(dur_ms),
                     goodput_mbps=float(goodput_mbps),
                     overhead_ratio=float(overhead_ratio),
                 )
@@ -218,11 +220,19 @@ def _load_trials(results_csv: Path) -> List[Trial]:
                     is_warmup=_to_int(row, "is_warmup", 0),
                     success=_to_int(row, "success", 0),
                     dur_ms=_to_int(row, "dur_ms", 0),
+                    e2e_delay_ms=_to_float(row, "e2e_delay_ms", 0.0),
                     goodput_mbps=_to_float(row, "goodput_mbps", 0.0),
                     overhead_ratio=_to_float(row, "overhead_ratio", 0.0),
                 )
             )
     return out
+
+
+def _trial_delay_ms(t: Trial) -> float:
+    v = float(getattr(t, "e2e_delay_ms", 0.0) or 0.0)
+    if math.isfinite(v) and v > 0.0:
+        return v
+    return float(t.dur_ms)
 
 
 def _method_list_in_data(trials: Iterable[Trial]) -> List[str]:
@@ -254,7 +264,7 @@ def _filter_trials(
             continue
         if not include_failures and int(t.success) != 1:
             continue
-        if t.dur_ms <= 0:
+        if _trial_delay_ms(t) <= 0:
             continue
         if not math.isfinite(float(t.overhead_ratio)):
             continue
@@ -289,7 +299,7 @@ def _compute_completion_ratio_points(
 
         complete_n = 0
         for r in rs:
-            if int(r.success) == 1 and int(r.dur_ms) > 0 and int(r.dur_ms) <= int(ddl_ms):
+            if int(r.success) == 1 and _trial_delay_ms(r) > 0 and _trial_delay_ms(r) <= float(ddl_ms):
                 complete_n += 1
         complete_ratio = float(complete_n) / float(len(rs)) if rs else 0.0
 
@@ -311,7 +321,7 @@ def _aggregate_sender_method_mean(points: List[Trial], *, y: str) -> List[Tuple[
         if y == "goodput":
             ys = [float(r.goodput_mbps) for r in rows if math.isfinite(float(r.goodput_mbps)) and float(r.goodput_mbps) > 0]
         else:
-            ys = [float(r.dur_ms) for r in rows if r.dur_ms > 0]
+            ys = [float(_trial_delay_ms(r)) for r in rows if _trial_delay_ms(r) > 0]
         if not ovs or not ys:
             continue
         out.append((str(method), float(np.mean(ovs)), float(np.mean(ys))))
@@ -555,7 +565,7 @@ def main() -> int:
         include_warmup=include_warmup,
     )
     if str(args.aggregate) == "none":
-        pts_delay = [(t.method, float(t.overhead_ratio), float(t.dur_ms)) for t in delay_trials]
+        pts_delay = [(t.method, float(t.overhead_ratio), float(_trial_delay_ms(t))) for t in delay_trials]
     else:
         pts_delay = _aggregate_sender_method_mean(delay_trials, y="dur")
 
@@ -576,7 +586,7 @@ def main() -> int:
             out_path=out_dir / f"fig_completion_ratio_vs_overhead_ddl{int(ddl_ms)}.pdf",
             title="",
             xlabel="Overhead ",
-            ylabel=f"Completion ratio (dur_ms <= {int(ddl_ms)} ms)",
+            ylabel=f"Completion ratio (delay_ms <= {int(ddl_ms)} ms)",
             pts=pts_cr,
             xlim=None,
             ylim=(-0.05, 1.05),
@@ -619,7 +629,7 @@ def main() -> int:
     # Delay CDF (delay task)
     delay_series: List[Tuple[str, Sequence[float]]] = []
     for m in methods:
-        vals = [float(t.dur_ms) for t in delay_trials if t.method == m and int(t.success) == 1 and t.dur_ms > 0]
+        vals = [float(_trial_delay_ms(t)) for t in delay_trials if t.method == m and int(t.success) == 1 and _trial_delay_ms(t) > 0]
         delay_series.append((m, vals))
 
     _plot_delay_cdf(
