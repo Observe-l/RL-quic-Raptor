@@ -27,10 +27,10 @@ FILE_BYTES_LIST=${FILE_BYTES_LIST:-"131072 1048576"}
 FILE=${FILE:-}
 
 # QUIC-FEC knobs (override via env if desired)
-K=${K:-30}
-R0=${R0:-4}
+K=${K:-40}
+R0=${R0:-11}
 W=${W:-8}
-RSTEP=${RSTEP:-4}
+RSTEP=${RSTEP:-11}
 ACK_EVERY=${ACK_EVERY:-8}
 MAX_ATTEMPTS=${MAX_ATTEMPTS:-0}
 USE_ARQ=${USE_ARQ:-1}

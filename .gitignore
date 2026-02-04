@@ -27,3 +27,4 @@ __pycache__/
 wandb/
 .venv/
 tmp*/
+bin/
