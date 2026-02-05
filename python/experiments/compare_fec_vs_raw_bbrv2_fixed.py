@@ -285,9 +285,9 @@ def main() -> int:
 	)
 
 	# QUIC-FEC knobs (passed to scripts/quicfec_run_once.sh)
-	ap.add_argument("--k", type=int, default=40)
-	ap.add_argument("--r0", type=int, default=6)
-	ap.add_argument("--rstep", type=int, default=4)
+	ap.add_argument("--k", type=int, default=20)
+	ap.add_argument("--r0", type=int, default=0)
+	ap.add_argument("--rstep", type=int, default=0)
 	ap.add_argument("--symbol-bytes", type=int, default=1200)
 
 	ap.add_argument("--run-tag", type=str, default="")

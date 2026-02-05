@@ -159,7 +159,6 @@ def _action_to_env_vars(*, action_set: ActionSet, a_idx: int) -> Dict[str, str]:
         "W": os.environ.get("W", "8"),
         "RSTEP": str(int(RSTEP)),
         "DDL_MS": str(int(DDL_MS)),
-        "ALPHA": os.environ.get("ALPHA", "0.6"),
         "MAX_ATTEMPTS": os.environ.get("MAX_ATTEMPTS", "5"),
         "USE_ARQ": os.environ.get("USE_ARQ", "1"),
         # Always CC enabled in our comparisons.

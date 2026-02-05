@@ -21,7 +21,7 @@ set -euo pipefail
 #               #   iid:5           (5% i.i.d. loss)
 #               #   gemodel:p,r,h,k (Gilbert-Elliott model, percents)
 #   FILE=$ROOT/go/test_data/train_FD001.txt
-#   K=40, SYMBOL_BYTES=1200, R0=6, W=8, DDL_MS=150, RSTEP=4, ALPHA=0.6, ACK_EVERY=8, MAX_ATTEMPTS=8
+#   K=40, SYMBOL_BYTES=1200, R0=6, W=8, DDL_MS=150, RSTEP=4, ACK_EVERY=8, MAX_ATTEMPTS=8
 #   OBS_JSON=/tmp/quicfec_rl_${NS}.json
 #   POST_WAIT=0s (linger after client send; keep at 0s for fastest runs)
 #   SRV_TIMEOUT=10s (server max lifetime; lower keeps runs bounded)
@@ -54,13 +54,13 @@ K=${K:-30}
 SYMBOL_BYTES=${SYMBOL_BYTES:-1032}
 R0=${R0:-6}
 W=${W:-8}
-DDL_MS=${DDL_MS:-150}
+DDL_MS=${DDL_MS:-100}
 RSTEP=${RSTEP:-4}
 ALPHA=${ALPHA:-0.6}
 ACK_EVERY=${ACK_EVERY:-8}
 MAX_ATTEMPTS=${MAX_ATTEMPTS:-0}
 USE_ARQ=${USE_ARQ:-1}
-PACE_US=${PACE_US:-}
+PACE_US=${PACE_US:-0}
 TRANSPORT=${TRANSPORT:-dgram}
 if [[ -z "${POST_WAIT+x}" || -z "${POST_WAIT}" ]]; then
   # Default linger: 0s. QUIC-FEC now waits for an explicit server->client DONE ACK.
@@ -241,21 +241,6 @@ pace_arg=""
 # - If PACE_US is unset, auto-compute an inter-packet gap targeting BITRATE_MBPS.
 # - If PACE_US=0, disable app-level pacing and rely on QUIC + tc shaping.
 # - If PACE_US>0, use the provided microsecond gap.
-if [[ -z "${PACE_US}" ]]; then
-  # Auto pace: approximate dgram size (symbol + FEC header + QUIC/UDP/IP overhead)
-  # Use a conservative +64B overhead fudge.
-  local_sz=$(( SYMBOL_BYTES + 64 ))
-  # Inter-packet gap microseconds at the target rate: us = (bytes*8 / (Mbps*1e6)) * 1e6
-  # Simplifies to us = (bytes*8) / (Mbps)
-  if [[ ${BITRATE_MBPS} -gt 0 && ${local_sz} -gt 0 ]]; then
-    PACE_US=$(( (local_sz * 8 + BITRATE_MBPS - 1) / BITRATE_MBPS ))
-    # Clamp to a minimum to avoid tight spinning on very high rates.
-    # For high-rate experiments (e.g., 100 Mbps), 200us would cap throughput too low.
-    if [[ ${PACE_US} -lt 50 ]]; then PACE_US=50; fi
-  else
-    PACE_US=0
-  fi
-fi
 if [[ -n "${PACE_US}" && "${PACE_US}" -gt 0 ]]; then
   pace_arg="-pace ${PACE_US}us"
 fi
@@ -267,11 +252,11 @@ fi
 if command -v timeout >/dev/null 2>&1; then
   timeout --signal=KILL ${TIMEOUT_S}s \
     "$BIN_DIR/quicfec-client" -addr ${SRV_IP}:$PORT -file "$FILE" -N $((K+R0)) -K "$K" -L "$SYMBOL_BYTES" \
-      -post-wait "$POST_WAIT" -ack-every "$ACK_EVERY" -dgram-warn 1400 -transport "$TRANSPORT" $arq_flag -rx-ddl ${DDL_MS}ms -R0 "$R0" -W "$W" -Rstep "$RSTEP" -alpha "$ALPHA" -max-attempts "$MAX_ATTEMPTS" -loss 0 $pace_arg \
+      -post-wait "$POST_WAIT" -ack-every "$ACK_EVERY" -dgram-warn 1400 -transport "$TRANSPORT" $arq_flag -rx-ddl ${DDL_MS}ms -R0 "$R0" -W "$W" -Rstep "$RSTEP" -max-attempts "$MAX_ATTEMPTS" -loss 0 $pace_arg \
       >"$CLI_LOG" 2>&1 || RC=$?
 else
   "$BIN_DIR/quicfec-client" -addr ${SRV_IP}:$PORT -file "$FILE" -N $((K+R0)) -K "$K" -L "$SYMBOL_BYTES" \
-    -post-wait "$POST_WAIT" -ack-every "$ACK_EVERY" -dgram-warn 1400 -transport "$TRANSPORT" $arq_flag -rx-ddl ${DDL_MS}ms -R0 "$R0" -W "$W" -Rstep "$RSTEP" -alpha "$ALPHA" -max-attempts "$MAX_ATTEMPTS" -loss 0 $pace_arg \
+    -post-wait "$POST_WAIT" -ack-every "$ACK_EVERY" -dgram-warn 1400 -transport "$TRANSPORT" $arq_flag -rx-ddl ${DDL_MS}ms -R0 "$R0" -W "$W" -Rstep "$RSTEP" -max-attempts "$MAX_ATTEMPTS" -loss 0 $pace_arg \
     >"$CLI_LOG" 2>&1 || RC=$?
 fi
 RC=${RC:-0}

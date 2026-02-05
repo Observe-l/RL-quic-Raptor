@@ -15,6 +15,7 @@ func main() {
 		addr      = flag.String("addr", "127.0.0.1:4444", "server address")
 		alpn      = flag.String("alpn", "quic-fec", "ALPN protocol")
 		filePath  = flag.String("file", "go/test_data/train_FD001.txt", "file to send")
+		limit     = flag.Duration("timeout", 600*time.Second, "client timeout")
 		insecure  = flag.Bool("insecure", true, "skip TLS verification")
 		N         = flag.Int("N", 32, "block length N")
 		K         = flag.Int("K", 26, "source symbols K")
@@ -30,11 +31,25 @@ func main() {
 		rxDDL     = flag.Duration("rx-ddl", 0, "receiver decode deadline per block (sent to server via header; 0=unspecified)")
 		R0        = flag.Int("R0", -1, "initial extra repairs (>=0 exact; -1=auto: N-K)")
 		W         = flag.Int("W", 8, "ARQ window W (unfinished clusters)")
-		Rstep     = flag.Int("Rstep", 4, "ARQ minimum append per NACK")
-		maxAtt    = flag.Int("max-attempts", 5, "ARQ max attempts per cluster")
+		Rstep     = flag.Int("Rstep", 4, "ARQ extra repairs appended per NACK (0 allowed; <0 uses default)")
+		maxAtt    = flag.Int("max-attempts", 0, "ARQ max attempts per cluster (0=unlimited)")
+
+		devRetx   = flag.Bool("dev-retx", true, "enable QUIC retransmission reason logging (requires build tag quicfecdev)")
+		quicStats = flag.Bool("quic-stats", false, "enable QUIC-layer aggregate stats line")
 	)
 	flag.Parse()
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+
+	if *devRetx {
+		_ = os.Setenv("QUIC_FEC_DEV_RETX", "1")
+	}
+	if *quicStats {
+		_ = os.Setenv("QUIC_FEC_STATS", "1")
+	}
+	if os.Getenv("QUIC_FEC_CC_ALGO") == "" {
+		_ = os.Setenv("QUIC_FEC_CC_ALGO", "bbrv2")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), *limit)
 	defer cancel()
 	opts := fecquic.SendOptions{K: *K, N: *N, L: *L, InsecureTLS: *insecure, DropProb: *loss, PaceEach: *pace, BlockPause: *blkPause, RxDDL: *rxDDL, WarnDgramSize: *warn, PostWait: *postWait, AckEvery: *ackEvery, Transport: *transport, UseARQ: *arq, InitialRepairs: *R0, WindowW: *W, RStep: *Rstep, MaxAttempts: *maxAtt}
 	if err := fecquic.ClientSendFile(ctx, *addr, *alpn, *filePath, opts); err != nil {

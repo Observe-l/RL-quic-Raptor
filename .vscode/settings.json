@@ -1,3 +1,14 @@
 {
-  // Intentionally empty: avoid tag-specific config that hides files behind build tags.
+  // Include develop-only sources behind the quicfecdev build tag.
+  // Prevents gopls diagnostics like:
+  // "No packages found for open file ... excluded due to its build tags".
+  "go.toolsEnvVars": {
+    "GOFLAGS": "-tags=quicfecdev"
+  },
+  "gopls": {
+    "buildFlags": ["-tags=quicfecdev"],
+    "env": {
+      "GOFLAGS": "-tags=quicfecdev"
+    }
+  }
 }

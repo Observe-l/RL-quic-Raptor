@@ -241,7 +241,6 @@ class QuicFecRunner:
         # ARQ policy (RSTEP is controlled by the policy).
         env["W"] = os.environ.get("W", "8")
         env["RSTEP"] = str(int(getattr(action, "RSTEP", int(os.environ.get("RSTEP", "4")))))
-        env["ALPHA"] = os.environ.get("ALPHA", "0.6")
         env["MAX_ATTEMPTS"] = os.environ.get("MAX_ATTEMPTS", "5")
 
         # CC is always enabled with BBRv2.

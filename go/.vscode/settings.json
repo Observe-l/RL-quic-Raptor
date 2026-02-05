@@ -1,0 +1,11 @@
+{
+  "go.toolsEnvVars": {
+    "GOFLAGS": "-tags=quicfecdev"
+  },
+  "gopls": {
+    "buildFlags": ["-tags=quicfecdev"],
+    "env": {
+      "GOFLAGS": "-tags=quicfecdev"
+    }
+  }
+}

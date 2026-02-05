@@ -16,6 +16,10 @@ import (
 )
 
 func main() {
+	if _, ok := os.LookupEnv("QUIC_FEC_CC_ALGO"); !ok {
+		_ = os.Setenv("QUIC_FEC_CC_ALGO", "bbrv2")
+	}
+
 	var (
 		addr     = flag.String("addr", ":4445", "listen address")
 		alpn     = flag.String("alpn", "quic-raw", "ALPN protocol")

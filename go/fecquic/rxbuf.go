@@ -83,9 +83,12 @@ type rxManager struct {
 	totalBlocks int
 
 	// state
-	mu     sync.Mutex
-	inUse  atomic.Int64
-	blocks map[uint16]*rxBlock
+	mu    sync.Mutex
+	inUse atomic.Int64
+	// blockSpan is the base block size in bytes for file offsets: baseK*L.
+	// It is set when the first symbol arrives (when m.K becomes known).
+	blockSpan atomic.Int64
+	blocks    map[uint16]*rxBlock
 	// completed remembers blocks that have already been fully decoded and written,
 	// so late-arriving symbols for those blocks are ignored instead of recreating state.
 	completed map[uint16]struct{}
@@ -283,7 +286,11 @@ func (m *rxManager) start(rx RXOptions) {
 						m.met.OnDecodeComputeNs(decNs)
 					}
 					// schedule a single contiguous write for this block
-					off := int64(int(b.id) * b.K * b.L)
+					span := m.blockSpan.Load()
+					if span <= 0 {
+						span = int64(b.K * b.L)
+					}
+					off := int64(b.id) * span
 					m.writeQ <- writeTask{off: off, data: bytes}
 					m.noteDelivered(off, len(bytes))
 					m.decBlocks.Add(1)
@@ -550,6 +557,7 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 	if m.K == 0 && K > 0 {
 		m.K = K
 		m.L = L
+		m.blockSpan.Store(int64(K * L))
 		if K > 0 && L > 0 {
 			blk := uint64(K * L)
 			m.totalBlocks = int((m.fileSize + blk - 1) / blk)
@@ -593,6 +601,23 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 			syms:     make(map[int][]byte, N),
 		}
 		m.blocks[blockID] = b
+	} else {
+		// If this was a pre-seeded placeholder, update it with real block parameters
+		// on the first actual symbol. This matters when the last block uses a smaller K.
+		if b.srcSeenCount == 0 && len(b.syms) == 0 {
+			if K > 0 {
+				b.K = K
+			}
+			if N > 0 {
+				b.N = N
+			}
+			if L > 0 {
+				b.L = L
+			}
+			if dataSize > 0 {
+				b.dataSize = dataSize
+			}
+		}
 	}
 	// If this is the first time we observe any block (minSeen==-1), backfill placeholders for [0..blockID-1].
 	if m.minSeen == -1 {
@@ -780,7 +805,11 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 		} else {
 			sysBuf = b.srcBuf
 		}
-		sysOff = int64(int(b.id) * b.K * b.L)
+		span := m.blockSpan.Load()
+		if span <= 0 {
+			span = int64(b.K * b.L)
+		}
+		sysOff = int64(b.id) * span
 		sysRxUnique = b.srcSeenCount + len(b.syms)
 		sysUsedRep = max(0, sysRxUnique-b.K)
 		sysAttempt = b.attempt

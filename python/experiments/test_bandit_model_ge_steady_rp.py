@@ -228,7 +228,6 @@ def _action_to_env_vars(*, action_set: ActionSet, a_idx: int) -> Dict[str, str]:
         "W": os.environ.get("W", "8"),
         "RSTEP": str(int(RSTEP)),
         "DDL_MS": str(int(DDL_MS)),
-        "ALPHA": os.environ.get("ALPHA", "0.6"),
         "MAX_ATTEMPTS": os.environ.get("MAX_ATTEMPTS", "5"),
         "USE_ARQ": os.environ.get("USE_ARQ", "1"),
         "QUIC_FEC_CC_BYPASS": "0",
@@ -443,7 +442,7 @@ def main() -> int:
 
     out_actions = out_dir / "actions.csv"
     # Stable field order: rep, a_idx, score, then env vars.
-    fieldnames = ["rep", "a_idx", "score", "K", "R0", "RSTEP", "DDL_MS", "W", "ALPHA", "MAX_ATTEMPTS", "USE_ARQ", "SYMBOL_BYTES", "QUIC_FEC_CC_ALGO", "QUIC_FEC_CC_BYPASS", "PACE_US"]
+    fieldnames = ["rep", "a_idx", "score", "K", "R0", "RSTEP", "DDL_MS", "W", "MAX_ATTEMPTS", "USE_ARQ", "SYMBOL_BYTES", "QUIC_FEC_CC_ALGO", "QUIC_FEC_CC_BYPASS", "PACE_US"]
     with out_actions.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         w.writeheader()

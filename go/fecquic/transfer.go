@@ -49,12 +49,11 @@ type SendOptions struct {
 	AckEvery      int           // write 1B on a stream every N datagrams (ack-eliciting); <=0 uses default
 	Transport     string        // "dgram" (default) or "stream"
 	// ARQ options
-	UseARQ         bool    // enable ARQ control plane and on-demand repairs
-	InitialRepairs int     // R0: additional repairs to send initially (defaults to N-K if N provided)
-	WindowW        int     // max unfinished clusters in flight (0=unlimited)
-	RStep          int     // minimum repairs per NACK
-	Alpha          float64 // scaling for deficit in ΔR
-	MaxAttempts    int     // max ARQ attempts per cluster (0=no cap)
+	UseARQ         bool // enable ARQ control plane and on-demand repairs
+	InitialRepairs int  // R0: initial repair symbols (>=0 exact; -1=auto: max(0, N-K))
+	WindowW        int  // max unfinished clusters in flight (0=unlimited)
+	RStep          int  // minimum repairs per NACK
+	MaxAttempts    int  // max ARQ attempts per cluster (0=no cap)
 }
 
 // ClientSendFile connects and sends a file using QFEC header + RaptorQ symbols over datagrams.
@@ -132,9 +131,9 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 				NewCCDebugConnTracer(),
 			)
 			if !enableQuicStats {
-				return base
+				return devWrapConnTracer(base)
 			}
-			return logging.NewMultiplexedConnectionTracer(base, newQuicConnStatsTracer(quicStats))
+			return devWrapConnTracer(logging.NewMultiplexedConnectionTracer(base, newQuicConnStatsTracer(quicStats)))
 		},
 		EnableDatagrams: true,
 		// Prevent idle timeouts; keep small to avoid tail delays on shutdown.
@@ -296,7 +295,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 
 	// Send symbols per block
 	sendBlocksStart := time.Now()
-	buf := make([]byte, K*L)
+	readBuf := make([]byte, K*L)
 	blockID := 0
 	// If ARQ window enforcement times out once, disable it for the remainder to avoid per-block 5s stalls
 	var arqWindowDisabled bool
@@ -380,36 +379,24 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 							continue
 						}
 						toSend := int(n.RecommendExtra)
-						if toSend <= 0 {
+						if toSend < 0 {
 							toSend = 0
 						}
-						// ΔR policy: max(rec_extra, R_step, ceil(alpha * deficit))
+						// Policy: append exactly (rec_extra + R_step) repair symbols on every NACK.
 						deficit := 0
 						if bt.K-int(n.RxUnique) > 0 {
 							deficit = bt.K - int(n.RxUnique)
 						}
 						rstep := opts.RStep
-						if rstep <= 0 {
+						// Semantics: Rstep=0 means "no extra". Negative values fall back to default.
+						if rstep < 0 {
 							rstep = 4
 						}
-						alpha := opts.Alpha
-						if alpha <= 0 {
-							alpha = 0.6
-						}
-						cand := int(alpha*float64(deficit) + 0.9999)
-						if cand < rstep {
-							cand = rstep
-						}
-						if cand < toSend {
-							cand = toSend
-						}
+						cand := toSend + rstep
 						if cand <= 0 {
-							cand = 1
-						}
-						if cand == 0 {
-							// nothing to append
 							continue
 						}
+						devARQOnClientNack(n, deficit, cand, bt.K, bt.nextESI, bt.repairsOut)
 						// send cand fresh repairs
 						for i := 0; i < cand; i++ {
 							esi := bt.nextESI
@@ -441,6 +428,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 								sentBytes += int64(len(b))
 								totalSymbols++
 								totalRepairs++
+								devARQOnClientRepairSent(bid, esi)
 							} else {
 								sendErrs++
 							}
@@ -457,6 +445,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 							continue
 						}
 						a := msg.(AckSuccess)
+						devARQOnClientAck(a)
 						bid := uint16(a.ClusterID)
 						txMu.Lock()
 						delete(active, bid)
@@ -469,15 +458,14 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	}()
 
 	for {
-		n, err := io.ReadFull(f, buf)
-		if err == io.ErrUnexpectedEOF || err == io.EOF { // last partial block
-			if n == 0 {
-				break
-			}
-			buf = buf[:n]
-		} else if err != nil && err != io.EOF {
+		n, err := io.ReadFull(f, readBuf)
+		if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
 			return err
 		}
+		if n == 0 {
+			break
+		}
+		blockData := readBuf[:n]
 		// Enforce ARQ window to limit unfinished clusters.
 		// If a timeout is hit once, disable further gating to avoid cumulative stalls.
 		if opts.UseARQ && opts.WindowW > 0 && !arqWindowDisabled {
@@ -497,38 +485,49 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 				time.Sleep(10 * time.Millisecond)
 			}
 		}
-		// Prepare encoder for this block so we can generate on-demand repairs later.
-		// IMPORTANT: Always pad the source block to exactly K*L bytes. The RaptorQ
-		// encoder/decoder interpret ESIs relative to K; for the last partial block,
-		// failing to pad here can make repair symbols inconsistent with the padded
-		// systematic symbols we transmit (and what the receiver decodes).
-		blockBytes := make([]byte, K*L)
-		copy(blockBytes, buf)
+		// For the last (partial) block, shrink K so we don't transmit padding-only
+		// systematic symbols. R0 / Rstep behavior remains unchanged.
+		curK := K
 		blockDataLen := n
 		if blockDataLen < 0 {
 			blockDataLen = 0
 		}
-		if blockDataLen > K*L {
-			blockDataLen = K * L
+		if blockDataLen < K*L {
+			curK = (blockDataLen + L - 1) / L // ceil
+			if curK < 1 {
+				curK = 1
+			}
+			if curK > K {
+				curK = K
+			}
+		}
+		// Always pad the source block to exactly curK*L bytes.
+		blockBytes := make([]byte, curK*L)
+		copy(blockBytes, blockData)
+		if blockDataLen > curK*L {
+			blockDataLen = curK * L
 		}
 		tEnc := time.Now()
-		enc, encErr := fec.NewRaptorQEncoder(blockBytes, K, L)
+		enc, encErr := fec.NewRaptorQEncoder(blockBytes, curK, L)
 		if encErr != nil {
 			return encErr
 		}
 		encTime += time.Since(tEnc)
-		// Decide initial symbols count
+		// Decide initial symbols count.
+		// Semantics:
+		//   InitialRepairs >= 0: send exactly that many initial repair symbols (0 allowed).
+		//   InitialRepairs < 0:  auto = max(0, N-K) for backward-compat / convenience.
 		initRepairs := opts.InitialRepairs
-		if initRepairs <= 0 {
+		if initRepairs < 0 {
 			initRepairs = maxInt(0, N-K)
 		}
 		// Allow large initial parity: header N will still be clamped to 255 and pacing/rate control will shape traffic.
-		initN := K + initRepairs
-		if initN < K {
-			initN = K
+		initN := curK + initRepairs
+		if initN < curK {
+			initN = curK
 		}
 		// Initialize attempt to -1 so the first NACK with attempt_idx=0 is processed once.
-		bt := &blockTx{K: K, L: L, enc: enc, nextESI: K, repairsOut: 0, attempt: -1}
+		bt := &blockTx{K: curK, L: L, enc: enc, nextESI: curK, repairsOut: 0, attempt: -1}
 		txMu.Lock()
 		active[uint16(blockID)] = bt
 		txMu.Unlock()
@@ -542,7 +541,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 			// cap throughput well below the shaped rate. The RaptorQ systematic symbols
 			// are exactly the original data partitioned into L-byte chunks, with the
 			// final symbol padded with zeros if needed.
-			if esi < K {
+			if esi < curK {
 				start := esi * L
 				payloadLen = 0
 				if start < blockDataLen {
@@ -575,7 +574,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 				Scheme:     fecwire.SchemeRaptorQ,
 				BlockID:    uint16(blockID),
 				N:          uint8(advN),
-				K:          uint8(K),
+				K:          uint8(curK),
 				SymID:      uint8(esi),
 				PayloadLen: uint32(payloadLen),
 			}
@@ -617,7 +616,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 				lastSend = tSend
 				sendTime += time.Since(tSend)
 				totalSymbols++
-				if esi >= K {
+				if esi >= curK {
 					totalRepairs++
 				}
 			}
@@ -628,23 +627,17 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 			if pc != nil {
 				pc.AfterSend()
 			}
-			if esi >= K {
+			if esi >= curK {
 				bt.nextESI = esi + 1
-				bt.repairsOut = (esi + 1) - K
+				bt.repairsOut = (esi + 1) - curK
 			}
 		}
 		blockID++
-		if n < K*L { // done
+		if err == io.ErrUnexpectedEOF || err == io.EOF {
 			break
 		}
 		if opts.BlockPause > 0 {
 			time.Sleep(opts.BlockPause)
-		}
-		// reset buf slice to full size for next block
-		if cap(buf) < K*L {
-			buf = make([]byte, K*L)
-		} else {
-			buf = buf[:K*L]
 		}
 	}
 	sendBlocksDur = time.Since(sendBlocksStart)
@@ -825,9 +818,11 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 			return "", err
 		}
 		// Client-controlled receiver deadline: when present, override RXOptions.DDL.
+		prevDDL := rx.DDL
 		if hdr.RxDDLMS > 0 {
 			rx.DDL = time.Duration(hdr.RxDDLMS) * time.Millisecond
 		}
+		devLogRxDDL("server_rxddl_before=%s hdr_rxddl_ms=%d server_rxddl_after=%s", prevDDL, hdr.RxDDLMS, rx.DDL)
 		// Try read optional filename (u16 len + bytes); safe if EOF
 		var lb [2]byte
 		n, err := io.ReadFull(s, lb[:])
@@ -1132,7 +1127,7 @@ func ListenAndServe(ctx context.Context, addr, alpn, outDir string, tlsConf *tls
 	ecnStats := NewECNStats()
 	ln, err := quic.ListenAddr(addr, tlsConf, &quic.Config{
 		Tracer: func(ctx context.Context, p logging.Perspective, cid logging.ConnectionID) *logging.ConnectionTracer {
-			return NewECNConnTracer(ecnStats)
+			return devWrapConnTracer(NewECNConnTracer(ecnStats))
 		},
 		EnableDatagrams:                true,
 		KeepAlivePeriod:                2 * time.Second,
@@ -1160,7 +1155,7 @@ func ListenAndServeLoop(ctx context.Context, addr, alpn, outDir string, tlsConf 
 	ecnStats := NewECNStats()
 	ln, err := quic.ListenAddr(addr, tlsConf, &quic.Config{
 		Tracer: func(ctx context.Context, p logging.Perspective, cid logging.ConnectionID) *logging.ConnectionTracer {
-			return NewECNConnTracer(ecnStats)
+			return devWrapConnTracer(NewECNConnTracer(ecnStats))
 		},
 		EnableDatagrams:                true,
 		KeepAlivePeriod:                2 * time.Second,
@@ -1312,7 +1307,7 @@ func ListenAndServeLoopWithRX(ctx context.Context, addr, alpn, outDir string, tl
 	ecnStats := NewECNStats()
 	ln, err := quic.ListenAddr(addr, tlsConf, &quic.Config{
 		Tracer: func(ctx context.Context, p logging.Perspective, cid logging.ConnectionID) *logging.ConnectionTracer {
-			return NewECNConnTracer(ecnStats)
+			return devWrapConnTracer(NewECNConnTracer(ecnStats))
 		},
 		EnableDatagrams:                true,
 		KeepAlivePeriod:                2 * time.Second,
