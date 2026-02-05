@@ -70,7 +70,10 @@ def save_checkpoint(
     # Minimal action set reconstruction data.
     action_meta = {
         "k_values": action_set.k_values,
-        "r0_pct_values": action_set.r0_pct_values,
+        # New semantics: R0 is an integer number of repair symbols.
+        "r0_values": getattr(action_set, "r0_values", None),
+        # Backward-compat: keep the old field name too.
+        "r0_pct_values": getattr(action_set, "r0_pct_values", None),
         "rstep_values": action_set.rstep_values,
         "ddl_ms_values": action_set.ddl_ms_values,
     }
@@ -131,6 +134,7 @@ def load_checkpoint(
     action_set_meta = dict(meta.get("action_set", {}))
     action_set = ActionSet(
         k_values=action_set_meta.get("k_values"),
+        r0_values=action_set_meta.get("r0_values"),
         r0_pct_values=action_set_meta.get("r0_pct_values"),
         rstep_values=action_set_meta.get("rstep_values"),
         ddl_ms_values=action_set_meta.get("ddl_ms_values"),

@@ -28,6 +28,12 @@ OUT_DIR=${OUT_DIR:-"$ROOT/go/test_data"}
 
 TIMEOUT_S=${TIMEOUT_S:-15}
 
+# Connection establishment guard:
+# - CONNECT_TIMEOUT_S bounds dialing + QUIC handshake (client-side).
+# - CONNECT_RETRIES controls how many times we retry on dial/handshake failures.
+CONNECT_TIMEOUT_S=${CONNECT_TIMEOUT_S:-2}
+CONNECT_RETRIES=${CONNECT_RETRIES:-5}
+
 # Training / experiment speed flags (match quicfec_run_once.sh semantics):
 #   SETUP_ONLY=1         Only prepare netns/tc (and optional build), then exit 0.
 #   SKIP_NETNS_RESET=1   Assume netns/veth already exist; do not recreate.
@@ -153,6 +159,7 @@ if [[ "$RAW_STATS" == "1" ]]; then
 fi
 
 TIMED_OUT=0
+CONNECT_ATTEMPTS=0
 
 # Byte counters on host veth (network-layer; includes headers).
 TX0=0; RX0=0
@@ -160,15 +167,37 @@ if [[ -r "/sys/class/net/${VETH_HOST}/statistics/tx_bytes" ]]; then
   TX0=$(cat "/sys/class/net/${VETH_HOST}/statistics/tx_bytes" 2>/dev/null || echo 0)
   RX0=$(cat "/sys/class/net/${VETH_HOST}/statistics/rx_bytes" 2>/dev/null || echo 0)
 fi
-if command -v timeout >/dev/null 2>&1; then
-  timeout --signal=KILL ${TIMEOUT_S}s \
-    "$BIN_DIR/quicraw-client" -addr ${SRV_IP}:$PORT -file "$FILE" -timeout ${TIMEOUT_S}s -measure-delay=true -packet-bytes 1200 \
-    >"$CLI_LOG" 2>&1 || RC=$?
-else
-  "$BIN_DIR/quicraw-client" -addr ${SRV_IP}:$PORT -file "$FILE" -timeout ${TIMEOUT_S}s -measure-delay=true -packet-bytes 1200 \
-    >"$CLI_LOG" 2>&1 || RC=$?
-fi
-RC=${RC:-0}
+while true; do
+  CONNECT_ATTEMPTS=$((CONNECT_ATTEMPTS + 1))
+  : >"$CLI_LOG" || true
+  unset RC || true
+
+  if command -v timeout >/dev/null 2>&1; then
+    timeout --signal=KILL ${TIMEOUT_S}s \
+      "$BIN_DIR/quicraw-client" -addr ${SRV_IP}:$PORT -file "$FILE" -timeout ${TIMEOUT_S}s -connect-timeout ${CONNECT_TIMEOUT_S}s -measure-delay=true -packet-bytes 1200 \
+      >"$CLI_LOG" 2>&1 || RC=$?
+  else
+    "$BIN_DIR/quicraw-client" -addr ${SRV_IP}:$PORT -file "$FILE" -timeout ${TIMEOUT_S}s -connect-timeout ${CONNECT_TIMEOUT_S}s -measure-delay=true -packet-bytes 1200 \
+      >"$CLI_LOG" 2>&1 || RC=$?
+  fi
+  RC=${RC:-0}
+
+  # If dialing / handshake failed, retry a few times instead of counting this as a rep.
+  if [[ "$RC" != "0" ]]; then
+    if grep -qE "^dial timeout:|^dial error:" "$CLI_LOG" 2>/dev/null; then
+      if [[ "$CONNECT_RETRIES" -gt 0 && "$CONNECT_ATTEMPTS" -lt "$CONNECT_RETRIES" ]]; then
+        # Restart server in case it crashed or is wedged.
+        kill $SP 2>/dev/null || true
+        kill -9 $SP 2>/dev/null || true
+        sudo ip netns exec "$NS" bash -lc "ulimit -n 1048576; '$BIN_DIR/quicraw-server' -addr ${SRV_IP}:$PORT -out '$OUT_DIR' -timeout 45s" >"$SRV_LOG" 2>&1 & SP=$!
+        sleep 0.05
+        continue
+      fi
+    fi
+  fi
+  break
+done
+
 CLIENT_OK=1
 if [[ "$RC" != "0" ]]; then
   CLIENT_OK=0

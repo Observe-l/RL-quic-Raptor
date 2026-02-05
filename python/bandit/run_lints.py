@@ -252,6 +252,12 @@ def main() -> int:
         default=0.3,
         help="overhead reward weight (uses fec_overhead = tx_repair_symbols/tx_source_symbols)",
     )
+    ap.add_argument(
+        "--reward-w-done",
+        type=float,
+        default=0.3,
+        help="done_flag penalty weight (done_term = -w_done*(1-done_flag))",
+    )
     ap.add_argument("--reward-variant", type=str, default="qarc_v1")
     ap.add_argument("--reward-residual-binary", type=int, default=1)
 
@@ -328,11 +334,15 @@ def main() -> int:
         "bitrate_mbps": int(args.bitrate_mbps),
         "timeout_sec": int(args.timeout_sec),
         "train_file_bytes": int(args.train_file_bytes),
-        "ddl_ms_values": [25, 50, 75, 100, 125, 150, 175, 200],
+        "ddl_ms_values": [100, 125, 150, 175, 200],
+        "k_values": list(range(20, 51, 2)),
+        "r0_values": list(range(0, 21, 2)),
+        "rstep_values": list(range(0, 21, 2)),
         "reward_variant": str(args.reward_variant),
         "reward_w_goodput": float(args.reward_w_goodput),
         "reward_w_arq": float(args.reward_w_arq),
         "reward_w_overhead": float(args.reward_w_overhead),
+        "reward_w_done": float(getattr(args, "reward_w_done", 0.3)),
         "reward_residual_binary": bool(int(args.reward_residual_binary)),
         "log_obs_vec": False,
         "log_step_metrics": False,
@@ -363,7 +373,7 @@ def main() -> int:
             loaded_from = str(load_prefix)
 
     if loaded_from is None:
-        ddl_ms_values = [25, 50, 75, 100, 125, 150, 175, 200]
+        ddl_ms_values = [100, 125, 150, 175, 200]
         action_set = ActionSet(ddl_ms_values=ddl_ms_values)
         ctx_cfg = ContextConfig(ewma_alpha=float(args.ctx_alpha), window=int(args.ctx_window))
         ctx = ContextBuilder(ctx_cfg)
@@ -388,11 +398,11 @@ def main() -> int:
     try:
         n_actions = int(len(action_set))
         k_n = int(len(action_set.k_values))
-        r0_n = int(len(action_set.r0_pct_values))
+        r0_n = int(len(getattr(action_set, "r0_values", [])))
         rs_n = int(len(action_set.rstep_values))
         ddl_n = int(len(action_set.ddl_ms_values))
         print(
-            f"[bandit] action_set: n={n_actions} = K({k_n})*R0pct({r0_n})*RSTEP({rs_n})*DDL({ddl_n}); "
+            f"[bandit] action_set: n={n_actions} = K({k_n})*R0({r0_n})*RSTEP({rs_n})*DDL({ddl_n}); "
             f"ddl_ms_values={list(action_set.ddl_ms_values)}"
         )
     except Exception:

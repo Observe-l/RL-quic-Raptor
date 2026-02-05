@@ -285,9 +285,9 @@ def main() -> int:
 	)
 
 	# QUIC-FEC knobs (passed to scripts/quicfec_run_once.sh)
-	ap.add_argument("--k", type=int, default=20)
-	ap.add_argument("--r0", type=int, default=0)
-	ap.add_argument("--rstep", type=int, default=0)
+	ap.add_argument("--k", type=int, default=30)
+	ap.add_argument("--r0", type=int, default=12)
+	ap.add_argument("--rstep", type=int, default=6)
 	ap.add_argument("--symbol-bytes", type=int, default=1200)
 
 	ap.add_argument("--run-tag", type=str, default="")
@@ -334,6 +334,21 @@ def main() -> int:
 		"SKIP_BUILD": "0",
 	}
 	_run_script(script=_REPO_ROOT / "scripts" / "quicfec_run_once.sh", env=setup_env, timeout_s=60)
+
+	# Build quic-raw binaries once as well.
+	# Later reps run with SKIP_BUILD=1 for speed, so without this step a stale
+	# quicraw-client (missing newer flags like -connect-timeout) could fail every rep.
+	raw_setup_env = {
+		**net_env,
+		"SETUP_ONLY": "1",
+		"SKIP_NETNS_RESET": "1",
+		"SKIP_TC_CONFIG": "1",
+		"BITRATE_MBPS": str(int(args.bitrate_mbps)),
+		"RTT_MS": str(int(args.rtt_ms)),
+		"LOSS_MODE": "none",
+		"SKIP_BUILD": "0",
+	}
+	_run_script(script=_REPO_ROOT / "scripts" / "quicraw_run_once.sh", env=raw_setup_env, timeout_s=60)
 
 	common_env = {
 		**net_env,

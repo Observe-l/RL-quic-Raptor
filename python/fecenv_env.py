@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import time
+import re
 import subprocess
 from dataclasses import dataclass
 from typing import Dict, Any, Tuple, Optional, List
@@ -35,11 +36,11 @@ class EnvConfig:
 class Action:
     # Action space for QUIC-FEC control:
     # - K: source symbols per block
-    # - R0_pct: initial parity ratio relative to K
+    # - R0: initial repair symbols per block
     # - RSTEP: incremental repair step size
     # - ddl_ms: receiver decode deadline used for ARQ/NACK timing
     K: int = 30
-    R0_pct: float = 0.2
+    R0: int = 6
     RSTEP: int = 4
     ddl_ms: int = 450
 
@@ -228,9 +229,8 @@ class QuicFecRunner:
         # Keep SYMBOL_BYTES fixed to avoid MTU-triggered fragmentation.
         env["SYMBOL_BYTES"] = str(int(getattr(cfg, "symbol_bytes", 1200)))
 
-        # Map R0_pct -> integer R0.
-        # Discrete control: R0 = floor(K * R0_pct), allowing 0.
-        r0 = int(float(action.R0_pct) * float(k))
+        # Initial repair symbols (R0) are controlled by the policy.
+        r0 = int(getattr(action, "R0", 0))
         if r0 < 0:
             r0 = 0
         if r0 > int(k):
@@ -334,6 +334,15 @@ class QuicFecRunner:
             if p.returncode != 0:
                 raise RuntimeError(f"harness failed: code={p.returncode} stderr={p.stderr[-400:]}\nstdout={p.stdout[-400:]}")
             obs = self._read_last_obs(obs_json_path)
+            # The harness prints a summary line to stderr (e.g. "[run] ... dur_ms=...")
+            # but it might not be included in the RL observation JSON. Parse it here and
+            # attach to obs so downstream logs can record transfer duration.
+            try:
+                m = re.findall(r"\bdur_ms=([0-9]+(?:\.[0-9]+)?)\b", str(p.stderr or ""))
+                if m:
+                    obs["dur_ms"] = float(m[-1])
+            except Exception:
+                pass
         # Reward is computed at the Env level; return 0.0 placeholder here.
             return obs, 0.0, True, {}
         except subprocess.TimeoutExpired as te:
@@ -445,10 +454,39 @@ class FecEnv(gym.Env):
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         cfg = config or {}
 
+        # Action factor levels (requested discretization).
+        # Keep these explicit so bandit training/eval can ensure env matches the ActionSet.
+        default_k_values = list(range(20, 51, 2))
+        default_r0_values = list(range(0, 21, 2))
+        default_rstep_values = list(range(0, 21, 2))
+        try:
+            self._k_values: List[int] = [int(x) for x in list(cfg.get("k_values", default_k_values))]
+        except Exception:
+            self._k_values = list(default_k_values)
+        try:
+            self._r0_values: List[int] = [int(x) for x in list(cfg.get("r0_values", default_r0_values))]
+        except Exception:
+            self._r0_values = list(default_r0_values)
+        try:
+            self._rstep_values: List[int] = [int(x) for x in list(cfg.get("rstep_values", default_rstep_values))]
+        except Exception:
+            self._rstep_values = list(default_rstep_values)
+
+        self._k_values = sorted({int(x) for x in self._k_values if int(x) > 0})
+        self._r0_values = sorted({int(x) for x in self._r0_values if int(x) >= 0})
+        self._rstep_values = sorted({int(x) for x in self._rstep_values if int(x) >= 0})
+        if not self._k_values:
+            self._k_values = list(default_k_values)
+        if not self._r0_values:
+            self._r0_values = list(default_r0_values)
+        if not self._rstep_values:
+            self._rstep_values = list(default_rstep_values)
+
         # DDL discretization (ms).
         # This controls both the action space cardinality and the mapping from ddl_idx -> ddl_ms.
-        # Default kept for backward compatibility with older checkpoints.
-        default_ddl_ms_values = [100, 150, 200, 250, 300, 350]
+        # Default matches the requested discretization.
+        # (Older checkpoints should pass their ddl_ms_values explicitly.)
+        default_ddl_ms_values = [100, 125, 150, 175, 200]
         ddl_ms_values_cfg = cfg.get("ddl_ms_values", default_ddl_ms_values)
         try:
             ddl_ms_values = [int(x) for x in list(ddl_ms_values_cfg)]
@@ -460,30 +498,29 @@ class FecEnv(gym.Env):
         # Keep deterministic mapping.
         self._ddl_ms_values: List[int] = sorted({int(x) for x in ddl_ms_values})
 
-        # Discrete action space (MultiDiscrete), matching the requirement that
-        # controls are chosen from a finite set (not a clipped continuous Box).
-        # Order: [K_idx, R0_pct_idx, RSTEP_idx, ddl_idx]
-        #   K: 10..64                                -> 55 values
-        #   R0_pct: 0.0..1.0 step 0.05               -> 21 values
-        #   RSTEP: 1..8                              -> 8 values
-        #   ddl_ms: configured via ddl_ms_values     -> len(ddl_ms_values) values
-        self.action_space = spaces.MultiDiscrete([55, 21, 8, int(len(self._ddl_ms_values))])
+        # Discrete action space (MultiDiscrete).
+        # Order: [K_idx, R0_idx, RSTEP_idx, ddl_idx]
+        #   K:      20..50 step 2    -> len(self._k_values)
+        #   R0:      0..20 step 2    -> len(self._r0_values)
+        #   RSTEP:   0..20 step 2    -> len(self._rstep_values)
+        #   ddl_ms: configured       -> len(self._ddl_ms_values)
+        self.action_space = spaces.MultiDiscrete(
+            [int(len(self._k_values)), int(len(self._r0_values)), int(len(self._rstep_values)), int(len(self._ddl_ms_values))]
+        )
         # Policy observation keys.
         # Keep this strictly limited to the learning signal (no debug/leakage).
         # Layout (requested):
         #   goodput,
         #   fec_overhead,
         #   ctrl_tx_nack_msgs,
-        #   arq_attempts_mean,
-        #   residual_erasures,
+        #   done_flag,
         #   fec_rate (R0/K),
         #   ddl_ms (executed)
         self._obs_keys: List[str] = [
             "goodput",
             "fec_overhead",
             "ctrl_tx_nack_msgs",
-            "arq_attempts_mean",
-            "residual_erasures",
+            "done_flag",
             "fec_rate",
             "ddl_ms",
         ]
@@ -527,10 +564,9 @@ class FecEnv(gym.Env):
         # Default weights for shaping.
         # Latency term removed: bandit controls TX side only.
         self._reward_w_goodput = float(cfg.get("reward_w_goodput", 1.0))
-        self._reward_w_residual = float(cfg.get("reward_w_residual", 0.0))
         self._reward_w_overhead = float(cfg.get("reward_w_overhead", 0.3))
         self._reward_w_arq = float(cfg.get("reward_w_arq", 0.0))
-        self._reward_residual_binary = bool(cfg.get("reward_residual_binary", True))
+        self._reward_w_done = float(cfg.get("reward_w_done", 0.3))
 
         # Network defaults
         self._rtt_ms = int(cfg.get("rtt_ms", 100))
@@ -668,20 +704,20 @@ class FecEnv(gym.Env):
         rstep_idx = int(a[2])
         ddl_idx = int(a[3])
 
-        if not (0 <= k_idx <= 54):
+        if not (0 <= k_idx < int(len(self._k_values))):
             raise ValueError(f"K index out of range: {k_idx}")
-        if not (0 <= r0_idx <= 20):
-            raise ValueError(f"R0_pct index out of range: {r0_idx}")
-        if not (0 <= rstep_idx <= 7):
+        if not (0 <= r0_idx < int(len(self._r0_values))):
+            raise ValueError(f"R0 index out of range: {r0_idx}")
+        if not (0 <= rstep_idx < int(len(self._rstep_values))):
             raise ValueError(f"RSTEP index out of range: {rstep_idx}")
         if not (0 <= ddl_idx < int(len(self._ddl_ms_values))):
             raise ValueError(f"ddl index out of range: {ddl_idx}")
 
-        K = 10 + k_idx
-        R0_pct = 0.05 * float(r0_idx)
-        RSTEP = 1 + rstep_idx
+        K = int(self._k_values[int(k_idx)])
+        R0 = int(self._r0_values[int(r0_idx)])
+        RSTEP = int(self._rstep_values[int(rstep_idx)])
         ddl_ms = int(self._ddl_ms_values[int(ddl_idx)])
-        act = Action(K=int(K), R0_pct=float(R0_pct), RSTEP=int(RSTEP), ddl_ms=int(ddl_ms))
+        act = Action(K=int(K), R0=int(R0), RSTEP=int(RSTEP), ddl_ms=int(ddl_ms))
 
         obs_dict, _reward_unused, _done_transfer, info = self._runner.step(
             act,
@@ -725,10 +761,44 @@ class FecEnv(gym.Env):
         obs_dict["goodput"] = float(goodput_mbps)
 
         # Append control-derived observation fields.
-        # fec_rate is defined as R0/K where R0=floor(K*R0_pct) used by the sender.
-        r0_used = max(0, int(float(R0_pct) * float(K)))
+        r0_used = int(np.clip(int(R0), 0, int(K)))
         obs_dict["fec_rate"] = float(r0_used) / float(max(1, int(K)))
         obs_dict["ddl_ms"] = float(ddl_ms)
+
+        # done_flag: depends on file size and transfer duration.
+        # Thresholds (ms):
+        #   >= 500 KiB: 2000ms
+        #   [50, 500) KiB: 500ms
+        #   < 50 KiB: 100ms
+        file_bytes = int(getattr(self._runner, "train_file_bytes", 0) or 0)
+
+        def _deadline_ms(sz: int) -> int:
+            if sz <= 0:
+                return 0
+            if sz >= 500 * 1024:
+                return 2000
+            if sz >= 50 * 1024:
+                return 500
+            return 100
+
+        def _dur_ms_from_obs(d: Dict[str, Any]) -> float:
+            for key in ("dur_ms", "duration_transfer_ms", "duration_decode_ms"):
+                if key in d and d.get(key) is not None:
+                    try:
+                        return float(d.get(key))
+                    except Exception:
+                        pass
+            return 0.0
+
+        dur_ms = float(_dur_ms_from_obs(obs_dict))
+        ddl_ms_deadline = int(_deadline_ms(int(file_bytes)))
+        done_flag = 0
+        if ddl_ms_deadline > 0 and not is_timeout and not is_md5_fail and dur_ms > 0:
+            done_flag = 1 if float(dur_ms) <= float(ddl_ms_deadline) else 0
+        obs_dict["done_flag"] = float(done_flag)
+
+        # e2e_delay approximation: dur_ms + RTT/2.
+        obs_dict["e2e_delay_ms"] = float(dur_ms) + float(self._rtt_ms) / 2.0
 
         if not self._ignore_runner_errors and info and isinstance(info, dict) and info.get("error"):
             err = str(info.get("error"))
@@ -764,6 +834,9 @@ class FecEnv(gym.Env):
         info = {
             **(info or {}),
             "step_valid": 1,
+            # Useful for training logs / analysis (not part of the policy observation).
+            "dur_ms": float(dur_ms),
+            "e2e_delay_ms": float(obs_dict.get("e2e_delay_ms", 0.0) or 0.0),
             "net_params": {
                 "rtt_ms": self._rtt_ms,
                 "bitrate_mbps": self._bitrate_mbps,
@@ -772,7 +845,6 @@ class FecEnv(gym.Env):
             "fec_cfg": {
                 "K": int(K),
                 "symbol_bytes": 1200,
-                "R0_pct": float(R0_pct),
                 "R0": int(r0_used),
                 "RSTEP": int(RSTEP),
                 "ddl_ms": ddl_ms,
@@ -901,27 +973,26 @@ class FecEnv(gym.Env):
 
     def _compute_reward_satellite(self, obs: Dict[str, Any], ddl_ms: int) -> Tuple[float, Dict[str, float]]:
         g = float(obs.get("goodput", obs.get("goodput_mbps", obs.get("goodput_arrival_mbps", obs.get("goodput_decode_mbps", 0.0)))))
-        e = float(obs.get("residual_erasures", 0.0))
         oh = float(obs.get("fec_overhead", 0.0))
         a_mean = float(obs.get("arq_attempts_mean", 0.0))
+        done_flag = float(obs.get("done_flag", 0.0))
 
         if self._reward_variant == "legacy":
             # Previous shaping (kept for reproducibility)
             c = max(1.0, float(self._capacity_mbps))
             tp_term = float(np.clip(g / c, 0.0, 1.0))
-            lam_e = 0.75
-            resid_term = -lam_e * (e / (1.0 + e))
             lam_o = 0.3
             # Legacy overhead term: treat fec_overhead as a ratio (repairs/source).
             # Penalize overhead above ~0.5, saturating by ~2.0.
             oh_term = -lam_o * max(0.0, (oh - 0.5) / 1.5)
             arq_term = -min(0.3, 0.08 * a_mean)
-            r = tp_term + resid_term + oh_term + arq_term
+            done_term = -float(self._reward_w_done) * float(1.0 - float(np.clip(done_flag, 0.0, 1.0)))
+            r = tp_term + oh_term + arq_term + done_term
             return float(r), {
                 "tp_term": float(tp_term),
-                "resid_term": float(resid_term),
                 "oh_term": float(oh_term),
                 "arq_term": float(arq_term),
+                "done_term": float(done_term),
             }
 
         # Throughput + latency reward shaping.
@@ -929,26 +1000,20 @@ class FecEnv(gym.Env):
         c = max(1e-6, float(self._capacity_mbps))
         tp_term = float(self._reward_w_goodput) * float(g / c)
 
-        # Keep residual/overhead/ARQ as penalties (optional knobs).
-        if self._reward_residual_binary:
-            l_tilde = float(e > 0.0)
-        else:
-            l_tilde = float(e / (1.0 + max(0.0, e)))
         arq_tilde = float(np.clip(a_mean / 2.0, 0.0, 1.0))
-
-        resid_term = -float(self._reward_w_residual) * float(l_tilde)
         oh_term = float(self._reward_w_overhead) * float(1.0 / (1.0 + (float(oh) / 0.3) ** 2))
         arq_term = -float(self._reward_w_arq) * float(arq_tilde)
+        done_term = -float(self._reward_w_done) * float(1.0 - float(np.clip(done_flag, 0.0, 1.0)))
 
-        r = float(tp_term + resid_term + oh_term + arq_term)
+        r = float(tp_term + oh_term + arq_term + done_term)
         return r, {
             "tp_term": float(tp_term),
-            "resid_term": float(resid_term),
             "oh_term": float(oh_term),
             "arq_term": float(arq_term),
+            "done_term": float(done_term),
             "tp_norm": float(np.clip(g / c, 0.0, 1.0)),
-            "l_tilde": float(l_tilde),
             "arq_tilde": float(arq_tilde),
+            "done_flag": float(np.clip(done_flag, 0.0, 1.0)),
         }
 
 

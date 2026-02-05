@@ -125,6 +125,9 @@ type rxManager struct {
 	met *serverMetrics
 	// first arrival timestamp (for missing-block ARQ heuristics)
 	t0First time.Time
+	// lastRxAt stores the unix nano timestamp of the last received symbol (including duplicates).
+	// Used to avoid sending preemptive NACKs for unseen blocks while traffic is still flowing.
+	lastRxAt atomic.Int64
 
 	// tracking for missing blocks to NACK
 	minSeen int  // first seen block id
@@ -295,8 +298,21 @@ func (m *rxManager) start(rx RXOptions) {
 					m.noteDelivered(off, len(bytes))
 					m.decBlocks.Add(1)
 					// release memory and mark done
-					// capture stats before clearing
-					rxUnique := b.srcSeenCount + len(b.syms)
+					// capture stats before clearing; must hold m.mu because ingest mutates b.syms.
+					var (
+						rxUnique   int
+						usedRep    int
+						attemptIdx int
+						firstSeen  time.Time
+					)
+					m.mu.Lock()
+					if b.done {
+						m.mu.Unlock()
+						continue
+					}
+					firstSeen = b.firstSeen
+					attemptIdx = b.attempt
+					rxUnique = b.srcSeenCount + len(b.syms)
 					// Used repairs is at least the number of received repair symbols.
 					// (This may slightly overcount if repairs were redundant, but is stable and cheap.)
 					repairRx := 0
@@ -305,8 +321,7 @@ func (m *rxManager) start(rx RXOptions) {
 							repairRx++
 						}
 					}
-					usedRep := repairRx
-					m.mu.Lock()
+					usedRep = repairRx
 					for _, p := range b.syms {
 						m.inUse.Add(int64(-len(p)))
 					}
@@ -321,7 +336,7 @@ func (m *rxManager) start(rx RXOptions) {
 					m.mu.Unlock()
 					// metrics: per-cluster decode event
 					if m.met != nil {
-						m.met.OnClusterDecoded(b.firstSeen, time.Now(), b.attempt, usedRep)
+						m.met.OnClusterDecoded(firstSeen, time.Now(), attemptIdx, usedRep)
 					}
 					// ACK success to sender if ctrl available
 					if m.ctrlOut != nil {
@@ -329,7 +344,7 @@ func (m *rxManager) start(rx RXOptions) {
 						_ = writeAck(&buf, AckSuccess{
 							FileID:          0,
 							ClusterID:       uint32(b.id),
-							AttemptIdx:      uint16(b.attempt),
+							AttemptIdx:      uint16(attemptIdx),
 							RxUnique:        uint16(rxUnique),
 							UsedRepairs:     uint16(usedRep),
 							DecodeLatencyMs: uint32(time.Since(t0).Milliseconds()),
@@ -358,7 +373,7 @@ func (m *rxManager) start(rx RXOptions) {
 						if m.met != nil {
 							m.met.OnCtrlTx(len(payload), "ack", dropped)
 						}
-						fmt.Fprintf(os.Stderr, "[arq] ack block=%d rx_unique=%d used_rep=%d attempt=%d\n", b.id, rxUnique, usedRep, b.attempt)
+						fmt.Fprintf(os.Stderr, "[arq] ack block=%d rx_unique=%d used_rep=%d attempt=%d\n", b.id, rxUnique, usedRep, attemptIdx)
 					}
 				}
 			}
@@ -426,13 +441,36 @@ func (m *rxManager) start(rx RXOptions) {
 								// If totalBlocks is known, use [0,totalBlocks) so missing tail blocks are recoverable.
 								inRange := false
 								if m.totalBlocks > 0 {
-									// IMPORTANT: Don't NACK future blocks that we haven't observed yet.
-									// Only NACK unseen placeholders that are within the observed range.
-									inRange = (m.minSeen >= 0 && int(b.id) >= m.minSeen && int(b.id) <= m.maxSeen)
+									// With totalBlocks known (header parsed), we can safely NACK a small
+									// prefix beyond what we've observed, so a fully-missing tail block can
+									// still be recovered. Limit to (maxSeen+1) to avoid spamming NACKs for
+									// the entire file.
+									hi := m.maxSeen + 1
+									if hi < 0 {
+										hi = 0
+									}
+									if hi >= m.totalBlocks {
+										hi = m.totalBlocks - 1
+									}
+									inRange = (hi >= 0 && int(b.id) >= 0 && int(b.id) <= hi)
 								} else {
 									inRange = (m.minSeen >= 0 && int(b.id) >= m.minSeen && int(b.id) <= m.maxSeen)
 								}
-								if inRange && !m.t0First.IsZero() && now.Sub(m.t0First) >= minUnseenNack {
+								// For the immediate tail block (maxSeen+1), wait longer than for gaps,
+								// to avoid preemptive repairs during transient burst-loss gaps.
+								needIdle := minUnseenNack
+								if int(b.id) == m.maxSeen+1 {
+									longer := 6 * m.ddl
+									if longer > needIdle {
+										needIdle = longer
+									}
+								}
+								lastRx := m.lastRxAt.Load()
+								idleOK := false
+								if lastRx > 0 {
+									idleOK = now.Sub(time.Unix(0, lastRx)) >= needIdle
+								}
+								if inRange && idleOK {
 									if !b.unseenNackSent {
 										canNack = true
 									} else if !b.lastNackAt.IsZero() && now.Sub(b.lastNackAt) >= 4*m.ddl {
@@ -444,10 +482,19 @@ func (m *rxManager) start(rx RXOptions) {
 							if canNack {
 								// Only count ARQ attempts when we actually send a NACK.
 								b.attempt++
-								// Recommend at least the deficit (min 4)
+								// Recommend repairs.
+								// - Unseen placeholders (no symbols received at all): request a small bootstrap.
+								// - Seen blocks: cap recommendation to avoid large bursts that inflate overhead.
 								rec := deficit
-								if rec < 4 {
+								if b.firstSeen.IsZero() {
 									rec = 4
+								} else {
+									if rec < 1 {
+										rec = 1
+									}
+									if rec > 4 {
+										rec = 4
+									}
 								}
 								nacks = append(nacks, nackMsg{blockID: b.id, attempt: b.attempt, rxu: rxu, rec: rec, send: true})
 								// Update per-block debounce state.
@@ -551,6 +598,9 @@ func (m *rxManager) start(rx RXOptions) {
 
 // ingest one symbol; returns whether accepted.
 func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, dataSize int) bool {
+	// Record receive activity early (even if this symbol is later dropped as duplicate)
+	// so the scheduler doesn't send unseen-block NACKs while traffic is ongoing.
+	m.lastRxAt.Store(time.Now().UnixNano())
 	isRepair := esi >= K
 	m.mu.Lock()
 	// On first observed symbol, record global K and compute total blocks.

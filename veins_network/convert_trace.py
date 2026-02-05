@@ -24,6 +24,7 @@ import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
+import zlib
 
 import numpy as np
 import pandas as pd
@@ -276,6 +277,10 @@ def main():
     for sender, g in df.groupby("sender", sort=False):
         gg = g.sort_values(["seq", "time"]).copy()
 
+        # Assign a per-sender RTT (ms) in [50,150].
+        # Use a deterministic pseudo-random mapping from sender id so results are reproducible.
+        rtt_ms = 50 + (zlib.crc32(sender.encode("utf-8")) % 101)
+
         nominal = estimate_nominal_interval(gg)
         if not np.isfinite(nominal):
             nominal = global_interval
@@ -394,6 +399,7 @@ def main():
         # Prepare sender payload for JSON (we'll filter later)
         sender_json_payload[sender] = {
             "nominal_interval_s": nominal,
+            "rtt_ms": int(rtt_ms),
             "GE_full": {
                 "p_g2b": full_stats["ge_p_g2b"],
                 "r_b2g": full_stats["ge_r_b2g"],
@@ -457,6 +463,11 @@ def main():
     # Build JSON (filtered only here, per your request)
     compact = {
         "window_stats_s": win,
+        "rtt_ms": {
+            "min": 50,
+            "max": 150,
+            "method": "rtt_ms = 50 + (crc32(sender) % 101)",
+        },
         "steady_rp": {
             "window_s": float(args.steady_window),
             "min_recv_pps": float(args.min_recv_pps),

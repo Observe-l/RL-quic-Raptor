@@ -35,12 +35,14 @@ class TrialResult:
     method: str
     rep: int
     goodput_mbps: float
+    dur_ms: float
+    e2e_delay_ms: float
     delay_ms_avg: float
     md5_ok: int
     extra: Dict[str, Any]
 
 
-def _load_sender_ge(*, params_path: Path, sender_id: int, ge_key: str) -> Dict[str, Any]:
+def _load_sender_data(*, params_path: Path, sender_id: int) -> Dict[str, Any]:
     data = json.loads(params_path.read_text(encoding="utf-8"))
     senders = data.get("senders")
     if not isinstance(senders, dict):
@@ -48,7 +50,11 @@ def _load_sender_ge(*, params_path: Path, sender_id: int, ge_key: str) -> Dict[s
     s = senders.get(str(sender_id))
     if not isinstance(s, dict):
         raise ValueError(f"sender_id={sender_id} not found in {params_path}")
-    ge = s.get(ge_key)
+    return s
+
+
+def _load_sender_ge(*, sender_data: Dict[str, Any], sender_id: int, ge_key: str) -> Dict[str, Any]:
+    ge = sender_data.get(ge_key)
     if not isinstance(ge, dict):
         raise ValueError(f"sender_id={sender_id} missing ge_key={ge_key}")
     return ge
@@ -145,12 +151,11 @@ def _action_to_env_vars(*, action_set: ActionSet, a_idx: int) -> Dict[str, str]:
     env_action = spec.to_env_action()
     k_idx, r0_idx, rstep_idx, ddl_idx = (int(env_action[0]), int(env_action[1]), int(env_action[2]), int(env_action[3]))
 
-    K = 10 + k_idx
-    r0_pct = 0.05 * float(r0_idx)
-    R0 = int(float(K) * r0_pct)
-    RSTEP = 1 + rstep_idx
-    ddl_ms_values = [100, 150, 200, 250, 300, 350]
-    DDL_MS = int(ddl_ms_values[int(ddl_idx)])
+    # New ActionSet semantics: indices are factor-level indices.
+    K = int(action_set.k_values[int(k_idx)])
+    R0 = int(action_set.r0_values[int(r0_idx)])
+    RSTEP = int(action_set.rstep_values[int(rstep_idx)])
+    DDL_MS = int(action_set.ddl_ms_values[int(ddl_idx)])
 
     return {
         "K": str(int(K)),
@@ -206,7 +211,9 @@ def main() -> int:
         model_prefix = model_prefix[:-4]
 
     params_path = Path(args.ge_params)
-    ge = _load_sender_ge(params_path=params_path, sender_id=int(args.sender_id), ge_key=str(args.ge_key))
+    sender_data = _load_sender_data(params_path=params_path, sender_id=int(args.sender_id))
+    ge = _load_sender_ge(sender_data=sender_data, sender_id=int(args.sender_id), ge_key=str(args.ge_key))
+    rtt_ms = int(sender_data.get("rtt_ms", int(args.rtt_ms)))
     loss_mode = _ge_to_tc_gemodel_loss_mode(ge, h_loss_pct=float(args.ge_h_pct), k_loss_pct=float(args.ge_k_pct))
 
     # Create a deterministic file of requested size.
@@ -243,7 +250,7 @@ def main() -> int:
         for rep in range(int(args.reps)):
             common_env = {
                 "BITRATE_MBPS": str(int(args.bitrate_mbps)),
-                "RTT_MS": str(int(args.rtt_ms)),
+                "RTT_MS": str(int(rtt_ms)),
                 "LOSS_MODE": str(loss_mode),
                 "LOSS_PCT": "0",
                 "FILE": str(file_path),
@@ -296,6 +303,12 @@ def main() -> int:
             except Exception:
                 goodput = 0.0
 
+            dur_ms = 0.0
+            try:
+                dur_ms = float(kv.get("dur_ms", "0"))
+            except Exception:
+                dur_ms = 0.0
+
             md5_ok = 0
             try:
                 md5_ok = int(float(kv.get("md5_ok", "0")))
@@ -319,8 +332,12 @@ def main() -> int:
             else:
                 delay_ms_avg = _parse_delay_ms_avg_from_delay_line(_extract_delay_line(stderr) or "")
 
+            e2e_delay_ms = float(dur_ms) + float(rtt_ms) / 2.0
+
             if timed_out or md5_ok != 1:
                 goodput = 0.0
+                dur_ms = 0.0
+                e2e_delay_ms = 0.0
                 delay_ms_avg = 0.0
 
             extra = {
@@ -353,17 +370,21 @@ def main() -> int:
                     method=method,
                     rep=rep,
                     goodput_mbps=goodput,
+                    dur_ms=dur_ms,
+                    e2e_delay_ms=e2e_delay_ms,
                     delay_ms_avg=delay_ms_avg,
                     md5_ok=md5_ok,
                     extra=extra,
                 )
             )
-            print(f"rep={rep:02d} method={method:16s} goodput_mbps={goodput:.3f} delay_ms_avg={delay_ms_avg:.3f} md5_ok={md5_ok}")
+            print(
+                f"rep={rep:02d} method={method:16s} goodput_mbps={goodput:.3f} dur_ms={dur_ms:.1f} e2e_delay_ms={e2e_delay_ms:.1f} delay_ms_avg={delay_ms_avg:.3f} md5_ok={md5_ok}"
+            )
 
     # Write per-trial CSV
     out_csv = out_dir / "trials.csv"
     with out_csv.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["method", "rep", "goodput_mbps", "delay_ms_avg", "md5_ok"])
+        w = csv.DictWriter(f, fieldnames=["method", "rep", "goodput_mbps", "dur_ms", "e2e_delay_ms", "delay_ms_avg", "md5_ok"])
         w.writeheader()
         for r in rows:
             w.writerow(
@@ -371,6 +392,8 @@ def main() -> int:
                     "method": r.method,
                     "rep": r.rep,
                     "goodput_mbps": f"{r.goodput_mbps:.6f}",
+                    "dur_ms": f"{r.dur_ms:.3f}",
+                    "e2e_delay_ms": f"{r.e2e_delay_ms:.3f}",
                     "delay_ms_avg": f"{r.delay_ms_avg:.6f}",
                     "md5_ok": r.md5_ok,
                 }
@@ -385,10 +408,14 @@ def main() -> int:
                 "method",
                 "n_all",
                 "goodput_mbps_mean_all",
+                "dur_ms_mean_all",
+                "e2e_delay_ms_mean_all",
                 "delay_ms_avg_mean_all",
                 "md5_ok_rate_all",
                 "n_no_warmup",
                 "goodput_mbps_mean_no_warmup",
+                "dur_ms_mean_no_warmup",
+                "e2e_delay_ms_mean_no_warmup",
                 "delay_ms_avg_mean_no_warmup",
                 "md5_ok_rate_no_warmup",
             ],
@@ -404,10 +431,14 @@ def main() -> int:
                     "method": m,
                     "n_all": len(rs_all),
                     "goodput_mbps_mean_all": f"{mean([r.goodput_mbps for r in rs_all]):.6f}" if rs_all else "",
+                    "dur_ms_mean_all": f"{mean([r.dur_ms for r in rs_all]):.6f}" if rs_all else "",
+                    "e2e_delay_ms_mean_all": f"{mean([r.e2e_delay_ms for r in rs_all]):.6f}" if rs_all else "",
                     "delay_ms_avg_mean_all": f"{mean([r.delay_ms_avg for r in rs_all]):.6f}" if rs_all else "",
                     "md5_ok_rate_all": f"{(len(ok_all) / len(rs_all)):.6f}" if rs_all else "",
                     "n_no_warmup": len(rs),
                     "goodput_mbps_mean_no_warmup": f"{mean([r.goodput_mbps for r in rs]):.6f}" if rs else "",
+                    "dur_ms_mean_no_warmup": f"{mean([r.dur_ms for r in rs]):.6f}" if rs else "",
+                    "e2e_delay_ms_mean_no_warmup": f"{mean([r.e2e_delay_ms for r in rs]):.6f}" if rs else "",
                     "delay_ms_avg_mean_no_warmup": f"{mean([r.delay_ms_avg for r in rs]):.6f}" if rs else "",
                     "md5_ok_rate_no_warmup": f"{(len(ok) / len(rs)):.6f}" if rs else "",
                 }
@@ -421,7 +452,7 @@ def main() -> int:
         "ge_k_pct": float(args.ge_k_pct),
         "loss_mode": loss_mode,
         "bitrate_mbps": int(args.bitrate_mbps),
-        "rtt_ms": int(args.rtt_ms),
+        "rtt_ms": int(rtt_ms),
         "file": str(file_path),
         "file_bytes": int(args.file_bytes),
         "bandit": {"mode": "sequential_mean", "action_set_size": len(action_set)},

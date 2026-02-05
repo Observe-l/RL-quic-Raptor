@@ -34,6 +34,8 @@ from bandit.run_lints_ge_schedule import _ge_to_tc_gemodel_loss_mode  # noqa: E4
 class Trial:
     rep: int
     goodput_mbps: float
+    dur_ms: float
+    e2e_delay_ms: float
     delay_ms_avg: float
     md5_ok: int
     timed_out: int
@@ -44,60 +46,39 @@ class Trial:
 def _aligned_obs_vec_from_rl_observation(*, rl_obs: Dict[str, Any], ddl_ms: int, failed: bool) -> np.ndarray:
     """Construct the exact training observation vector.
 
-    Layout must match `python/fecenv_env.py`:
-            [goodput, decode_latency_p95_ms, fec_overhead,
-       ctrl_tx_nack_msgs, arq_attempts_mean, residual_erasures,
-       fec_rate, ddl_ms]
+    Layout must match `python/fecenv_env.py` (new):
+      [goodput, fec_overhead, ctrl_tx_nack_msgs, done_flag, fec_rate, ddl_ms]
     """
 
     if failed:
-        # Mirror QuicFecRunner._default_obs(timeout=True) for the fields used in obs.
-        goodput_mbps = 0.0
-        decode_latency_p95_ms = 0.0
+        goodput = 0.0
         fec_overhead = 0.0
         ctrl_tx_nack_msgs = 0.0
-        arq_attempts_mean = 2.0
-        residual_erasures = 1.0
+        done_flag = 0.0
         fec_rate = 0.0
     else:
-        try:
-            goodput_mbps = float(rl_obs.get("goodput", rl_obs.get("goodput_mbps", rl_obs.get("goodput_arrival_mbps", rl_obs.get("goodput_decode_mbps", 0.0)))))
-        except Exception:
-            goodput_mbps = 0.0
-        try:
-            decode_latency_p95_ms = float(rl_obs.get("decode_latency_p95_ms", 0.0))
-        except Exception:
-            decode_latency_p95_ms = 0.0
-        try:
-            fec_overhead = float(rl_obs.get("fec_overhead", rl_obs.get("fec_overhead_pct_arrival", 0.0)))
-        except Exception:
-            fec_overhead = 0.0
-        try:
-            ctrl_tx_nack_msgs = float(rl_obs.get("ctrl_tx_nack_msgs", 0.0))
-        except Exception:
-            ctrl_tx_nack_msgs = 0.0
-        try:
-            arq_attempts_mean = float(rl_obs.get("arq_attempts_mean", 0.0))
-        except Exception:
-            arq_attempts_mean = 0.0
-        try:
-            residual_erasures = float(rl_obs.get("residual_erasures", 0.0))
-        except Exception:
-            residual_erasures = 0.0
-        try:
-            fec_rate = float(rl_obs.get("fec_rate", 0.0))
-        except Exception:
-            fec_rate = 0.0
+        def _f(k: str, default: float = 0.0) -> float:
+            try:
+                return float(rl_obs.get(k, default))
+            except Exception:
+                return default
+
+        goodput = _f(
+            "goodput",
+            _f("goodput_mbps", _f("goodput_arrival_mbps", _f("goodput_decode_mbps", 0.0))),
+        )
+        fec_overhead = _f("fec_overhead", _f("fec_overhead_pct_arrival", 0.0))
+        ctrl_tx_nack_msgs = _f("ctrl_tx_nack_msgs", 0.0)
+        done_flag = _f("done_flag", 1.0)
+        fec_rate = _f("fec_rate", 0.0)
 
     return np.asarray(
         [
-            goodput_mbps,
-            decode_latency_p95_ms,
-            fec_overhead,
-            ctrl_tx_nack_msgs,
-            arq_attempts_mean,
-            residual_erasures,
-            float(np.clip(fec_rate, 0.0, 1.0)),
+            float(goodput),
+            float(fec_overhead),
+            float(ctrl_tx_nack_msgs),
+            float(np.clip(float(done_flag), 0.0, 1.0)),
+            float(np.clip(float(fec_rate), 0.0, 1.0)),
             float(int(ddl_ms)),
         ],
         dtype=np.float32,
@@ -121,6 +102,17 @@ def _load_sender_ge(*, params_path: Path, sender_id: int, ge_key: str) -> Dict[s
     if not isinstance(ge, dict):
         raise ValueError(f"sender_id={sender_id} missing {ge_key}")
     return ge
+
+
+def _load_sender_data(*, params_path: Path, sender_id: int) -> Dict[str, Any]:
+    data = json.loads(params_path.read_text(encoding="utf-8"))
+    senders = data.get("senders")
+    if not isinstance(senders, dict):
+        raise ValueError("invalid 'senders' in ge params")
+    s = senders.get(str(sender_id))
+    if not isinstance(s, dict):
+        raise ValueError(f"sender_id={sender_id} not found")
+    return s
 
 
 def _extract_last_line(prefix: str, s: str) -> Optional[str]:
@@ -182,10 +174,10 @@ def _bandit_select_action_mean_with_fixed_ddl(
     """Select best action under posterior mean, but with ddl forced to a fixed value."""
 
     fixed_ddl_ms = int(fixed_ddl_ms)
-    ddl_ms_values = [100, 150, 200, 250, 300, 350]
+    ddl_ms_values = list(action_set.ddl_ms_values)
     if fixed_ddl_ms not in ddl_ms_values:
         raise ValueError(f"fixed_ddl_ms must be one of {ddl_ms_values}")
-    fixed_ddl_idx = int(ddl_ms_values.index(fixed_ddl_ms))
+    fixed_ddl_idx = int(ddl_ms_values.index(int(fixed_ddl_ms)))
 
     x = ctx.get_context()
     theta = np.asarray(agent.theta_hat, dtype=np.float64).reshape(-1)
@@ -214,12 +206,11 @@ def _action_to_env_vars(*, action_set: ActionSet, a_idx: int) -> Dict[str, str]:
     env_action = spec.to_env_action()
     k_idx, r0_idx, rstep_idx, ddl_idx = (int(env_action[0]), int(env_action[1]), int(env_action[2]), int(env_action[3]))
 
-    K = 10 + k_idx
-    r0_pct = 0.05 * float(r0_idx)
-    R0 = int(float(K) * r0_pct)
-    RSTEP = 1 + rstep_idx
-    ddl_ms_values = [100, 150, 200, 250, 300, 350]
-    DDL_MS = int(ddl_ms_values[int(ddl_idx)])
+    # New ActionSet semantics: indices are factor-level indices.
+    K = int(action_set.k_values[int(k_idx)])
+    R0 = int(action_set.r0_values[int(r0_idx)])
+    RSTEP = int(action_set.rstep_values[int(rstep_idx)])
+    DDL_MS = int(action_set.ddl_ms_values[int(ddl_idx)])
 
     return {
         "K": str(int(K)),
@@ -307,7 +298,10 @@ def main() -> int:
     if model_prefix.endswith(".npz"):
         model_prefix = model_prefix[:-4]
 
-    ge = _load_sender_ge(params_path=Path(args.ge_params), sender_id=int(args.sender_id), ge_key=str(args.ge_key))
+    params_path = Path(args.ge_params)
+    ge = _load_sender_ge(params_path=params_path, sender_id=int(args.sender_id), ge_key=str(args.ge_key))
+    sender_data = _load_sender_data(params_path=params_path, sender_id=int(args.sender_id))
+    rtt_ms = int(sender_data.get("rtt_ms", int(args.rtt_ms)))
     loss_mode = _ge_to_tc_gemodel_loss_mode(ge, h_loss_pct=float(args.ge_h_pct), k_loss_pct=float(args.ge_k_pct))
 
     file_path = _REPO_ROOT / "go" / "test_data" / f"eval_{int(args.file_bytes)}B.bin"
@@ -333,7 +327,7 @@ def main() -> int:
                 a_idx = int(args.force_a_idx)
                 bandit_debug = {"x": ctx.get_context().tolist(), "a_idx": int(a_idx), "score": float("nan"), "forced": True}
             else:
-                if int(args.fixed_ddl_ms) == 300:
+                if int(args.fixed_ddl_ms) > 0:
                     a_idx, bandit_debug = _bandit_select_action_mean_with_fixed_ddl(
                         agent=agent,
                         action_set=action_set,
@@ -350,7 +344,7 @@ def main() -> int:
 
             common_env = {
                 "BITRATE_MBPS": str(int(args.bitrate_mbps)),
-                "RTT_MS": str(int(args.rtt_ms)),
+                "RTT_MS": str(int(rtt_ms)),
                 "LOSS_MODE": str(loss_mode),
                 "LOSS_PCT": "0",
                 "FILE": str(file_path),
@@ -382,6 +376,14 @@ def main() -> int:
             except Exception:
                 timed_out = 0
 
+            dur_ms = 0.0
+            try:
+                dur_ms = float(kv.get("dur_ms", "0"))
+            except Exception:
+                dur_ms = 0.0
+
+            e2e_delay_ms = float(dur_ms) + float(rtt_ms) / 2.0
+
             obs = _extract_last_rl_observation(stderr) or {}
             delay_ms_avg = 0.0
             try:
@@ -391,6 +393,8 @@ def main() -> int:
 
             if timed_out or md5_ok != 1:
                 goodput = 0.0
+                dur_ms = 0.0
+                e2e_delay_ms = 0.0
                 delay_ms_avg = 0.0
 
             ddl_ms = int(env.get("DDL_MS", "0") or 0)
@@ -405,6 +409,8 @@ def main() -> int:
                 Trial(
                     rep=rep,
                     goodput_mbps=goodput,
+                    dur_ms=dur_ms,
+                    e2e_delay_ms=e2e_delay_ms,
                     delay_ms_avg=delay_ms_avg,
                     md5_ok=md5_ok,
                     timed_out=timed_out,
@@ -415,7 +421,7 @@ def main() -> int:
             action_rows.append({"rep": rep, **bandit_debug, **bandit_env})
 
             print(
-                f"rep={rep:02d} a_idx={a_idx:04d} ddl_ms={ddl_ms:4d} goodput_mbps={goodput:.3f} delay_ms_avg={delay_ms_avg:.3f} md5_ok={md5_ok} timed_out={timed_out}"
+                f"rep={rep:02d} a_idx={a_idx:04d} ddl_ms={ddl_ms:4d} goodput_mbps={goodput:.3f} dur_ms={dur_ms:.1f} e2e_delay_ms={e2e_delay_ms:.1f} delay_ms_avg={delay_ms_avg:.3f} md5_ok={md5_ok} timed_out={timed_out}"
             )
     except KeyboardInterrupt:
         interrupted = True
@@ -424,7 +430,7 @@ def main() -> int:
     with out_trials.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(
             f,
-            fieldnames=["rep", "bandit_action_idx", "ddl_ms", "goodput_mbps", "delay_ms_avg", "md5_ok", "timed_out"],
+            fieldnames=["rep", "bandit_action_idx", "ddl_ms", "goodput_mbps", "dur_ms", "e2e_delay_ms", "delay_ms_avg", "md5_ok", "timed_out"],
         )
         w.writeheader()
         for t in trials:
@@ -434,6 +440,8 @@ def main() -> int:
                     "bandit_action_idx": t.bandit_action_idx,
                     "ddl_ms": t.ddl_ms,
                     "goodput_mbps": f"{t.goodput_mbps:.6f}",
+                    "dur_ms": f"{t.dur_ms:.3f}",
+                    "e2e_delay_ms": f"{t.e2e_delay_ms:.3f}",
                     "delay_ms_avg": f"{t.delay_ms_avg:.6f}",
                     "md5_ok": t.md5_ok,
                     "timed_out": t.timed_out,
@@ -451,6 +459,7 @@ def main() -> int:
 
     goodputs = [t.goodput_mbps for t in trials]
     delays = [t.delay_ms_avg for t in trials]
+    e2e_delays = [t.e2e_delay_ms for t in trials]
     ok_rate = mean([1.0 if (t.md5_ok == 1 and t.timed_out == 0) else 0.0 for t in trials]) if trials else 0.0
 
     summary = {
@@ -461,7 +470,7 @@ def main() -> int:
         "ge": ge,
         "loss_mode": loss_mode,
         "bitrate_mbps": int(args.bitrate_mbps),
-        "rtt_ms": int(args.rtt_ms),
+        "rtt_ms": int(rtt_ms),
         "timeout_transfer_s": int(args.timeout_transfer_s),
         "reps": int(args.reps),
         "forced_a_idx": (int(args.force_a_idx) if int(args.force_a_idx) >= 0 else None),
@@ -471,6 +480,8 @@ def main() -> int:
         "median_goodput_mbps": median(goodputs) if goodputs else 0.0,
         "mean_delay_ms_avg": mean(delays) if delays else 0.0,
         "median_delay_ms_avg": median(delays) if delays else 0.0,
+        "mean_e2e_delay_ms": mean(e2e_delays) if e2e_delays else 0.0,
+        "median_e2e_delay_ms": median(e2e_delays) if e2e_delays else 0.0,
         "ok_rate": ok_rate,
         "interrupted": bool(interrupted),
     }
@@ -480,6 +491,7 @@ def main() -> int:
     print(f"loss_mode={loss_mode}")
     print(f"mean_goodput_mbps={summary['mean_goodput_mbps']:.3f} median_goodput_mbps={summary['median_goodput_mbps']:.3f} ok_rate={ok_rate:.3f}")
     print(f"mean_delay_ms_avg={summary['mean_delay_ms_avg']:.3f} median_delay_ms_avg={summary['median_delay_ms_avg']:.3f}")
+    print(f"mean_e2e_delay_ms={summary['mean_e2e_delay_ms']:.3f} median_e2e_delay_ms={summary['median_e2e_delay_ms']:.3f}")
     print("\nOUT:", out_dir)
     return 0
 

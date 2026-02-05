@@ -54,7 +54,7 @@ K=${K:-30}
 SYMBOL_BYTES=${SYMBOL_BYTES:-1032}
 R0=${R0:-6}
 W=${W:-8}
-DDL_MS=${DDL_MS:-100}
+DDL_MS=${DDL_MS:-150}
 RSTEP=${RSTEP:-4}
 ALPHA=${ALPHA:-0.6}
 ACK_EVERY=${ACK_EVERY:-8}
@@ -68,6 +68,9 @@ if [[ -z "${POST_WAIT+x}" || -z "${POST_WAIT}" ]]; then
 fi
 # Experiment-level transfer timeout in seconds (15s by default).
 TIMEOUT_S=${TIMEOUT_S:-15}
+# Connection establishment guard (client-side dial + QUIC handshake).
+CONNECT_TIMEOUT_S=${CONNECT_TIMEOUT_S:-2}
+CONNECT_RETRIES=${CONNECT_RETRIES:-5}
 # Server / client lifetime caps (defaults to TIMEOUT_S).
 SRV_TIMEOUT=${SRV_TIMEOUT:-${TIMEOUT_S}s}
 CLI_TIMEOUT=${CLI_TIMEOUT:-${TIMEOUT_S}s}
@@ -250,14 +253,54 @@ if [[ "${USE_ARQ}" == "1" ]]; then
   arq_flag="-arq"
 fi
 if command -v timeout >/dev/null 2>&1; then
-  timeout --signal=KILL ${TIMEOUT_S}s \
-    "$BIN_DIR/quicfec-client" -addr ${SRV_IP}:$PORT -file "$FILE" -N $((K+R0)) -K "$K" -L "$SYMBOL_BYTES" \
+  CONNECT_ATTEMPTS=0
+  while true; do
+    CONNECT_ATTEMPTS=$((CONNECT_ATTEMPTS + 1))
+    : >"$CLI_LOG" || true
+    unset RC || true
+    timeout --signal=KILL ${TIMEOUT_S}s \
+      "$BIN_DIR/quicfec-client" -addr ${SRV_IP}:$PORT -file "$FILE" -timeout ${TIMEOUT_S}s -connect-timeout ${CONNECT_TIMEOUT_S}s \
+        -N $((K+R0)) -K "$K" -L "$SYMBOL_BYTES" \
+        -post-wait "$POST_WAIT" -ack-every "$ACK_EVERY" -dgram-warn 1400 -transport "$TRANSPORT" $arq_flag -rx-ddl ${DDL_MS}ms -R0 "$R0" -W "$W" -Rstep "$RSTEP" -max-attempts "$MAX_ATTEMPTS" -loss 0 $pace_arg \
+        >"$CLI_LOG" 2>&1 || RC=$?
+    RC=${RC:-0}
+    if [[ "$RC" != "0" ]]; then
+      if grep -qE "^error: .*context deadline exceeded|^error:.*timeout|context deadline exceeded" "$CLI_LOG" 2>/dev/null; then
+        if [[ "$CONNECT_RETRIES" -gt 0 && "$CONNECT_ATTEMPTS" -lt "$CONNECT_RETRIES" ]]; then
+          kill $SP 2>/dev/null || true
+          kill -9 $SP 2>/dev/null || true
+          sudo ip netns exec "$NS" bash -lc "ulimit -n 1048576; '$BIN_DIR/quicfec-server' -addr ${SRV_IP}:$PORT -out '$OUT_DIR' -timeout ${SRV_TIMEOUT}" >"$SRV_LOG" 2>&1 & SP=$!
+          sleep 0.05
+          continue
+        fi
+      fi
+    fi
+    break
+  done
+else
+  CONNECT_ATTEMPTS=0
+  while true; do
+    CONNECT_ATTEMPTS=$((CONNECT_ATTEMPTS + 1))
+    : >"$CLI_LOG" || true
+    unset RC || true
+    "$BIN_DIR/quicfec-client" -addr ${SRV_IP}:$PORT -file "$FILE" -timeout ${TIMEOUT_S}s -connect-timeout ${CONNECT_TIMEOUT_S}s \
+      -N $((K+R0)) -K "$K" -L "$SYMBOL_BYTES" \
       -post-wait "$POST_WAIT" -ack-every "$ACK_EVERY" -dgram-warn 1400 -transport "$TRANSPORT" $arq_flag -rx-ddl ${DDL_MS}ms -R0 "$R0" -W "$W" -Rstep "$RSTEP" -max-attempts "$MAX_ATTEMPTS" -loss 0 $pace_arg \
       >"$CLI_LOG" 2>&1 || RC=$?
-else
-  "$BIN_DIR/quicfec-client" -addr ${SRV_IP}:$PORT -file "$FILE" -N $((K+R0)) -K "$K" -L "$SYMBOL_BYTES" \
-    -post-wait "$POST_WAIT" -ack-every "$ACK_EVERY" -dgram-warn 1400 -transport "$TRANSPORT" $arq_flag -rx-ddl ${DDL_MS}ms -R0 "$R0" -W "$W" -Rstep "$RSTEP" -max-attempts "$MAX_ATTEMPTS" -loss 0 $pace_arg \
-    >"$CLI_LOG" 2>&1 || RC=$?
+    RC=${RC:-0}
+    if [[ "$RC" != "0" ]]; then
+      if grep -qE "^error: .*context deadline exceeded|^error:.*timeout|context deadline exceeded" "$CLI_LOG" 2>/dev/null; then
+        if [[ "$CONNECT_RETRIES" -gt 0 && "$CONNECT_ATTEMPTS" -lt "$CONNECT_RETRIES" ]]; then
+          kill $SP 2>/dev/null || true
+          kill -9 $SP 2>/dev/null || true
+          sudo ip netns exec "$NS" bash -lc "ulimit -n 1048576; '$BIN_DIR/quicfec-server' -addr ${SRV_IP}:$PORT -out '$OUT_DIR' -timeout ${SRV_TIMEOUT}" >"$SRV_LOG" 2>&1 & SP=$!
+          sleep 0.05
+          continue
+        fi
+      fi
+    fi
+    break
+  done
 fi
 RC=${RC:-0}
 TIMED_OUT=0
@@ -560,6 +603,32 @@ if [[ -z "$RL_OBS" ]] || echo "$MERGED_LINE" | grep -q '"residual_erasures"[[:sp
   tail -n 120 "$SRV_LOG" >&2 || true
   echo "[diag] ---- client log tail ----" >&2
   tail -n 120 "$CLI_LOG" >&2 || true
+fi
+
+# Preserve logs on any integrity failure (md5 mismatch) or runtime failure.
+# Copy into the repo so they are accessible from the workspace.
+if [[ "$MD5_OK" == "0" || "$CLIENT_OK" == "0" || "$TIMED_OUT" == "1" ]]; then
+  KEEP_LOGS=1
+  echo "[diag] failure detected (md5_ok=${MD5_OK} client_ok=${CLIENT_OK} timed_out=${TIMED_OUT}); preserving logs" >&2
+  echo "[diag] server log: $SRV_LOG" >&2
+  echo "[diag] client log: $CLI_LOG" >&2
+  echo "[diag] ---- server log tail ----" >&2
+  tail -n 120 "$SRV_LOG" >&2 || true
+  echo "[diag] ---- client log tail ----" >&2
+  tail -n 120 "$CLI_LOG" >&2 || true
+fi
+
+if [[ "$KEEP_LOGS" == "1" && "${BG:-0}" != "1" ]]; then
+  LOG_DIR="$ROOT/go/test_data/logs"
+  mkdir -p "$LOG_DIR" 2>/dev/null || true
+  stamp=$(date +%Y%m%d_%H%M%S_%N)
+  srv_copy="$LOG_DIR/quic_fec_srv.${stamp}.log"
+  cli_copy="$LOG_DIR/quic_fec_cli.${stamp}.log"
+  cp -f "$SRV_LOG" "$srv_copy" 2>/dev/null || true
+  cp -f "$CLI_LOG" "$cli_copy" 2>/dev/null || true
+  echo "[diag] copied logs into workspace:" >&2
+  echo "[diag]   $srv_copy" >&2
+  echo "[diag]   $cli_copy" >&2
 fi
 
 # Echo a concise run summary (always)

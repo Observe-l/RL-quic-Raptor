@@ -477,10 +477,10 @@ def _action_to_env_vars(*, action_set: ActionSet, a_idx: int, symbol_bytes: int)
     env_action = spec.to_env_action()
     k_idx, r0_idx, rstep_idx, ddl_idx = (int(env_action[0]), int(env_action[1]), int(env_action[2]), int(env_action[3]))
 
-    K = 10 + k_idx
-    r0_pct = 0.05 * float(r0_idx)
-    R0 = int(float(K) * r0_pct)
-    RSTEP = 1 + rstep_idx
+    # New ActionSet semantics: indices are factor-level indices.
+    K = int(action_set.k_values[int(k_idx)])
+    R0 = int(action_set.r0_values[int(r0_idx)])
+    RSTEP = int(action_set.rstep_values[int(rstep_idx)])
 
     # DDL discretization comes from the bandit checkpoint's ActionSet.
     ddl_ms_values = list(action_set.ddl_ms_values)
@@ -506,19 +506,15 @@ def _action_to_env_vars(*, action_set: ActionSet, a_idx: int, symbol_bytes: int)
 def _aligned_obs_vec_from_rl_observation(*, rl_obs: Optional[Dict[str, Any]], ddl_ms: int, failed: bool) -> np.ndarray:
     """Construct training observation vector.
 
-        Layout matches python/fecenv_env.py:
-            [goodput, decode_latency_p95_ms, fec_overhead,
-       ctrl_tx_nack_msgs, arq_attempts_mean, residual_erasures,
-       fec_rate, ddl_ms]
+    Layout matches python/fecenv_env.py (new):
+      [goodput, fec_overhead, ctrl_tx_nack_msgs, done_flag, fec_rate, ddl_ms]
     """
 
     if failed or not isinstance(rl_obs, dict):
-        goodput_mbps = 0.0
-        decode_latency_p95_ms = 0.0
+        goodput = 0.0
         fec_overhead = 0.0
         ctrl_tx_nack_msgs = 0.0
-        arq_attempts_mean = 2.0
-        residual_erasures = 1.0
+        done_flag = 0.0
         fec_rate = 0.0
     else:
         def _f(k: str, default: float = 0.0) -> float:
@@ -527,22 +523,18 @@ def _aligned_obs_vec_from_rl_observation(*, rl_obs: Optional[Dict[str, Any]], dd
             except Exception:
                 return default
 
-        goodput_mbps = _f("goodput", _f("goodput_mbps", _f("goodput_arrival_mbps", _f("goodput_decode_mbps", 0.0))))
-        decode_latency_p95_ms = _f("decode_latency_p95_ms", 0.0)
+        goodput = _f("goodput", _f("goodput_mbps", _f("goodput_arrival_mbps", _f("goodput_decode_mbps", 0.0))))
         fec_overhead = _f("fec_overhead", _f("fec_overhead_pct_arrival", 0.0))
         ctrl_tx_nack_msgs = _f("ctrl_tx_nack_msgs", 0.0)
-        arq_attempts_mean = _f("arq_attempts_mean", 0.0)
-        residual_erasures = _f("residual_erasures", 0.0)
+        done_flag = _f("done_flag", 1.0)
         fec_rate = _f("fec_rate", 0.0)
 
     return np.asarray(
         [
-            float(goodput_mbps),
-            float(decode_latency_p95_ms),
+            float(goodput),
             float(fec_overhead),
             float(ctrl_tx_nack_msgs),
-            float(arq_attempts_mean),
-            float(residual_erasures),
+            float(np.clip(float(done_flag), 0.0, 1.0)),
             float(np.clip(float(fec_rate), 0.0, 1.0)),
             float(int(ddl_ms)),
         ],
@@ -836,6 +828,17 @@ def _load_sender_ge(*, params_path: Path, sender_id: int, ge_key: str) -> Dict[s
     return ge
 
 
+def _load_sender_data(*, params_path: Path, sender_id: int) -> Dict[str, Any]:
+    data = json.loads(params_path.read_text(encoding="utf-8"))
+    senders = data.get("senders")
+    if not isinstance(senders, dict):
+        raise ValueError("invalid 'senders' in ge params")
+    s = senders.get(str(sender_id))
+    if not isinstance(s, dict):
+        raise ValueError(f"sender_id={sender_id} not found")
+    return s
+
+
 def _method_env_fixed_fec(*, k: int, r0: int, rstep: int, ddl_ms: int, symbol_bytes: int) -> Dict[str, str]:
     return {
         "K": str(int(k)),
@@ -915,6 +918,11 @@ def _run_one(
     rx_bytes = _to_int(kv, "rx_bytes", 0)
     file_bytes = _to_int(kv, "file_bytes", int(file_path.stat().st_size))
 
+    # E2E delay definition for recording/plotting:
+    #   e2e_delay_ms = dur_ms + rtt_ms/2
+    # (Server-side dur_ms is the transfer completion time excluding full RTT; we add RTT/2.)
+    e2e_delay_ms = float(dur_ms) + 0.5 * float(rtt_ms)
+
     # Failures -> goodput=0. For delay task we use success-only samples downstream.
     if timed_out or md5_ok != 1:
         goodput = 0.0
@@ -922,6 +930,8 @@ def _run_one(
     return {
         "dur_ms": int(dur_ms),
         "dur_ms_client": int(dur_ms_client),
+        "e2e_delay_ms": float(e2e_delay_ms),
+        "rtt_ms": int(rtt_ms),
         "timed_out": int(timed_out),
         "md5_ok": int(md5_ok),
         "client_ok": int(client_ok),
@@ -995,11 +1005,12 @@ def main() -> int:
     ap.add_argument(
         "--duration-field",
         type=str,
-        default="dur_ms",
-        choices=["dur_ms", "dur_ms_client"],
+        default="e2e_delay_ms",
+        choices=["e2e_delay_ms", "dur_ms", "dur_ms_client"],
         help=(
             "Which duration to record as dur_ms in results/plots. "
-            "dur_ms=server-side e2e completion when available (recommended for fairness); "
+            "e2e_delay_ms = dur_ms + rtt_ms/2 (recommended); "
+            "dur_ms=server-side completion; "
             "dur_ms_client=client wall-clock total (includes ARQ drain / ack wait)."
         ),
     )
@@ -1310,6 +1321,16 @@ def main() -> int:
                 seed32=int(group_seed32),
             )
 
+            # In GE mode, RTT is defined per sender in quic_fec_params.json.
+            if loss_profile != "iid":
+                try:
+                    sender_data = _load_sender_data(params_path=params_path, sender_id=int(scenario_id))
+                    rtt_ms_sender = sender_data.get("rtt_ms")
+                    if rtt_ms_sender is not None:
+                        rtt_ms_group = int(rtt_ms_sender)
+                except Exception:
+                    pass
+
             # Bandit state is per-(sender,task) sequence.
             ctx = ContextBuilder(cfg=ctx_cfg)
             ctx.reset()
@@ -1357,7 +1378,8 @@ def main() -> int:
                 )
                 rl_obs = _extract_last_rl_observation(stderr)
                 failed = bool(int(m["timed_out"]) or int(m["md5_ok"]) != 1)
-                dur_record = int(m.get(duration_field, m.get("dur_ms", 0)) or 0)
+                dur_record_ms = float(m.get(duration_field, m.get("dur_ms", 0)) or 0.0)
+                dur_record = int(round(dur_record_ms))
                 overhead_ratio = float(m.get("overhead_ratio", 0.0) or 0.0)
                 fec_overhead_ratio = _overhead_ratio_from_rl_observation(rl_obs)
                 obs_vec = _aligned_obs_vec_from_rl_observation(rl_obs=rl_obs, ddl_ms=warmup_ddl_ms, failed=failed)
@@ -1382,6 +1404,7 @@ def main() -> int:
                             "warmup_step": int(w_i),
                             "policy": str(args.bandit_policy),
                             "rtt_ms": int(rtt_ms_group),
+                            "e2e_delay_ms": float(m.get("e2e_delay_ms", 0.0) or 0.0),
                             "fec_overhead_ratio": float(fec_overhead_ratio),
                             "dur_ms_server": int(m.get("dur_ms", 0) or 0),
                             "dur_ms_client": int(m.get("dur_ms_client", 0) or 0),
@@ -1440,7 +1463,8 @@ def main() -> int:
                 )
                 rl_obs = _extract_last_rl_observation(stderr)
                 failed = bool(int(m["timed_out"]) or int(m["md5_ok"]) != 1)
-                dur_record = int(m.get(duration_field, m.get("dur_ms", 0)) or 0)
+                dur_record_ms = float(m.get(duration_field, m.get("dur_ms", 0)) or 0.0)
+                dur_record = int(round(dur_record_ms))
                 overhead_ratio = float(m.get("overhead_ratio", 0.0) or 0.0)
                 fec_overhead_ratio = _overhead_ratio_from_rl_observation(rl_obs)
                 obs_vec = _aligned_obs_vec_from_rl_observation(rl_obs=rl_obs, ddl_ms=ddl_ms, failed=failed)
@@ -1465,6 +1489,7 @@ def main() -> int:
                             "bandit": dbg,
                             "policy": str(args.bandit_policy),
                             "rtt_ms": int(rtt_ms_group),
+                            "e2e_delay_ms": float(m.get("e2e_delay_ms", 0.0) or 0.0),
                             "fec_overhead_ratio": float(fec_overhead_ratio),
                             "dur_ms_server": int(m.get("dur_ms", 0) or 0),
                             "dur_ms_client": int(m.get("dur_ms_client", 0) or 0),
@@ -1487,7 +1512,8 @@ def main() -> int:
                     net_env=run_env,
                 )
                 overhead2 = float(m2.get("overhead_ratio", 0.0) or 0.0)
-                dur2_record = int(m2.get(duration_field, m2.get("dur_ms", 0)) or 0)
+                dur2_record_ms = float(m2.get(duration_field, m2.get("dur_ms", 0)) or 0.0)
+                dur2_record = int(round(dur2_record_ms))
                 rows.append(
                     Row(
                         task=task,
@@ -1505,6 +1531,7 @@ def main() -> int:
                         a_idx=-1,
                         extra={
                             "rtt_ms": int(rtt_ms_group),
+                            "e2e_delay_ms": float(m2.get("e2e_delay_ms", 0.0) or 0.0),
                             "dur_ms_server": int(m2.get("dur_ms", 0) or 0),
                             "dur_ms_client": int(m2.get("dur_ms_client", 0) or 0),
                             "client_ok": int(m2.get("client_ok", 1) or 1),
@@ -1532,7 +1559,8 @@ def main() -> int:
                 rl3 = _extract_last_rl_observation(stderr3)
                 overhead3 = float(m3.get("overhead_ratio", 0.0) or 0.0)
                 fec_overhead3 = _overhead_ratio_from_rl_observation(rl3)
-                dur3_record = int(m3.get(duration_field, m3.get("dur_ms", 0)) or 0)
+                dur3_record_ms = float(m3.get(duration_field, m3.get("dur_ms", 0)) or 0.0)
+                dur3_record = int(round(dur3_record_ms))
                 rows.append(
                     Row(
                         task=task,
@@ -1552,6 +1580,7 @@ def main() -> int:
                             "fec": {"K": 20, "R0": 2, "RSTEP": 2, "DDL_MS": 100},
                             "fec_overhead_ratio": float(fec_overhead3),
                             "rtt_ms": int(rtt_ms_group),
+                            "e2e_delay_ms": float(m3.get("e2e_delay_ms", 0.0) or 0.0),
                             "dur_ms_server": int(m3.get("dur_ms", 0) or 0),
                             "dur_ms_client": int(m3.get("dur_ms_client", 0) or 0),
                             "client_ok": int(m3.get("client_ok", 1) or 1),
@@ -1579,7 +1608,8 @@ def main() -> int:
                 rl4 = _extract_last_rl_observation(stderr4)
                 overhead4 = float(m4.get("overhead_ratio", 0.0) or 0.0)
                 fec_overhead4 = _overhead_ratio_from_rl_observation(rl4)
-                dur4_record = int(m4.get(duration_field, m4.get("dur_ms", 0)) or 0)
+                dur4_record_ms = float(m4.get(duration_field, m4.get("dur_ms", 0)) or 0.0)
+                dur4_record = int(round(dur4_record_ms))
                 rows.append(
                     Row(
                         task=task,
@@ -1599,6 +1629,7 @@ def main() -> int:
                             "fec": {"K": 20, "R0": 6, "RSTEP": 4, "DDL_MS": 100},
                             "fec_overhead_ratio": float(fec_overhead4),
                             "rtt_ms": int(rtt_ms_group),
+                            "e2e_delay_ms": float(m4.get("e2e_delay_ms", 0.0) or 0.0),
                             "dur_ms_server": int(m4.get("dur_ms", 0) or 0),
                             "dur_ms_client": int(m4.get("dur_ms_client", 0) or 0),
                             "client_ok": int(m4.get("client_ok", 1) or 1),

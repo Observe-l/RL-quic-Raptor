@@ -217,13 +217,22 @@ def _extract_last_rl_observation(stderr: str) -> Optional[Dict[str, Any]]:
 
 
 def _aligned_obs_vec_from_rl_observation(*, rl_obs: Optional[Dict[str, Any]], ddl_ms: int, failed: bool) -> np.ndarray:
+    """Map [rl-observation] into the *new* 6-dim obs layout used by ContextBuilder.
+
+    Layout:
+      0 goodput
+      1 fec_overhead
+      2 ctrl_tx_nack_msgs
+      3 done_flag
+      4 fec_rate
+      5 ddl_ms
+    """
+
     if failed or not isinstance(rl_obs, dict):
-        goodput_mbps = 0.0
-        decode_latency_p95_ms = 0.0
+        goodput = 0.0
         fec_overhead = 0.0
         ctrl_tx_nack_msgs = 0.0
-        arq_attempts_mean = 2.0
-        residual_erasures = 1.0
+        done_flag = 0.0
         fec_rate = 0.0
     else:
 
@@ -233,25 +242,21 @@ def _aligned_obs_vec_from_rl_observation(*, rl_obs: Optional[Dict[str, Any]], dd
             except Exception:
                 return default
 
-        goodput_mbps = _f(
+        goodput = _f(
             "goodput",
             _f("goodput_mbps", _f("goodput_arrival_mbps", _f("goodput_decode_mbps", 0.0))),
         )
-        decode_latency_p95_ms = _f("decode_latency_p95_ms", 0.0)
         fec_overhead = _f("fec_overhead", _f("fec_overhead_pct_arrival", 0.0))
         ctrl_tx_nack_msgs = _f("ctrl_tx_nack_msgs", 0.0)
-        arq_attempts_mean = _f("arq_attempts_mean", 0.0)
-        residual_erasures = _f("residual_erasures", 0.0)
+        done_flag = _f("done_flag", 1.0)
         fec_rate = _f("fec_rate", 0.0)
 
     return np.asarray(
         [
-            float(goodput_mbps),
-            float(decode_latency_p95_ms),
+            float(goodput),
             float(fec_overhead),
             float(ctrl_tx_nack_msgs),
-            float(arq_attempts_mean),
-            float(residual_erasures),
+            float(np.clip(float(done_flag), 0.0, 1.0)),
             float(np.clip(float(fec_rate), 0.0, 1.0)),
             float(int(ddl_ms)),
         ],
@@ -304,6 +309,16 @@ def _load_sender_ge(*, params_path: Path, sender_id: int, ge_key: str) -> Dict[s
         raise ValueError(f"sender_id={sender_id} missing {ge_key}")
     return ge
 
+def _load_sender_data(*, params_path: Path, sender_id: int) -> Dict[str, Any]:
+    data = json.loads(params_path.read_text(encoding="utf-8"))
+    senders = data.get("senders")
+    if not isinstance(senders, dict):
+        raise ValueError("invalid 'senders' in ge params")
+    s = senders.get(str(sender_id))
+    if not isinstance(s, dict):
+        raise ValueError(f"sender_id={sender_id} not found")
+    return s
+
 
 @dataclass
 class RunRow:
@@ -320,6 +335,8 @@ class RunRow:
     rx_bytes: int
     file_bytes: int
     overhead_ratio: float
+    rtt_ms: int
+    e2e_delay_ms: float
 
 
 def _load_runrows_from_runs_csv(runs_csv: Path) -> List[RunRow]:
@@ -339,6 +356,8 @@ def _load_runrows_from_runs_csv(runs_csv: Path) -> List[RunRow]:
                         md5_ok=int(row.get("md5_ok", "0") or "0"),
                         success=int(row.get("success", "0") or "0"),
                         dur_ms=int(row.get("dur_ms", "0") or "0"),
+                        rtt_ms=int(row.get("rtt_ms", "0") or "0"),
+                        e2e_delay_ms=float(row.get("e2e_delay_ms", row.get("dur_ms", "0")) or "0"),
                         tx_bytes=int(row.get("tx_bytes", "0") or "0"),
                         rx_bytes=int(row.get("rx_bytes", "0") or "0"),
                         file_bytes=int(row.get("file_bytes", "0") or "0"),
@@ -402,6 +421,8 @@ def _load_flec_runrows_from_jsonl(flec_jsonl: Path) -> List[RunRow]:
                     md5_ok=int(ok),
                     success=int(ok),
                     dur_ms=int(dur_ms),
+                    rtt_ms=0,
+                    e2e_delay_ms=float(dur_ms),
                     tx_bytes=int(tx_total),
                     rx_bytes=0,
                     file_bytes=int(file_bytes),
@@ -443,13 +464,11 @@ def _action_to_env_vars(
         int(env_action[3]),
     )
 
-    K = 10 + k_idx
-    r0_pct = 0.05 * float(r0_idx)
-    R0 = int(float(K) * r0_pct)
-    RSTEP = 1 + rstep_idx
-
-    ddl_ms_values = [100, 150, 200, 250, 300, 350]
-    ddl_ms = int(ddl_ms_values[int(ddl_idx)])
+    # New ActionSet semantics: indices are factor-level indices.
+    K = int(action_set.k_values[int(k_idx)])
+    R0 = int(action_set.r0_values[int(r0_idx)])
+    RSTEP = int(action_set.rstep_values[int(rstep_idx)])
+    ddl_ms = int(action_set.ddl_ms_values[int(ddl_idx)])
     if int(ddl_ms_override) > 0:
         ddl_ms = int(ddl_ms_override)
 
@@ -534,8 +553,12 @@ def _run_one(
     if file_bytes > 0 and tx_bytes > 0:
         overhead_ratio = max(0.0, (float(tx_bytes) - float(file_bytes)) / float(file_bytes))
 
+    e2e_delay_ms = float(dur_ms) + float(rtt_ms) / 2.0
+
     return {
         "dur_ms": int(dur_ms),
+        "rtt_ms": int(rtt_ms),
+        "e2e_delay_ms": float(e2e_delay_ms),
         "timed_out": int(timed_out),
         "md5_ok": int(md5_ok),
         "success": int(success),
@@ -692,9 +715,11 @@ def main() -> int:
     for sender_id in sender_ids:
         if plot_only:
             continue
+        sender_data = _load_sender_data(params_path=params_path, sender_id=int(sender_id))
         ge = _load_sender_ge(params_path=params_path, sender_id=int(sender_id), ge_key=str(args.ge_key))
+        rtt_ms = int(sender_data.get("rtt_ms", int(args.rtt_ms)))
         loss_mode = _ge_to_tc_gemodel_loss_mode(ge, h_loss_pct=float(args.ge_h_pct), k_loss_pct=float(args.ge_k_pct))
-        print(f"\n[sender] {int(sender_id)} loss_mode={loss_mode}")
+        print(f"\n[sender] {int(sender_id)} rtt_ms={int(rtt_ms)} loss_mode={loss_mode}")
 
         # Bandit state per sender (single sweep, update context sequentially).
         ctx = ContextBuilder(ctx_cfg)
@@ -713,7 +738,7 @@ def main() -> int:
             method="bandit",
             loss_mode=loss_mode,
             bitrate_mbps=int(args.bitrate_mbps),
-            rtt_ms=int(args.rtt_ms),
+            rtt_ms=int(rtt_ms),
             timeout_transfer_s=int(args.timeout_transfer_s),
             timeout_s=int(args.timeout_s),
             file_path=file_path,
@@ -738,7 +763,7 @@ def main() -> int:
                 method="bandit",
                 loss_mode=loss_mode,
                 bitrate_mbps=int(args.bitrate_mbps),
-                rtt_ms=int(args.rtt_ms),
+                rtt_ms=int(rtt_ms),
                 timeout_transfer_s=int(args.timeout_transfer_s),
                 timeout_s=int(args.timeout_s),
                 file_path=file_path,
@@ -759,6 +784,8 @@ def main() -> int:
                     md5_ok=int(m["md5_ok"]),
                     success=int(m["success"]),
                     dur_ms=int(m["dur_ms"]),
+                    rtt_ms=int(m.get("rtt_ms", int(rtt_ms))),
+                    e2e_delay_ms=float(m.get("e2e_delay_ms", float(m["dur_ms"]))),
                     tx_bytes=int(m["tx_bytes"]),
                     rx_bytes=int(m["rx_bytes"]),
                     file_bytes=int(m["file_bytes"]),
@@ -771,7 +798,7 @@ def main() -> int:
                 method="quic_bbrv2",
                 loss_mode=loss_mode,
                 bitrate_mbps=int(args.bitrate_mbps),
-                rtt_ms=int(args.rtt_ms),
+                rtt_ms=int(rtt_ms),
                 timeout_transfer_s=int(args.timeout_transfer_s),
                 timeout_s=int(args.timeout_s),
                 file_path=file_path,
@@ -787,6 +814,8 @@ def main() -> int:
                     md5_ok=int(m_q["md5_ok"]),
                     success=int(m_q["success"]),
                     dur_ms=int(m_q["dur_ms"]),
+                    rtt_ms=int(m_q.get("rtt_ms", int(rtt_ms))),
+                    e2e_delay_ms=float(m_q.get("e2e_delay_ms", float(m_q["dur_ms"]))),
                     tx_bytes=int(m_q["tx_bytes"]),
                     rx_bytes=int(m_q["rx_bytes"]),
                     file_bytes=int(m_q["file_bytes"]),
@@ -807,7 +836,7 @@ def main() -> int:
                 method=method_f1,
                 loss_mode=loss_mode,
                 bitrate_mbps=int(args.bitrate_mbps),
-                rtt_ms=int(args.rtt_ms),
+                rtt_ms=int(rtt_ms),
                 timeout_transfer_s=int(args.timeout_transfer_s),
                 timeout_s=int(args.timeout_s),
                 file_path=file_path,
@@ -824,6 +853,8 @@ def main() -> int:
                     md5_ok=int(m_f1["md5_ok"]),
                     success=int(m_f1["success"]),
                     dur_ms=int(m_f1["dur_ms"]),
+                    rtt_ms=int(m_f1.get("rtt_ms", int(rtt_ms))),
+                    e2e_delay_ms=float(m_f1.get("e2e_delay_ms", float(m_f1["dur_ms"]))),
                     tx_bytes=int(m_f1["tx_bytes"]),
                     rx_bytes=int(m_f1["rx_bytes"]),
                     file_bytes=int(m_f1["file_bytes"]),
@@ -844,7 +875,7 @@ def main() -> int:
                 method=method_f2,
                 loss_mode=loss_mode,
                 bitrate_mbps=int(args.bitrate_mbps),
-                rtt_ms=int(args.rtt_ms),
+                rtt_ms=int(rtt_ms),
                 timeout_transfer_s=int(args.timeout_transfer_s),
                 timeout_s=int(args.timeout_s),
                 file_path=file_path,
@@ -861,6 +892,8 @@ def main() -> int:
                     md5_ok=int(m_f2["md5_ok"]),
                     success=int(m_f2["success"]),
                     dur_ms=int(m_f2["dur_ms"]),
+                    rtt_ms=int(m_f2.get("rtt_ms", int(rtt_ms))),
+                    e2e_delay_ms=float(m_f2.get("e2e_delay_ms", float(m_f2["dur_ms"]))),
                     tx_bytes=int(m_f2["tx_bytes"]),
                     rx_bytes=int(m_f2["rx_bytes"]),
                     file_bytes=int(m_f2["file_bytes"]),
@@ -892,6 +925,8 @@ def main() -> int:
                 "md5_ok",
                 "success",
                 "dur_ms",
+                "rtt_ms",
+                "e2e_delay_ms",
                 "tx_bytes",
                 "rx_bytes",
                 "file_bytes",
@@ -911,6 +946,8 @@ def main() -> int:
                     "md5_ok": r.md5_ok,
                     "success": r.success,
                     "dur_ms": r.dur_ms,
+                    "rtt_ms": r.rtt_ms,
+                    "e2e_delay_ms": f"{r.e2e_delay_ms:.3f}",
                     "tx_bytes": r.tx_bytes,
                     "rx_bytes": r.rx_bytes,
                     "file_bytes": r.file_bytes,
@@ -938,7 +975,7 @@ def main() -> int:
             for ddl_ms in ddl_list:
                 complete_n = 0
                 for r in rs:
-                    if r.success == 1 and r.dur_ms > 0 and r.dur_ms <= int(ddl_ms):
+                    if r.success == 1 and r.e2e_delay_ms > 0 and float(r.e2e_delay_ms) <= float(ddl_ms):
                         complete_n += 1
                 complete_ratio = float(complete_n) / float(len(rs))
 
@@ -992,7 +1029,7 @@ def main() -> int:
         "ddl_ms": ddl_list,
         "methods": methods,
         "overhead_definition": "(tx_bytes - file_bytes)/file_bytes using host veth0 tx_bytes delta; includes headers",
-        "complete_definition": "success && dur_ms <= ddl_ms (ddl thresholds used only in post-processing)",
+        "complete_definition": "success && e2e_delay_ms <= ddl_ms (e2e_delay_ms = dur_ms + rtt_ms/2)",
         "plot_only": bool(plot_only),
     }
     if plot_only:
@@ -1010,7 +1047,7 @@ def main() -> int:
                 "ge_key": str(args.ge_key),
                 "sender_ids": sender_ids,
                 "bitrate_mbps": int(args.bitrate_mbps),
-                "rtt_ms": int(args.rtt_ms),
+                "rtt_ms": "per-sender (from ge_params['senders'][sid]['rtt_ms']); fallback to --rtt-ms",
                 "timeout_transfer_s": int(args.timeout_transfer_s),
                 "timeout_s": int(args.timeout_s),
                 "file_bytes": int(args.file_bytes),

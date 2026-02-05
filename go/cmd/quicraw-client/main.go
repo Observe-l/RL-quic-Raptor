@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -26,6 +27,7 @@ func main() {
 		alpn         = flag.String("alpn", "quic-raw", "ALPN protocol")
 		filePath     = flag.String("file", "go/test_data/train_FD001.txt", "file to send")
 		timeout      = flag.Duration("timeout", 60*time.Second, "client timeout")
+		connectTO    = flag.Duration("connect-timeout", 3*time.Second, "max time allowed for dialing + QUIC handshake (0=use -timeout)")
 		postWait     = flag.Duration("post-wait", 0, "linger after sending")
 		measureDelay = flag.Bool("measure-delay", true, "send framed records for delay measurement")
 		packetBytes  = flag.Int("packet-bytes", 1200, "payload bytes per record")
@@ -56,9 +58,19 @@ func main() {
 		},
 	}
 	t0 := time.Now()
-	conn, err := quic.DialAddr(ctx, *addr, tlsConf, qconf)
+	dialCtx := ctx
+	cancelDial := func() {}
+	if *connectTO > 0 && *connectTO < *timeout {
+		dialCtx, cancelDial = context.WithTimeout(ctx, *connectTO)
+	}
+	defer cancelDial()
+	conn, err := quic.DialAddr(dialCtx, *addr, tlsConf, qconf)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "dial error:", err)
+		if errors.Is(err, context.DeadlineExceeded) {
+			fmt.Fprintln(os.Stderr, "dial timeout:", err)
+		} else {
+			fmt.Fprintln(os.Stderr, "dial error:", err)
+		}
 		os.Exit(1)
 	}
 	dialDur = time.Since(t0)

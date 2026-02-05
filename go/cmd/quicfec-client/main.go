@@ -16,6 +16,8 @@ func main() {
 		alpn      = flag.String("alpn", "quic-fec", "ALPN protocol")
 		filePath  = flag.String("file", "go/test_data/train_FD001.txt", "file to send")
 		insecure  = flag.Bool("insecure", true, "skip TLS verification")
+		timeout   = flag.Duration("timeout", 60*time.Second, "client timeout (overall)")
+		connectTO = flag.Duration("connect-timeout", 3*time.Second, "max time allowed for dialing + QUIC handshake (0=use -timeout)")
 		N         = flag.Int("N", 32, "block length N")
 		K         = flag.Int("K", 26, "source symbols K")
 		L         = flag.Int("L", 1200, "symbol bytes L")
@@ -34,9 +36,13 @@ func main() {
 		maxAtt    = flag.Int("max-attempts", 5, "ARQ max attempts per cluster")
 	)
 	flag.Parse()
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	opts := fecquic.SendOptions{K: *K, N: *N, L: *L, InsecureTLS: *insecure, DropProb: *loss, PaceEach: *pace, BlockPause: *blkPause, RxDDL: *rxDDL, WarnDgramSize: *warn, PostWait: *postWait, AckEvery: *ackEvery, Transport: *transport, UseARQ: *arq, InitialRepairs: *R0, WindowW: *W, RStep: *Rstep, MaxAttempts: *maxAtt}
+	if *connectTO > 0 && *connectTO > *timeout {
+		// Avoid making connect-timeout the effective total timeout.
+		*connectTO = *timeout
+	}
+	opts := fecquic.SendOptions{K: *K, N: *N, L: *L, InsecureTLS: *insecure, DropProb: *loss, PaceEach: *pace, BlockPause: *blkPause, RxDDL: *rxDDL, WarnDgramSize: *warn, PostWait: *postWait, AckEvery: *ackEvery, Transport: *transport, UseARQ: *arq, InitialRepairs: *R0, WindowW: *W, RStep: *Rstep, MaxAttempts: *maxAtt, DialTimeout: *connectTO}
 	if err := fecquic.ClientSendFile(ctx, *addr, *alpn, *filePath, opts); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)

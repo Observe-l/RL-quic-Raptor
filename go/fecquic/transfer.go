@@ -38,6 +38,7 @@ type SendOptions struct {
 	InsecureTLS bool
 	DropProb    float64
 	Seed        int64
+	DialTimeout time.Duration // bounds dialing + QUIC handshake; 0 means "use ctx"
 	PaceEach    time.Duration
 	BlockPause  time.Duration
 	// RxDDL is the receiver decode deadline per block.
@@ -143,7 +144,13 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		InitialConnectionReceiveWindow: 16 * 1024 * 1024,
 	}
 	t0 := time.Now()
-	conn, err := quic.DialAddr(ctx, addr, tlsConf, qconf)
+	dialCtx := ctx
+	cancelDial := func() {}
+	if opts.DialTimeout > 0 {
+		dialCtx, cancelDial = context.WithTimeout(ctx, opts.DialTimeout)
+	}
+	conn, err := quic.DialAddr(dialCtx, addr, tlsConf, qconf)
+	cancelDial()
 	if err != nil {
 		return err
 	}
@@ -725,6 +732,9 @@ afterArqDrain:
 		select {
 		case d := <-doneMsgCh:
 			fmt.Fprintf(os.Stderr, "[fec-client-done] wait_ms=%d ok=%d written=%d\n", time.Since(t0).Milliseconds(), d.Ok, d.Written)
+			if d.Ok == 0 {
+				return fmt.Errorf("receiver reported not-ok (ok=0) written=%d", d.Written)
+			}
 		case <-ctx.Done():
 			return ctx.Err()
 		}
