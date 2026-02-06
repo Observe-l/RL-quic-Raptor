@@ -99,6 +99,41 @@ def _to_int(d: Dict[str, str], k: str, default: int = 0) -> int:
         return default
 
 
+def _to_float(d: Dict[str, str], k: str, default: float = 0.0) -> float:
+    try:
+        return float(d.get(k, str(default)))
+    except Exception:
+        return default
+
+
+def _overhead_quic_ratio_from_kv(*, kv: Dict[str, str], file_bytes: int) -> float:
+    """Compute overhead from QUIC attempted send bytes (pre-qdisc).
+
+    Prefers script-emitted QUIC stats when available:
+      - raw_quic_overhead_ratio / fec_quic_overhead_ratio
+      - raw_quic_sent_bytes / fec_quic_sent_bytes
+
+    Falls back to veth tx_bytes-derived overhead when QUIC stats are missing.
+    """
+
+    for key in ("raw_quic_overhead_ratio", "fec_quic_overhead_ratio"):
+        if key in kv:
+            v = _to_float(kv, key, 0.0)
+            if np.isfinite(v) and v >= 0.0:
+                return float(v)
+
+    for sent_key in ("raw_quic_sent_bytes", "fec_quic_sent_bytes"):
+        if sent_key in kv:
+            sent_bytes = _to_int(kv, sent_key, 0)
+            if file_bytes > 0 and sent_bytes > 0:
+                return float(max(0.0, (float(sent_bytes) - float(file_bytes)) / float(file_bytes)))
+
+    tx_bytes = _to_int(kv, "tx_bytes", 0)
+    if file_bytes > 0 and tx_bytes > 0:
+        return float(max(0.0, (float(tx_bytes) - float(file_bytes)) / float(file_bytes)))
+    return 0.0
+
+
 def _ensure_file_of_size(*, file_path: Path, file_bytes: int) -> None:
     file_path.parent.mkdir(parents=True, exist_ok=True)
     if not file_path.exists() or file_path.stat().st_size != int(file_bytes):
@@ -513,6 +548,8 @@ def _run_one(
             **common_env,
             "QUIC_FEC_CC_BYPASS": "0",
             "QUIC_FEC_CC_ALGO": "bbrv2",
+            # Make overhead reflect QUIC attempted send bytes.
+            "RAW_STATS": "1",
         }
         _stdout, stderr = _run_bash_script(
             script=_REPO_ROOT / "scripts" / "quicraw_run_once.sh",
@@ -522,7 +559,7 @@ def _run_one(
     elif method.startswith("fec_") or method == "bandit":
         if not fec_env:
             raise ValueError("fec_env is required for fec/bandit")
-        env = {**common_env, **fec_env}
+        env = {**common_env, **fec_env, "FEC_STATS": "1"}
         _stdout, stderr = _run_bash_script(
             script=_REPO_ROOT / "scripts" / "quicfec_run_once.sh",
             env=env,
@@ -549,9 +586,7 @@ def _run_one(
     file_bytes = _to_int(kv, "file_bytes", int(file_path.stat().st_size))
     success = 1 if (timed_out == 0 and md5_ok == 1) else 0
 
-    overhead_ratio = 0.0
-    if file_bytes > 0 and tx_bytes > 0:
-        overhead_ratio = max(0.0, (float(tx_bytes) - float(file_bytes)) / float(file_bytes))
+    overhead_ratio = _overhead_quic_ratio_from_kv(kv=kv, file_bytes=int(file_bytes))
 
     e2e_delay_ms = float(dur_ms) + float(rtt_ms) / 2.0
 
@@ -1028,7 +1063,7 @@ def main() -> int:
     meta: Dict[str, Any] = {
         "ddl_ms": ddl_list,
         "methods": methods,
-        "overhead_definition": "(tx_bytes - file_bytes)/file_bytes using host veth0 tx_bytes delta; includes headers",
+        "overhead_definition": "(quic_sent_bytes - file_bytes)/file_bytes using QUIC tracer attempted send bytes (pre-qdisc); requires RAW_STATS/FEC_STATS",
         "complete_definition": "success && e2e_delay_ms <= ddl_ms (e2e_delay_ms = dur_ms + rtt_ms/2)",
         "plot_only": bool(plot_only),
     }

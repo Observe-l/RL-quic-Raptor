@@ -160,17 +160,30 @@ def _parse_kv_from_run_line(line: str) -> Dict[str, str]:
 
 
 def _overhead_ratio_from_run_kv(*, kv: Dict[str, str], file_path: Path) -> float:
-    """Compute overhead as extra transmitted bytes over payload bytes.
+    """Compute overhead as extra QUIC attempted send bytes over payload bytes.
 
-    Matches python/experiments/overhead_vs_completion_scatter.py:
-        overhead_ratio = max(0, (tx_bytes - file_bytes) / file_bytes)
+    Prefer QUIC-layer stats emitted by scripts (pre-qdisc):
+      - raw_quic_overhead_ratio / fec_quic_overhead_ratio
+      - raw_quic_sent_bytes / fec_quic_sent_bytes
 
-    Note: tx_bytes is collected at the NIC counter level (includes headers,
-    retransmissions, etc). This makes it comparable across quicraw / quicfec.
+    Fall back to veth tx_bytes if QUIC stats are missing.
     """
 
-    tx_bytes = _to_int(kv, "tx_bytes", 0)
     file_bytes = _to_int(kv, "file_bytes", int(file_path.stat().st_size))
+
+    for key in ("raw_quic_overhead_ratio", "fec_quic_overhead_ratio"):
+        if key in kv:
+            v = _to_float(kv, key, 0.0)
+            if np.isfinite(v) and v >= 0.0:
+                return float(v)
+
+    for sent_key in ("raw_quic_sent_bytes", "fec_quic_sent_bytes"):
+        if sent_key in kv:
+            sent_bytes = _to_int(kv, sent_key, 0)
+            if file_bytes > 0 and sent_bytes > 0:
+                return float(max(0.0, (float(sent_bytes) - float(file_bytes)) / float(file_bytes)))
+
+    tx_bytes = _to_int(kv, "tx_bytes", 0)
     if file_bytes > 0 and tx_bytes > 0:
         return float(max(0.0, (float(tx_bytes) - float(file_bytes)) / float(file_bytes)))
     return 0.0
@@ -890,6 +903,8 @@ def _run_one(
             **common_env,
             "QUIC_FEC_CC_BYPASS": "0",
             "QUIC_FEC_CC_ALGO": "bbrv2",
+            # Make overhead reflect QUIC attempted send bytes.
+            "RAW_STATS": "1",
         }
         if str(env.get("_COMPARE_FAST", "0")) == "1":
             env.update({"SKIP_BUILD": "1", "SKIP_NETNS_RESET": "1"})
@@ -897,7 +912,7 @@ def _run_one(
     elif method.startswith("fec_") or method == "bandit":
         if not fec_env:
             raise ValueError("fec_env is required for fec/bandit methods")
-        env = {**common_env, **fec_env}
+        env = {**common_env, **fec_env, "FEC_STATS": "1"}
         _stdout, stderr = _run_bash_script(script=_REPO_ROOT / "scripts" / "quicfec_run_once.sh", env=env, timeout_s=timeout_s)
     else:
         raise ValueError(f"unknown method={method}")

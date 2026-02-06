@@ -281,7 +281,8 @@ def main() -> int:
 	ap.add_argument(
 		"--enable-quic-overhead",
 		action="store_true",
-		help="Enable QUIC-layer stats (RAW_STATS/FEC_STATS) and compute overhead_quic_pct from QUIC attempted send bytes.",
+		default=True,
+		help="Enable QUIC-layer stats (RAW_STATS/FEC_STATS). Default: enabled. Overhead is computed from QUIC attempted send bytes when available.",
 	)
 
 	# QUIC-FEC knobs (passed to scripts/quicfec_run_once.sh)
@@ -393,7 +394,7 @@ def main() -> int:
 						ok=int(raw_ok),
 						goodput_mbps=float(_to_float(raw_kv, "s_mbps", 0.0)),
 						dur_ms=int(_to_int(raw_kv, "dur_ms", 0)),
-						overhead_ratio=float(_overhead_ratio_from_kv(kv=raw_kv)),
+						overhead_ratio=float(_overhead_quic_ratio_from_kv(kv=raw_kv)),
 						overhead_quic_ratio=float(_overhead_quic_ratio_from_kv(kv=raw_kv)),
 						extra={"run": raw_kv},
 					)
@@ -432,7 +433,7 @@ def main() -> int:
 						ok=int(fec_ok),
 						goodput_mbps=float(_to_float(fec_kv, "s_mbps", 0.0)),
 						dur_ms=int(_to_int(fec_kv, "dur_ms", 0)),
-						overhead_ratio=float(_overhead_ratio_from_kv(kv=fec_kv)),
+						overhead_ratio=float(_overhead_quic_ratio_from_kv(kv=fec_kv)),
 						overhead_quic_ratio=float(_overhead_quic_ratio_from_kv(kv=fec_kv)),
 						extra={"run": fec_kv},
 					)
@@ -440,8 +441,8 @@ def main() -> int:
 
 				print(
 					f"rep={rep:02d} file={file_label} loss={loss_mode} "
-					f"raw(ok={raw_ok} dur_ms={_to_int(raw_kv,'dur_ms',0)} ov={_overhead_ratio_from_kv(kv=raw_kv)*100:.2f}% ov_quic={_overhead_quic_ratio_from_kv(kv=raw_kv)*100:.2f}%) "
-					f"fec(ok={fec_ok} dur_ms={_to_int(fec_kv,'dur_ms',0)} ov={_overhead_ratio_from_kv(kv=fec_kv)*100:.2f}% ov_quic={_overhead_quic_ratio_from_kv(kv=fec_kv)*100:.2f}%)"
+					f"raw(ok={raw_ok} dur_ms={_to_int(raw_kv,'dur_ms',0)} ov={_overhead_quic_ratio_from_kv(kv=raw_kv)*100:.2f}%) "
+					f"fec(ok={fec_ok} dur_ms={_to_int(fec_kv,'dur_ms',0)} ov={_overhead_quic_ratio_from_kv(kv=fec_kv)*100:.2f}%)"
 				)
 
 	out_jsonl = out_dir / "results.jsonl"
@@ -509,8 +510,8 @@ def main() -> int:
 				"run_tag_effective": run_tag_effective,
 				"net_env": net_env,
 				"fec": {"K": int(args.k), "R0": int(args.r0), "RSTEP": int(args.rstep), "SYMBOL_BYTES": int(args.symbol_bytes)},
-				"overhead_definition": "overhead_ratio = max(0, (tx_bytes - file_bytes)/file_bytes), tx_bytes from host veth NIC counters (post-qdisc)",
-				"overhead_quic_definition": "overhead_quic_ratio = max(0, (quic_sent_bytes - file_bytes)/file_bytes), quic_sent_bytes from QUIC tracer (pre-qdisc); requires --enable-quic-overhead",
+				"overhead_definition": "overhead_ratio = max(0, (quic_sent_bytes - file_bytes)/file_bytes), quic_sent_bytes from QUIC tracer (attempted send bytes, pre-qdisc)",
+				"overhead_quic_definition": "overhead_quic_ratio = max(0, (quic_sent_bytes - file_bytes)/file_bytes), quic_sent_bytes from QUIC tracer (attempted send bytes, pre-qdisc)",
 			},
 			indent=2,
 			ensure_ascii=False,
