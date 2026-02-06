@@ -992,7 +992,10 @@ def main() -> int:
         type=str,
         default="fixed",
         choices=["fixed", "random"],
-        help="RTT mode: fixed uses --rtt-ms; random samples from --rtt-random-ms (deterministic by --seed).",
+        help=(
+            "RTT mode for iid loss only: fixed uses --rtt-ms; random samples from --rtt-random-ms (deterministic by --seed). "
+            "When --loss-profile=ge, RTT is always taken per-sender from --ge-params (quic_fec_params.json) to match training."
+        ),
     )
     ap.add_argument(
         "--rtt-random-ms",
@@ -1215,6 +1218,13 @@ def main() -> int:
             lm = _ge_to_tc_gemodel_loss_mode(ge, h_loss_pct=float(args.ge_h_pct), k_loss_pct=float(args.ge_k_pct))
             scenarios.append((int(sid), str(lm)))
 
+    def _rtt_ms_for_ge_sender(sender_id: int) -> int:
+        sender_data = _load_sender_data(params_path=params_path, sender_id=int(sender_id))
+        rtt_ms_sender = sender_data.get("rtt_ms")
+        if rtt_ms_sender is None:
+            raise ValueError(f"sender_id={int(sender_id)} missing rtt_ms in {params_path}")
+        return int(rtt_ms_sender)
+
     # Load bandit checkpoint
     agent, _cfg, _ctx0, ctx_cfg, action_set, _t0 = load_checkpoint(path_prefix=model_prefix)
 
@@ -1280,11 +1290,16 @@ def main() -> int:
         except Exception as e:
             raise RuntimeError("sudo privileges required for --fast=1; run 'sudo -v' once and retry") from e
 
+        setup_rtt_ms = int(args.rtt_ms)
+        if loss_profile != "iid" and sender_ids:
+            # In GE mode, match training: RTT comes from per-sender data.
+            setup_rtt_ms = _rtt_ms_for_ge_sender(int(sender_ids[0]))
+
         setup_env = {
             "SETUP_ONLY": "1",
             "SKIP_BUILD": "1",
             "BITRATE_MBPS": str(int(args.bitrate_mbps)),
-            "RTT_MS": str(int(args.rtt_ms)),
+            "RTT_MS": str(int(setup_rtt_ms)),
             # Loss is configured per run; here we just ensure the namespace exists.
             "LOSS_MODE": "none",
         }
@@ -1329,22 +1344,16 @@ def main() -> int:
             # Keep RTT fixed for the entire group (same loss rate / sender + same task),
             # across warmup + all reps. This makes the bandit environment stationary enough.
             group_seed32 = (int(args.seed) + 9876541 + 1000003 * int(scenario_id) + 9176 * int(task_seed)) & 0xFFFFFFFF
-            rtt_ms_group = _choose_rtt_ms(
-                mode=rtt_mode,
-                fixed_rtt_ms=int(args.rtt_ms),
-                candidates=rtt_candidates,
-                seed32=int(group_seed32),
-            )
-
-            # In GE mode, RTT is defined per sender in quic_fec_params.json.
             if loss_profile != "iid":
-                try:
-                    sender_data = _load_sender_data(params_path=params_path, sender_id=int(scenario_id))
-                    rtt_ms_sender = sender_data.get("rtt_ms")
-                    if rtt_ms_sender is not None:
-                        rtt_ms_group = int(rtt_ms_sender)
-                except Exception:
-                    pass
+                # In GE mode, RTT is defined per sender in quic_fec_params.json (match training env).
+                rtt_ms_group = _rtt_ms_for_ge_sender(int(scenario_id))
+            else:
+                rtt_ms_group = _choose_rtt_ms(
+                    mode=rtt_mode,
+                    fixed_rtt_ms=int(args.rtt_ms),
+                    candidates=rtt_candidates,
+                    seed32=int(group_seed32),
+                )
 
             # Bandit state is per-(sender,task) sequence.
             ctx = ContextBuilder(cfg=ctx_cfg)
@@ -1737,9 +1746,9 @@ def main() -> int:
         "file_delay": str(file_delay),
         "file_goodput": str(file_goodput),
         "bitrate_mbps": int(args.bitrate_mbps),
-        "rtt_ms": int(args.rtt_ms),
-        "rtt_mode": str(rtt_mode),
-        "rtt_random_ms": rtt_candidates,
+        "rtt_ms": ("per-sender (from ge_params['senders'][sid]['rtt_ms'])" if loss_profile != "iid" else int(args.rtt_ms)),
+        "rtt_mode": ("per_sender" if loss_profile != "iid" else str(rtt_mode)),
+        "rtt_random_ms": (None if loss_profile != "iid" else rtt_candidates),
         "loss_profile": str(loss_profile),
         "iid_loss_pcts": [float(x) for x in iid_loss_pcts],
         "scenarios": [{"sender_id": int(sid), "loss_mode": str(lm)} for sid, lm in scenarios],
