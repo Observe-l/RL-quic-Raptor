@@ -592,23 +592,23 @@ class Row:
 _METHOD_ORDER = [
     "bandit",
     "quic_bbrv2",
-    "fec_k20_r0_2_rstep_2",
-    "fec_k20_r0_6_rstep_4",
+    "fec_k30_r0_2_rstep_6",
+    "fec_k30_r0_10_rstep_6",
 ]
 
 _METHOD_LABELS = {
     "bandit": "QUIC-FEC-Bandit",
     "quic_bbrv2": "QUIC",
-    "fec_k20_r0_2_rstep_2": "QUIC-FEC(K=20,R0=2,Rstep=2)",
-    "fec_k20_r0_6_rstep_4": "QUIC-FEC(K=20,R0=6,Rstep=4)",
+    "fec_k30_r0_2_rstep_6": "IR-FEC1",
+    "fec_k30_r0_10_rstep_6": "IR-FEC2",
     "flec": "FLEC",
 }
 
 _METHOD_COLORS = {
     "bandit": "#1f77b4",
     "quic_bbrv2": "#ff7f0e",
-    "fec_k20_r0_2_rstep_2": "#2ca02c",
-    "fec_k20_r0_6_rstep_4": "#d62728",
+    "fec_k30_r0_2_rstep_6": "#2ca02c",
+    "fec_k30_r0_10_rstep_6": "#d62728",
     "flec": "#9467bd",
 }
 
@@ -1119,7 +1119,7 @@ def main() -> int:
     ap.add_argument(
         "--which",
         type=str,
-        default="both",
+        default="delay",
         choices=["delay", "goodput", "both"],
         help="Which experiments to run: delay (128KB), goodput (3MB), or both.",
     )
@@ -1171,7 +1171,7 @@ def main() -> int:
             title="",
             xlabel="E2E delay per message (ms)",
             series=delay_series,
-            xlim=(0.0, 300.0),
+            xlim=(120.0, 500.0),
             show_ok_n_in_legend=False,
         )
 
@@ -1577,11 +1577,11 @@ def main() -> int:
                 )
 
                 # Fixed FEC #1
-                env_f1 = _method_env_fixed_fec(k=20, r0=2, rstep=2, ddl_ms=100, symbol_bytes=int(args.symbol_bytes))
+                env_f1 = _method_env_fixed_fec(k=30, r0=2, rstep=6, ddl_ms=150, symbol_bytes=int(args.symbol_bytes))
                 if use_fast:
                     env_f1.update({"SKIP_BUILD": "1", "SKIP_NETNS_RESET": "1", "SKIP_SYSCTL": "1"})
                 m3, stderr3 = _run_one(
-                    method="fec_k20_r0_2_rstep_2",
+                    method="fec_k30_r0_2_rstep_6",
                     task=task,
                     loss_mode=loss_mode,
                     bitrate_mbps=int(args.bitrate_mbps),
@@ -1600,7 +1600,7 @@ def main() -> int:
                 rows.append(
                     Row(
                         task=task,
-                        method="fec_k20_r0_2_rstep_2",
+                        method="fec_k30_r0_2_rstep_6",
                         sender_id=int(scenario_id),
                         loss_mode=str(loss_mode),
                         rep=int(rep),
@@ -1613,7 +1613,7 @@ def main() -> int:
                         overhead_ratio=float(overhead3),
                         a_idx=-1,
                         extra={
-                            "fec": {"K": 20, "R0": 2, "RSTEP": 2, "DDL_MS": 100},
+                            "fec": {"K": 30, "R0": 2, "RSTEP": 6, "DDL_MS": 150},
                             "fec_overhead_ratio": float(fec_overhead3),
                             "rtt_ms": int(rtt_ms_group),
                             "e2e_delay_ms": float(m3.get("e2e_delay_ms", 0.0) or 0.0),
@@ -1626,11 +1626,11 @@ def main() -> int:
                 )
 
                 # Fixed FEC #2
-                env_f2 = _method_env_fixed_fec(k=20, r0=6, rstep=4, ddl_ms=100, symbol_bytes=int(args.symbol_bytes))
+                env_f2 = _method_env_fixed_fec(k=30, r0=10, rstep=6, ddl_ms=150, symbol_bytes=int(args.symbol_bytes))
                 if use_fast:
                     env_f2.update({"SKIP_BUILD": "1", "SKIP_NETNS_RESET": "1", "SKIP_SYSCTL": "1"})
                 m4, stderr4 = _run_one(
-                    method="fec_k20_r0_6_rstep_4",
+                    method="fec_k30_r0_10_rstep_6",
                     task=task,
                     loss_mode=loss_mode,
                     bitrate_mbps=int(args.bitrate_mbps),
@@ -1649,7 +1649,7 @@ def main() -> int:
                 rows.append(
                     Row(
                         task=task,
-                        method="fec_k20_r0_6_rstep_4",
+                        method="fec_k30_r0_10_rstep_6",
                         sender_id=int(scenario_id),
                         loss_mode=str(loss_mode),
                         rep=int(rep),
@@ -1662,7 +1662,7 @@ def main() -> int:
                         overhead_ratio=float(overhead4),
                         a_idx=-1,
                         extra={
-                            "fec": {"K": 20, "R0": 6, "RSTEP": 4, "DDL_MS": 100},
+                            "fec": {"K": 30, "R0": 10, "RSTEP": 6, "DDL_MS": 150},
                             "fec_overhead_ratio": float(fec_overhead4),
                             "rtt_ms": int(rtt_ms_group),
                             "e2e_delay_ms": float(m4.get("e2e_delay_ms", 0.0) or 0.0),
@@ -1801,7 +1801,7 @@ def main() -> int:
             title="",
             xlabel="E2E delay per message (ms)",
             series=delay_series,
-            xlim=(0.0, 300.0),
+            xlim=(120.0, 500.0),
             show_ok_n_in_legend=False,
         )
 

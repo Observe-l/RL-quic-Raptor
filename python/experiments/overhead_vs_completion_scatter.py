@@ -652,8 +652,8 @@ def main() -> int:
         help="If >0, overrides DDL_MS for all QUIC-FEC runs (bandit + fixed). Default 0 keeps compare-style per-method DDL_MS.",
     )
     ap.add_argument("--symbol-bytes", type=int, default=1200)
-    ap.add_argument("--fixed1", type=str, default="20,2,2", help="Fixed FEC #1 as k,r0,rstep (default: 20,2,2)")
-    ap.add_argument("--fixed2", type=str, default="20,6,4", help="Fixed FEC #2 as k,r0,rstep (default: 20,6,4)")
+    ap.add_argument("--fixed1", type=str, default="30,2,6", help="Fixed FEC #1 as k,r0,rstep (default: 30,2,6)")
+    ap.add_argument("--fixed2", type=str, default="30,10,6", help="Fixed FEC #2 as k,r0,rstep (default: 30,10,6)")
     ap.add_argument(
         "--fixed-ddl-ms",
         type=int,
@@ -1119,13 +1119,15 @@ def main() -> int:
     for i, m in enumerate(fec_methods):
         mm = _FEC_METHOD_RE.match(m)
         if mm:
-            method_labels[m] = (
-                f"QUIC-FEC(K={int(mm.group('k'))},R0={int(mm.group('r0'))},Rstep={int(mm.group('rstep'))})"
-            )
+            method_labels[m] = f"QUIC-FEC(K={int(mm.group('k'))},R0={int(mm.group('r0'))},Rstep={int(mm.group('rstep'))})"
         else:
             method_labels[m] = m
         method_colors.setdefault(m, fec_palette[i % len(fec_palette)])
         method_markers.setdefault(m, fec_markers[i % len(fec_markers)])
+
+    # Rename the two fixed baselines in legends.
+    method_labels["fec_k30_r0_2_rstep_6"] = "IR-FEC1"
+    method_labels["fec_k30_r0_10_rstep_6"] = "IR-FEC2"
 
     # Plot: 2x2 subplots (one per ddl), each subplot overlays 4 methods.
     _configure_matplotlib()

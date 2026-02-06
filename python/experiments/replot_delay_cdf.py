@@ -17,22 +17,22 @@ import matplotlib.pyplot as plt  # noqa: E402
 _METHOD_ORDER = [
     "bandit",
     "quic_bbrv2",
-    "fec_k20_r0_2_rstep_2",
-    "fec_k20_r0_6_rstep_4",
+    "fec_k30_r0_2_rstep_6",
+    "fec_k30_r0_10_rstep_6",
 ]
 
 _METHOD_LABELS = {
     "bandit": "QUIC-FEC-Bandit",
     "quic_bbrv2": "QUIC",
-    "fec_k20_r0_2_rstep_2": "QUIC-FEC(K=20,R0=2,Rstep=2)",
-    "fec_k20_r0_6_rstep_4": "QUIC-FEC(K=20,R0=6,Rstep=4)",
+    "fec_k30_r0_2_rstep_6": "IR-FEC1",
+    "fec_k30_r0_10_rstep_6": "IR-FEC2",
 }
 
 _METHOD_COLORS = {
     "bandit": "#1f77b4",
     "quic_bbrv2": "#ff7f0e",
-    "fec_k20_r0_2_rstep_2": "#2ca02c",
-    "fec_k20_r0_6_rstep_4": "#d62728",
+    "fec_k30_r0_2_rstep_6": "#2ca02c",
+    "fec_k30_r0_10_rstep_6": "#d62728",
 }
 
 
