@@ -263,7 +263,7 @@ def main() -> int:
 	ap = argparse.ArgumentParser(description="Compare QUIC-FEC vs QUIC-raw under fixed bw/rtt and loss modes")
 	ap.add_argument("--reps", type=int, default=20)
 	ap.add_argument("--bitrate-mbps", type=int, default=10)
-	ap.add_argument("--rtt-ms", type=int, default=100)
+	ap.add_argument("--rtt-ms", type=int, default=60)
 	ap.add_argument(
 		"--loss-modes",
 		type=str,
@@ -286,9 +286,9 @@ def main() -> int:
 	)
 
 	# QUIC-FEC knobs (passed to scripts/quicfec_run_once.sh)
-	ap.add_argument("--k", type=int, default=30)
-	ap.add_argument("--r0", type=int, default=12)
-	ap.add_argument("--rstep", type=int, default=6)
+	ap.add_argument("--k", type=int, default=40)
+	ap.add_argument("--r0", type=int, default=8)
+	ap.add_argument("--rstep", type=int, default=8)
 	ap.add_argument("--symbol-bytes", type=int, default=1200)
 
 	ap.add_argument("--run-tag", type=str, default="")

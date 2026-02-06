@@ -139,11 +139,22 @@ def _choose_rtt_ms(*, mode: str, fixed_rtt_ms: int, candidates: Sequence[int], s
 
 
 def _extract_last_line(prefix: str, s: str) -> Optional[str]:
-    last = None
-    for line in (s or "").splitlines():
-        if line.startswith(prefix):
-            last = line
-    return last
+        """Return the last line that starts with prefix.
+
+        Notes:
+            - When QUIC stats / progress logging is enabled, stderr may contain carriage
+                returns ("\r") that can prefix or embed log lines. Normalize these so we
+                don't miss the final "[run]" summary.
+            - Some bash tooling can also emit leading whitespace; accept that.
+        """
+
+        last: Optional[str] = None
+        normalized = (s or "").replace("\r", "\n")
+        for raw_line in normalized.splitlines():
+                line = (raw_line or "").lstrip()
+                if line.startswith(prefix):
+                        last = line
+        return last
 
 
 def _parse_kv_from_run_line(line: str) -> Dict[str, str]:
@@ -1017,6 +1028,7 @@ def main() -> int:
         default="0.1,0.2,0.3,0.4,0.5",
         help="Comma list of i.i.d loss rates in percent (e.g. '0.1,0.2,0.3,0.4,0.5').",
     )
+    # Training harness default is 15s (see scripts/quic{raw,fec}_run_once.sh and python/fecenv_env.py).
     ap.add_argument("--timeout-transfer-s", type=int, default=5)
     ap.add_argument("--timeout-s", type=int, default=180, help="Python-side subprocess timeout; must exceed transfer timeout")
 

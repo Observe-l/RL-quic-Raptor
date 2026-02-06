@@ -99,6 +99,12 @@ def main() -> int:
         help="Directory containing results.csv (e.g., python/results/paper-delay)",
     )
     ap.add_argument(
+        "--xmin-ms",
+        type=float,
+        default=100.0,
+        help="Lower x-axis limit for the CDF plot (ms)",
+    )
+    ap.add_argument(
         "--xmax-ms",
         type=float,
         default=300.0,
@@ -138,8 +144,8 @@ def main() -> int:
     ax.set_xlabel("E2E delay per message (ms)")
     ax.set_ylabel("CDF")
     ax.set_ylim(0.0, 1.0)
-    if args.xmax_ms is not None and float(args.xmax_ms) > 0:
-        ax.set_xlim(0.0, float(args.xmax_ms))
+    # if args.xmax_ms is not None and float(args.xmax_ms) > 0:
+    ax.set_xlim(float(args.xmin_ms), float(args.xmax_ms))
 
     ax.legend(loc="lower right", frameon=True)
     fig.tight_layout()
