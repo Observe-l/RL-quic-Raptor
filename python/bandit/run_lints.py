@@ -334,8 +334,8 @@ def main() -> int:
         "bitrate_mbps": int(args.bitrate_mbps),
         "timeout_sec": int(args.timeout_sec),
         "train_file_bytes": int(args.train_file_bytes),
-        "ddl_ms_values": [100, 125, 150, 175, 200],
-        "k_values": list(range(20, 51, 2)),
+        "ddl_ms_values": [25, 40, 55, 70],
+        "k_values": list(range(20, 61, 2)),
         "r0_values": list(range(0, 21, 2)),
         "rstep_values": list(range(0, 21, 2)),
         "reward_variant": str(args.reward_variant),
@@ -350,8 +350,8 @@ def main() -> int:
         # Avoid curriculum overriding our externally supplied parameters.
         "randomize_net_params": False,
         "randomize_net_params_enabled": False,
-        # Ignore timeouts/md5 failures (do not feed invalid steps into the bandit).
-        "ignore_invalid_transfers": True,
+        # Failures are part of the learning signal/statistics.
+        "ignore_invalid_transfers": False,
         # Bandit should only consume the environment observation (no debug info).
         "normalize_obs": False,
     }
@@ -373,7 +373,7 @@ def main() -> int:
             loaded_from = str(load_prefix)
 
     if loaded_from is None:
-        ddl_ms_values = [100, 125, 150, 175, 200]
+        ddl_ms_values = [25, 40, 55, 70]
         action_set = ActionSet(ddl_ms_values=ddl_ms_values)
         ctx_cfg = ContextConfig(ewma_alpha=float(args.ctx_alpha), window=int(args.ctx_window))
         ctx = ContextBuilder(ctx_cfg)
@@ -409,7 +409,7 @@ def main() -> int:
         pass
 
     print(
-        "note: reward overhead term uses fec_overhead = tx_repair_symbols / tx_source_symbols (sender-side ratio)"
+        "note: reward overhead term uses fec_overhead = quic_overhead_ratio = max(0,(quic_sent_bytes-file_bytes)/file_bytes)"
     )
 
     # Breakpoint semantics: --steps is treated as the target total step index.

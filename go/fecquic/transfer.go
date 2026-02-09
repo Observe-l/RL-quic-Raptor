@@ -41,8 +41,8 @@ type SendOptions struct {
 	DialTimeout time.Duration // bounds dialing + QUIC handshake; 0 means "use ctx"
 	PaceEach    time.Duration
 	BlockPause  time.Duration
-	// RxDDL is the receiver decode deadline per block.
-	// It is sent once in the FileHeader and applied by the server.
+	// RxDDL is the receiver ARQ soft deadline (DDL_MS), sent once in the FileHeader.
+	// The server applies it to schedule NACKs for seen blocks (idle-from-lastSymAt).
 	// 0 means "not specified".
 	RxDDL         time.Duration
 	WarnDgramSize int           // bytes; 0 disables
@@ -399,7 +399,34 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 						if rstep < 0 {
 							rstep = 4
 						}
+						// Policy: append repairs on every NACK, but avoid many small ARQ rounds.
+						// Ensure we send at least enough to cover the current deficit, capped.
 						cand := toSend + rstep
+						maxBurst := 24
+						if v := os.Getenv("QUIC_FEC_ARQ_MAX_REPAIR_BURST"); v != "" {
+							if n, err := strconv.Atoi(v); err == nil && n > 0 {
+								maxBurst = n
+							}
+						}
+						if deficit > 0 {
+							need := deficit
+							if need > maxBurst {
+								need = maxBurst
+							}
+							if need > cand {
+								cand = need
+							}
+						}
+						// Wire format uses uint8 SymID. Do not allow ESI to exceed 255, otherwise
+						// SymID wraps and we start re-sending duplicate IDs (wasting bandwidth and
+						// preventing decoding from ever finishing).
+						if bt.nextESI >= 256 {
+							continue
+						}
+						remain := 256 - bt.nextESI
+						if cand > remain {
+							cand = remain
+						}
 						if cand <= 0 {
 							continue
 						}
@@ -532,6 +559,10 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		initN := curK + initRepairs
 		if initN < curK {
 			initN = curK
+		}
+		// SymID is uint8 on the wire; do not emit more than 256 distinct symbol IDs per block.
+		if initN > 256 {
+			initN = 256
 		}
 		// Initialize attempt to -1 so the first NACK with attempt_idx=0 is processed once.
 		bt := &blockTx{K: curK, L: L, enc: enc, nextESI: curK, repairsOut: 0, attempt: -1}
@@ -827,12 +858,13 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 		if err := hdr.UnmarshalBinary(hdrBytes); err != nil {
 			return "", err
 		}
-		// Client-controlled receiver deadline: when present, override RXOptions.DDL.
-		prevDDL := rx.DDL
+		// Client-controlled receiver soft deadline (DDL_MS) carried in the header.
+		// This controls ARQ NACK timing for seen blocks (idle-from-lastSymAt).
+		prevSoft := rx.SoftDDL
 		if hdr.RxDDLMS > 0 {
-			rx.DDL = time.Duration(hdr.RxDDLMS) * time.Millisecond
+			rx.SoftDDL = time.Duration(hdr.RxDDLMS) * time.Millisecond
 		}
-		devLogRxDDL("server_rxddl_before=%s hdr_rxddl_ms=%d server_rxddl_after=%s", prevDDL, hdr.RxDDLMS, rx.DDL)
+		devLogRxDDL("server_softddl_before=%s hdr_ddl_ms=%d server_softddl_after=%s", prevSoft, hdr.RxDDLMS, rx.SoftDDL)
 		// Try read optional filename (u16 len + bytes); safe if EOF
 		var lb [2]byte
 		n, err := io.ReadFull(s, lb[:])
@@ -911,8 +943,8 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 		lastDgramChange := time.Now()
 		// Make inactivity more tolerant for high-RTT/high-redundancy runs.
 		inactivity := 3 * time.Second
-		if rx.DDL > 0 {
-			if d := 2 * rx.DDL; d > inactivity {
+		if rx.DecodeDDL > 0 {
+			if d := 2 * rx.DecodeDDL; d > inactivity {
 				inactivity = d
 			}
 		}
@@ -1317,7 +1349,10 @@ func ListenAndServeLoopWithRX(ctx context.Context, addr, alpn, outDir string, tl
 	ecnStats := NewECNStats()
 	ln, err := quic.ListenAddr(addr, tlsConf, &quic.Config{
 		Tracer: func(ctx context.Context, p logging.Perspective, cid logging.ConnectionID) *logging.ConnectionTracer {
-			return devWrapConnTracer(NewECNConnTracer(ecnStats))
+			return devWrapConnTracer(logging.NewMultiplexedConnectionTracer(
+				NewECNConnTracer(ecnStats),
+				newServerSRTTTracer(),
+			))
 		},
 		EnableDatagrams:                true,
 		KeepAlivePeriod:                2 * time.Second,

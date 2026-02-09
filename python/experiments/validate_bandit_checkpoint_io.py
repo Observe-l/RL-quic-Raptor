@@ -83,6 +83,13 @@ def _check_actionset_indices(action_set) -> None:
     ddl_vals = list(action_set.ddl_ms_values)
     _assert(len(ddl_vals) > 0, "ddl_ms_values empty")
 
+    k_dim = int(len(getattr(action_set, "k_values", [])))
+    r0_dim = int(len(getattr(action_set, "r0_values", [])))
+    rs_dim = int(len(getattr(action_set, "rstep_values", [])))
+    _assert(k_dim > 0, "k_values empty")
+    _assert(r0_dim > 0, "r0_values empty")
+    _assert(rs_dim > 0, "rstep_values empty")
+
     # Spot-check a few actions (evenly spaced) for index validity.
     idxs = sorted({0, n - 1, n // 2, n // 3, (2 * n) // 3})
     for i in idxs:
@@ -90,9 +97,9 @@ def _check_actionset_indices(action_set) -> None:
         env_action = spec.to_env_action().astype(int).reshape(-1)
         _assert(env_action.size == 4, f"env_action must have 4 dims; got {env_action}")
         k_idx, r0_idx, rstep_idx, ddl_idx = map(int, env_action.tolist())
-        _assert(0 <= k_idx <= 54, f"k_idx out of range: {k_idx}")
-        _assert(0 <= r0_idx <= 20, f"r0_idx out of range: {r0_idx}")
-        _assert(0 <= rstep_idx <= 7, f"rstep_idx out of range: {rstep_idx}")
+        _assert(0 <= k_idx < k_dim, f"k_idx out of range: {k_idx} (dim={k_dim})")
+        _assert(0 <= r0_idx < r0_dim, f"r0_idx out of range: {r0_idx} (dim={r0_dim})")
+        _assert(0 <= rstep_idx < rs_dim, f"rstep_idx out of range: {rstep_idx} (dim={rs_dim})")
         _assert(0 <= ddl_idx < len(ddl_vals), f"ddl_idx out of range: {ddl_idx} (len={len(ddl_vals)})")
 
 

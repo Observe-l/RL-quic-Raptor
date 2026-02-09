@@ -38,7 +38,7 @@ class Action:
     # - K: source symbols per block
     # - R0: initial repair symbols per block
     # - RSTEP: incremental repair step size
-    # - ddl_ms: receiver decode deadline used for ARQ/NACK timing
+    # - ddl_ms: receiver ARQ soft deadline (used for ARQ/NACK timing)
     K: int = 30
     R0: int = 6
     RSTEP: int = 4
@@ -237,11 +237,15 @@ class QuicFecRunner:
             r0 = int(k)
         env["R0"] = str(int(r0))
         env["DDL_MS"] = str(int(action.ddl_ms))
+        # Receiver decode/check pacing. Keep consistent with compare_fec_vs_raw_bbrv2_fixed defaults.
+        env["DECODE_DDL_MS"] = os.environ.get("DECODE_DDL_MS", "25")
 
         # ARQ policy (RSTEP is controlled by the policy).
         env["W"] = os.environ.get("W", "8")
         env["RSTEP"] = str(int(getattr(action, "RSTEP", int(os.environ.get("RSTEP", "4")))))
-        env["MAX_ATTEMPTS"] = os.environ.get("MAX_ATTEMPTS", "5")
+        # Default: no cap (0) to match compare harness semantics.
+        env["MAX_ATTEMPTS"] = os.environ.get("MAX_ATTEMPTS", "0")
+        env["USE_ARQ"] = os.environ.get("USE_ARQ", "1")
 
         # CC is always enabled with BBRv2.
         env["QUIC_FEC_CC_BYPASS"] = "0"
@@ -267,6 +271,13 @@ class QuicFecRunner:
         env.setdefault("QUIC_FEC_ARQ_DRAIN_CAP_MS", "3000")
         if self.obs_wait_secs is not None:
             env.setdefault("OBS_WAIT_SECS", str(int(self.obs_wait_secs)))
+
+        # Keep harness-side timeouts aligned with the Python-side timeout budget.
+        env.setdefault("TIMEOUT_S", str(int(self.timeout_sec)))
+
+        # Default-enable QUIC-layer attempted-send stats for log comparability.
+        # The harness will export QUIC_FEC_STATS=1 when FEC_STATS=1.
+        env.setdefault("FEC_STATS", os.environ.get("FEC_STATS", "1"))
 
         train_file = self._ensure_train_file()
         if train_file:
@@ -334,6 +345,46 @@ class QuicFecRunner:
             if p.returncode != 0:
                 raise RuntimeError(f"harness failed: code={p.returncode} stderr={p.stderr[-400:]}\nstdout={p.stdout[-400:]}")
             obs = self._read_last_obs(obs_json_path)
+
+            # Parse the harness [run] line (printed to stderr) for QUIC overhead fields.
+            # This matches compare_fec_vs_raw_bbrv2_fixed.py's overhead definition.
+            try:
+                run_line = None
+                for line in (p.stderr or "").splitlines():
+                    if line.startswith("[run]"):
+                        run_line = line
+                if run_line:
+                    kv: Dict[str, str] = {}
+                    for tok in str(run_line).strip().split():
+                        if "=" not in tok:
+                            continue
+                        k, v = tok.split("=", 1)
+                        if k.startswith("["):
+                            continue
+                        kv[str(k).strip()] = str(v).strip()
+
+                    def _to_int(k: str, default: int = 0) -> int:
+                        try:
+                            return int(float(kv.get(k, str(default))))
+                        except Exception:
+                            return int(default)
+
+                    def _to_float(k: str, default: float = 0.0) -> float:
+                        try:
+                            return float(kv.get(k, str(default)))
+                        except Exception:
+                            return float(default)
+
+                    # Mirror compare_fec_vs_raw_bbrv2_fixed.py naming.
+                    if "fec_quic_sent_bytes" in kv:
+                        obs["fec_quic_sent_bytes"] = float(_to_int("fec_quic_sent_bytes", 0))
+                    if "fec_quic_overhead_ratio" in kv and kv.get("fec_quic_overhead_ratio") not in (None, ""):
+                        obs["fec_quic_overhead_ratio"] = float(_to_float("fec_quic_overhead_ratio", 0.0))
+                    if "file_bytes" in kv:
+                        obs["file_bytes"] = float(_to_int("file_bytes", 0))
+            except Exception:
+                pass
+
             # The harness prints a summary line to stderr (e.g. "[run] ... dur_ms=...")
             # but it might not be included in the RL observation JSON. Parse it here and
             # attach to obs so downstream logs can record transfer duration.
@@ -456,7 +507,7 @@ class FecEnv(gym.Env):
 
         # Action factor levels (requested discretization).
         # Keep these explicit so bandit training/eval can ensure env matches the ActionSet.
-        default_k_values = list(range(20, 51, 2))
+        default_k_values = list(range(20, 61, 2))
         default_r0_values = list(range(0, 21, 2))
         default_rstep_values = list(range(0, 21, 2))
         try:
@@ -486,7 +537,7 @@ class FecEnv(gym.Env):
         # This controls both the action space cardinality and the mapping from ddl_idx -> ddl_ms.
         # Default matches the requested discretization.
         # (Older checkpoints should pass their ddl_ms_values explicitly.)
-        default_ddl_ms_values = [100, 125, 150, 175, 200]
+        default_ddl_ms_values = [25, 40, 55, 70]
         ddl_ms_values_cfg = cfg.get("ddl_ms_values", default_ddl_ms_values)
         try:
             ddl_ms_values = [int(x) for x in list(ddl_ms_values_cfg)]
@@ -500,7 +551,7 @@ class FecEnv(gym.Env):
 
         # Discrete action space (MultiDiscrete).
         # Order: [K_idx, R0_idx, RSTEP_idx, ddl_idx]
-        #   K:      20..50 step 2    -> len(self._k_values)
+        #   K:      20..60 step 2    -> len(self._k_values)
         #   R0:      0..20 step 2    -> len(self._r0_values)
         #   RSTEP:   0..20 step 2    -> len(self._rstep_values)
         #   ddl_ms: configured       -> len(self._ddl_ms_values)
@@ -546,11 +597,8 @@ class FecEnv(gym.Env):
         # Invalid-transfer filtering:
         # - timeouts (Python-side) and
         # - md5_ok=0 (harness-side)
-        # should not be counted as learning signal nor included in step_metrics.
-        # This is critical for the TX-only contextual bandit: failures are often
-        # environmental (netns readiness, transient EPERM, etc.) and would poison
-        # the contextual update.
-        self._ignore_invalid_transfers = bool(cfg.get("ignore_invalid_transfers", True))
+        # are treated as valid (bad) outcomes for training/statistics.
+        self._ignore_invalid_transfers = bool(cfg.get("ignore_invalid_transfers", False))
 
         # Curriculum / randomization
         self._randomize_net_params_enabled = bool(cfg.get("randomize_net_params", False))
@@ -765,6 +813,23 @@ class FecEnv(gym.Env):
         obs_dict["fec_rate"] = float(r0_used) / float(max(1, int(K)))
         obs_dict["ddl_ms"] = float(ddl_ms)
 
+        # Overhead metric used by the policy:
+        # Use QUIC attempted-send overhead ratio when available, to match
+        # compare_fec_vs_raw_bbrv2_fixed.py's overhead_quic_ratio definition.
+        try:
+            oh = None
+            if "fec_quic_overhead_ratio" in obs_dict and obs_dict.get("fec_quic_overhead_ratio") is not None:
+                oh = float(obs_dict.get("fec_quic_overhead_ratio"))
+            if oh is None and "fec_quic_sent_bytes" in obs_dict:
+                file_bytes_oh = int(float(obs_dict.get("file_bytes", file_bytes) or 0))
+                sent_bytes_oh = int(float(obs_dict.get("fec_quic_sent_bytes", 0) or 0))
+                if file_bytes_oh > 0 and sent_bytes_oh > 0:
+                    oh = max(0.0, (float(sent_bytes_oh) - float(file_bytes_oh)) / float(file_bytes_oh))
+            if oh is not None and np.isfinite(float(oh)):
+                obs_dict["fec_overhead"] = float(max(0.0, float(oh)))
+        except Exception:
+            pass
+
         # done_flag: depends on file size and transfer duration.
         # Thresholds (ms):
         #   >= 500 KiB: 2000ms
@@ -795,6 +860,9 @@ class FecEnv(gym.Env):
         done_flag = 0
         if ddl_ms_deadline > 0 and not is_timeout and not is_md5_fail and dur_ms > 0:
             done_flag = 1 if float(dur_ms) <= float(ddl_ms_deadline) else 0
+        # Requested: failures should still be counted, but never "done".
+        if is_timeout or is_md5_fail:
+            done_flag = 0
         obs_dict["done_flag"] = float(done_flag)
 
         # e2e_delay approximation: dur_ms + RTT/2.
@@ -805,23 +873,14 @@ class FecEnv(gym.Env):
             if not err.lower().startswith("timeout"):
                 raise RuntimeError(f"QUIC-FEC harness failed: {err}")
 
-        # If this transfer is invalid, do not emit learning signal.
-        # We intentionally avoid updating last_obs so that reset() returns the
-        # last known-good observation.
-        if self._ignore_invalid_transfers and (is_timeout or is_md5_fail):
-            info = {
-                **(info or {}),
-                "step_valid": 0,
-                "invalid_reason": "timeout" if is_timeout else "md5_fail",
-                "md5_ok": int(md5_ok),
-            }
-            return self._last_obs_vec.copy(), 0.0, False, False, info
+        # Note: we do not filter out timeouts / md5 failures by default.
+        # They remain part of the learning signal and statistics.
 
-        # Compute reward (variant selectable via env_config). If the harness timed out,
-        # override with a hard penalty to discourage actions that fail to complete.
-        if is_timeout:
+        # Compute reward (variant selectable via env_config).
+        # Failures (timeout/md5_fail) should produce a strong negative signal.
+        if is_timeout or is_md5_fail:
             reward = -1.0
-            r_terms = {"timeout": 1.0}
+            r_terms = {"timeout": 1.0} if is_timeout else {"md5_fail": 1.0}
         else:
             reward, r_terms = self._compute_reward_satellite(obs_dict, ddl_ms)
         # Build policy observation vector.
@@ -834,6 +893,9 @@ class FecEnv(gym.Env):
         info = {
             **(info or {}),
             "step_valid": 1,
+            "md5_ok": int(md5_ok),
+            "is_timeout": int(is_timeout),
+            "is_md5_fail": int(is_md5_fail),
             # Useful for training logs / analysis (not part of the policy observation).
             "dur_ms": float(dur_ms),
             "e2e_delay_ms": float(obs_dict.get("e2e_delay_ms", 0.0) or 0.0),
@@ -850,6 +912,8 @@ class FecEnv(gym.Env):
                 "ddl_ms": ddl_ms,
                 "cc_algo": str(getattr(self._runner.last_cfg or EnvConfig(), "cc_algo", "bbrv2")),
             },
+            "quic_overhead_ratio": float(obs_dict.get("fec_quic_overhead_ratio", obs_dict.get("fec_overhead", 0.0)) or 0.0),
+            "quic_sent_bytes": float(obs_dict.get("fec_quic_sent_bytes", 0.0) or 0.0),
             "bw_cap_mbps": float(self._capacity_mbps),
             "goodput_mbps": float(obs_dict.get("goodput", obs_dict.get("goodput_mbps", obs_dict.get("goodput_arrival_mbps", obs_dict.get("goodput_decode_mbps", 0.0))))),
             "reward_terms": r_terms,
@@ -1001,7 +1065,7 @@ class FecEnv(gym.Env):
         tp_term = float(self._reward_w_goodput) * float(g / c)
 
         arq_tilde = float(np.clip(a_mean / 2.0, 0.0, 1.0))
-        oh_term = float(self._reward_w_overhead) * float(1.0 / (1.0 + (float(oh) / 0.3) ** 2))
+        oh_term = float(self._reward_w_overhead) * float(1.0 / (1.0 + (float(oh) / 0.25) ** 2))
         arq_term = -float(self._reward_w_arq) * float(arq_tilde)
         done_term = -float(self._reward_w_done) * float(1.0 - float(np.clip(done_flag, 0.0, 1.0)))
 

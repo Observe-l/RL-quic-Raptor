@@ -17,7 +17,8 @@ func main() {
 		out       = flag.String("out", ".", "output directory")
 		limit     = flag.Duration("timeout", 120*time.Second, "server timeout")
 		rxBudget  = flag.Int("rx-budget-bytes", 64*1024*1024, "receiver buffer budget in bytes")
-		rxDDL     = flag.Duration("rx-ddl", 50*time.Millisecond, "receiver decode deadline per block")
+		decodeDDL = flag.Duration("decode-ddl", 25*time.Millisecond, "receiver decode/check pacing (DECODE_DDL)")
+		_         = flag.Duration("rx-ddl", 25*time.Millisecond, "DEPRECATED: use -decode-ddl")
 		rxWorkers = flag.Int("rx-workers", 2, "receiver decode workers")
 
 		devRetx   = flag.Bool("dev-retx", true, "enable QUIC retransmission reason logging (requires build tag quicfecdev)")
@@ -42,7 +43,7 @@ func main() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), *limit)
 	defer cancel()
-	rx := fecquic.RXOptions{BudgetBytes: *rxBudget, DDL: *rxDDL, Workers: *rxWorkers}
+	rx := fecquic.RXOptions{BudgetBytes: *rxBudget, DecodeDDL: *decodeDDL, Workers: *rxWorkers}
 	err = fecquic.ListenAndServeLoopWithRX(ctx, *addr, *alpn, *out, tlsConf, rx, func(p string) { fmt.Println("stored:", p) })
 	if err != nil && err != context.DeadlineExceeded && err != context.Canceled {
 		fmt.Fprintln(os.Stderr, "serve error:", err)

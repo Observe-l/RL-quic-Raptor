@@ -21,7 +21,7 @@ set -euo pipefail
 #               #   iid:5           (5% i.i.d. loss)
 #               #   gemodel:p,r,h,k (Gilbert-Elliott model, percents)
 #   FILE=$ROOT/go/test_data/train_FD001.txt
-#   K=40, SYMBOL_BYTES=1200, R0=6, W=8, DDL_MS=150, RSTEP=4, ACK_EVERY=8, MAX_ATTEMPTS=8
+#   K=40, SYMBOL_BYTES=1200, R0=6, W=8, DDL_MS=150, DECODE_DDL_MS=25, RSTEP=4, ACK_EVERY=8, MAX_ATTEMPTS=8
 #   OBS_JSON=/tmp/quicfec_rl_${NS}.json
 #   POST_WAIT=0s (linger after client send; keep at 0s for fastest runs)
 #   SRV_TIMEOUT=10s (server max lifetime; lower keeps runs bounded)
@@ -55,6 +55,7 @@ SYMBOL_BYTES=${SYMBOL_BYTES:-1032}
 R0=${R0:-6}
 W=${W:-8}
 DDL_MS=${DDL_MS:-150}
+DECODE_DDL_MS=${DECODE_DDL_MS:-25}
 RSTEP=${RSTEP:-4}
 ALPHA=${ALPHA:-0.6}
 ACK_EVERY=${ACK_EVERY:-8}
@@ -203,7 +204,7 @@ SRV_LOG=$(mktemp -t quic_fec_srv.XXXXXX.log)
 # Remove any stale outputs from previous runs; otherwise md5_ok can be a false positive
 # if this run fails before producing a new file.
 rm -f "$OUT_DIR/$(basename "$FILE").recv" "$OUT_DIR/$(basename "$FILE").recv.part" 2>/dev/null || true
-sudo ip netns exec "$NS" bash -lc "ulimit -n 1048576; '$BIN_DIR/quicfec-server' -addr ${SRV_IP}:$PORT -out '$OUT_DIR' -timeout ${SRV_TIMEOUT}" >"$SRV_LOG" 2>&1 & SP=$!
+sudo ip netns exec "$NS" bash -lc "ulimit -n 1048576; '$BIN_DIR/quicfec-server' -addr ${SRV_IP}:$PORT -out '$OUT_DIR' -timeout ${SRV_TIMEOUT} -decode-ddl ${DECODE_DDL_MS}ms" >"$SRV_LOG" 2>&1 & SP=$!
 
 # Wait for server UDP socket to be ready (best-effort). A fixed sleep can be flaky under load.
 ready=0
@@ -269,7 +270,7 @@ if command -v timeout >/dev/null 2>&1; then
         if [[ "$CONNECT_RETRIES" -gt 0 && "$CONNECT_ATTEMPTS" -lt "$CONNECT_RETRIES" ]]; then
           kill $SP 2>/dev/null || true
           kill -9 $SP 2>/dev/null || true
-          sudo ip netns exec "$NS" bash -lc "ulimit -n 1048576; '$BIN_DIR/quicfec-server' -addr ${SRV_IP}:$PORT -out '$OUT_DIR' -timeout ${SRV_TIMEOUT}" >"$SRV_LOG" 2>&1 & SP=$!
+          sudo ip netns exec "$NS" bash -lc "ulimit -n 1048576; '$BIN_DIR/quicfec-server' -addr ${SRV_IP}:$PORT -out '$OUT_DIR' -timeout ${SRV_TIMEOUT} -decode-ddl ${DECODE_DDL_MS}ms" >"$SRV_LOG" 2>&1 & SP=$!
           sleep 0.05
           continue
         fi
@@ -293,7 +294,7 @@ else
         if [[ "$CONNECT_RETRIES" -gt 0 && "$CONNECT_ATTEMPTS" -lt "$CONNECT_RETRIES" ]]; then
           kill $SP 2>/dev/null || true
           kill -9 $SP 2>/dev/null || true
-          sudo ip netns exec "$NS" bash -lc "ulimit -n 1048576; '$BIN_DIR/quicfec-server' -addr ${SRV_IP}:$PORT -out '$OUT_DIR' -timeout ${SRV_TIMEOUT}" >"$SRV_LOG" 2>&1 & SP=$!
+          sudo ip netns exec "$NS" bash -lc "ulimit -n 1048576; '$BIN_DIR/quicfec-server' -addr ${SRV_IP}:$PORT -out '$OUT_DIR' -timeout ${SRV_TIMEOUT} -decode-ddl ${DECODE_DDL_MS}ms" >"$SRV_LOG" 2>&1 & SP=$!
           sleep 0.05
           continue
         fi
@@ -673,6 +674,12 @@ FEC_QUIC_SENT_SHORT_PKTS=
 FEC_QUIC_SENT_SHORT_BYTES=
 FEC_QUIC_LOST_1RTT_PKTS=
 FEC_QUIC_ACKED_1RTT_PKTS=
+FEC_QUIC_SRTT_MS=
+FEC_QUIC_MIN_RTT_MS=
+FEC_QUIC_LATEST_RTT_MS=
+FEC_QUIC_CWND_BYTES=
+FEC_QUIC_INFLIGHT_BYTES=
+FEC_QUIC_INFLIGHT_PKTS=
 FEC_QUIC_OVERHEAD_RATIO=
 FEC_QUIC_LINE=$(grep -E '^\[fec-client-quic-stats\] ' "$CLI_LOG" | tail -n1 || true)
 if [[ -n "$FEC_QUIC_LINE" ]]; then
@@ -682,6 +689,12 @@ if [[ -n "$FEC_QUIC_LINE" ]]; then
   FEC_QUIC_SENT_SHORT_BYTES=$(echo "$FEC_QUIC_LINE" | sed -n 's/.*sent_short_bytes=\([0-9]\+\).*/\1/p')
   FEC_QUIC_LOST_1RTT_PKTS=$(echo "$FEC_QUIC_LINE" | sed -n 's/.*lost_1rtt_pkts=\([0-9]\+\).*/\1/p')
   FEC_QUIC_ACKED_1RTT_PKTS=$(echo "$FEC_QUIC_LINE" | sed -n 's/.*acked_1rtt_pkts=\([0-9]\+\).*/\1/p')
+  FEC_QUIC_SRTT_MS=$(echo "$FEC_QUIC_LINE" | sed -n 's/.*srtt_ms=\([0-9]\+\).*/\1/p')
+  FEC_QUIC_MIN_RTT_MS=$(echo "$FEC_QUIC_LINE" | sed -n 's/.*min_rtt_ms=\([0-9]\+\).*/\1/p')
+  FEC_QUIC_LATEST_RTT_MS=$(echo "$FEC_QUIC_LINE" | sed -n 's/.*latest_rtt_ms=\([0-9]\+\).*/\1/p')
+  FEC_QUIC_CWND_BYTES=$(echo "$FEC_QUIC_LINE" | sed -n 's/.*cwnd_bytes=\([0-9]\+\).*/\1/p')
+  FEC_QUIC_INFLIGHT_BYTES=$(echo "$FEC_QUIC_LINE" | sed -n 's/.*inflight_bytes=\([0-9]\+\).*/\1/p')
+  FEC_QUIC_INFLIGHT_PKTS=$(echo "$FEC_QUIC_LINE" | sed -n 's/.*inflight_pkts=\([0-9\-]\+\).*/\1/p')
   if [[ -n "${FEC_QUIC_SENT_BYTES}" && "$FILE_SIZE" -gt 0 ]]; then
     FEC_QUIC_OVERHEAD_RATIO=$(awk -v tx="$FEC_QUIC_SENT_BYTES" -v fb="$FILE_SIZE" 'BEGIN{v=(tx-fb)/fb; if(v<0)v=0; printf "%.6f", v}')
   fi
@@ -691,13 +704,39 @@ fi
 FEC_ARQ_TX_SOURCE_SYMBOLS=
 FEC_ARQ_TX_REPAIRS=
 FEC_ARQ_FEC_OVERHEAD=
+FEC_ARQ_CLUSTERS=
+FEC_ARQ_ATTEMPTS=
 if [[ -n "${ARQ_STATS:-}" ]]; then
   FEC_ARQ_TX_SOURCE_SYMBOLS=$(echo "$ARQ_STATS" | sed -n 's/.*tx_source_symbols=\([0-9]\+\).*/\1/p')
   FEC_ARQ_TX_REPAIRS=$(echo "$ARQ_STATS" | sed -n 's/.*tx_repairs=\([0-9]\+\).*/\1/p')
   FEC_ARQ_FEC_OVERHEAD=$(echo "$ARQ_STATS" | sed -n 's/.*fec_overhead=\([0-9.\-]\+\).*/\1/p')
+  FEC_ARQ_CLUSTERS=$(echo "$ARQ_STATS" | sed -n 's/.*clusters=\([0-9]\+\).*/\1/p')
+  FEC_ARQ_ATTEMPTS=$(echo "$ARQ_STATS" | sed -n 's/.*attempts=\([0-9]\+\).*/\1/p')
 fi
 
-echo "[run] proto=quic_fec bitrate=${BITRATE_MBPS}Mbps rtt=${RTT_MS}ms loss=${LOSS_DESC} dur_ms=${DUR_MS} dur_ms_client=${DUR_MS_CLIENT} timed_out=${TIMED_OUT} client_ok=${CLIENT_OK} client_rc=${RC} md5_ok=${MD5_OK} s_mbps=${S_MBPS}${run_tail} overhead_ratio=${OVERHEAD_RATIO} file_bytes=${FILE_SIZE} tx_bytes=${TX_BYTES} rx_bytes=${RX_BYTES} netem_sent_pkts=${NETEM_SENT_PKTS} netem_dropped_pkts=${NETEM_DROPPED_PKTS} netem_sent_bytes=${NETEM_SENT_BYTES} netem_drop_rate=${NETEM_DROP_RATE:-} fec_quic_sent_pkts=${FEC_QUIC_SENT_PKTS:-} fec_quic_sent_bytes=${FEC_QUIC_SENT_BYTES:-} fec_quic_sent_short_pkts=${FEC_QUIC_SENT_SHORT_PKTS:-} fec_quic_sent_short_bytes=${FEC_QUIC_SENT_SHORT_BYTES:-} fec_quic_lost_1rtt_pkts=${FEC_QUIC_LOST_1RTT_PKTS:-} fec_quic_acked_1rtt_pkts=${FEC_QUIC_ACKED_1RTT_PKTS:-} fec_quic_overhead_ratio=${FEC_QUIC_OVERHEAD_RATIO:-} arq_tx_source_symbols=${FEC_ARQ_TX_SOURCE_SYMBOLS:-} arq_tx_repairs=${FEC_ARQ_TX_REPAIRS:-} arq_fec_overhead=${FEC_ARQ_FEC_OVERHEAD:-}" >&2
+# Extract client stage timing breakdown when available.
+FEC_STAGES_LINE=$(grep -E '^\[fec-client-stages\] ' "$CLI_LOG" | tail -n1 || true)
+FEC_DIAL_MS=$(echo "$FEC_STAGES_LINE" | sed -n 's/.*dial_ms=\([0-9]\+\).*/\1/p')
+FEC_HEADER_MS=$(echo "$FEC_STAGES_LINE" | sed -n 's/.*header_ms=\([0-9]\+\).*/\1/p')
+FEC_SEND_BLOCKS_MS=$(echo "$FEC_STAGES_LINE" | sed -n 's/.*send_blocks_ms=\([0-9]\+\).*/\1/p')
+FEC_ARQ_DRAIN_MS=$(echo "$FEC_STAGES_LINE" | sed -n 's/.*arq_drain_ms=\([0-9]\+\).*/\1/p')
+FEC_TX_STATS_MS=$(echo "$FEC_STAGES_LINE" | sed -n 's/.*tx_stats_ms=\([0-9]\+\).*/\1/p')
+FEC_POST_WAIT_MS=$(echo "$FEC_STAGES_LINE" | sed -n 's/.*post_wait_ms=\([0-9]\+\).*/\1/p')
+FEC_KEEP_STOP_MS=$(echo "$FEC_STAGES_LINE" | sed -n 's/.*keep_stop_ms=\([0-9]\+\).*/\1/p')
+FEC_TOTAL_MS=$(echo "$FEC_STAGES_LINE" | sed -n 's/.*total_ms=\([0-9]\+\).*/\1/p')
+
+# Extract receiver DONE wait time (client-side).
+FEC_DONE_LINE=$(grep -E '^\[fec-client-done\] ' "$CLI_LOG" | tail -n1 || true)
+FEC_DONE_WAIT_MS=$(echo "$FEC_DONE_LINE" | sed -n 's/.*wait_ms=\([0-9]\+\).*/\1/p')
+FEC_DONE_OK=$(echo "$FEC_DONE_LINE" | sed -n 's/.*ok=\([0-9]\+\).*/\1/p')
+FEC_DONE_WRITTEN=$(echo "$FEC_DONE_LINE" | sed -n 's/.*written=\([0-9]\+\).*/\1/p')
+
+# Extract encode/send time from client-stats line (diagnostic: RaptorQ encode + actual send call time).
+FEC_CLIENT_STATS_LINE=$(grep -E '^\[client-stats\] ' "$CLI_LOG" | tail -n1 || true)
+FEC_ENC_MS=$(echo "$FEC_CLIENT_STATS_LINE" | sed -n 's/.*enc_ms=\([0-9.\-]\+\).*/\1/p')
+FEC_SEND_MS=$(echo "$FEC_CLIENT_STATS_LINE" | sed -n 's/.*send_ms=\([0-9.\-]\+\).*/\1/p')
+
+echo "[run] proto=quic_fec bitrate=${BITRATE_MBPS}Mbps rtt=${RTT_MS}ms loss=${LOSS_DESC} dur_ms=${DUR_MS} dur_ms_client=${DUR_MS_CLIENT} timed_out=${TIMED_OUT} client_ok=${CLIENT_OK} client_rc=${RC} md5_ok=${MD5_OK} s_mbps=${S_MBPS}${run_tail} overhead_ratio=${OVERHEAD_RATIO} file_bytes=${FILE_SIZE} tx_bytes=${TX_BYTES} rx_bytes=${RX_BYTES} netem_sent_pkts=${NETEM_SENT_PKTS} netem_dropped_pkts=${NETEM_DROPPED_PKTS} netem_sent_bytes=${NETEM_SENT_BYTES} netem_drop_rate=${NETEM_DROP_RATE:-} fec_dial_ms=${FEC_DIAL_MS:-} fec_header_ms=${FEC_HEADER_MS:-} fec_send_blocks_ms=${FEC_SEND_BLOCKS_MS:-} fec_arq_drain_ms=${FEC_ARQ_DRAIN_MS:-} fec_tx_stats_ms=${FEC_TX_STATS_MS:-} fec_post_wait_ms=${FEC_POST_WAIT_MS:-} fec_keep_stop_ms=${FEC_KEEP_STOP_MS:-} fec_total_ms=${FEC_TOTAL_MS:-} fec_done_wait_ms=${FEC_DONE_WAIT_MS:-} fec_done_ok=${FEC_DONE_OK:-} fec_done_written=${FEC_DONE_WRITTEN:-} fec_enc_ms=${FEC_ENC_MS:-} fec_send_ms=${FEC_SEND_MS:-} fec_quic_sent_pkts=${FEC_QUIC_SENT_PKTS:-} fec_quic_sent_bytes=${FEC_QUIC_SENT_BYTES:-} fec_quic_sent_short_pkts=${FEC_QUIC_SENT_SHORT_PKTS:-} fec_quic_sent_short_bytes=${FEC_QUIC_SENT_SHORT_BYTES:-} fec_quic_lost_1rtt_pkts=${FEC_QUIC_LOST_1RTT_PKTS:-} fec_quic_acked_1rtt_pkts=${FEC_QUIC_ACKED_1RTT_PKTS:-} fec_quic_srtt_ms=${FEC_QUIC_SRTT_MS:-} fec_quic_min_rtt_ms=${FEC_QUIC_MIN_RTT_MS:-} fec_quic_latest_rtt_ms=${FEC_QUIC_LATEST_RTT_MS:-} fec_quic_cwnd_bytes=${FEC_QUIC_CWND_BYTES:-} fec_quic_inflight_bytes=${FEC_QUIC_INFLIGHT_BYTES:-} fec_quic_inflight_pkts=${FEC_QUIC_INFLIGHT_PKTS:-} fec_quic_overhead_ratio=${FEC_QUIC_OVERHEAD_RATIO:-} arq_clusters=${FEC_ARQ_CLUSTERS:-} arq_attempts=${FEC_ARQ_ATTEMPTS:-} arq_tx_source_symbols=${FEC_ARQ_TX_SOURCE_SYMBOLS:-} arq_tx_repairs=${FEC_ARQ_TX_REPAIRS:-} arq_fec_overhead=${FEC_ARQ_FEC_OVERHEAD:-}" >&2
 
 # Cleanup temp logs
 # - Keep logs when a failure occurs (no RL_OBS) or residual_erasures=1.

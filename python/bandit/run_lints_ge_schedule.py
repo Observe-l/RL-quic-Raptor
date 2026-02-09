@@ -277,7 +277,7 @@ def main() -> int:
     ap.add_argument(
         "--checkpoint-every-episodes",
         type=int,
-        default=0,
+        default=1,
         help="save latest checkpoint every N episodes (0 disables). Recommended >=1 for resume.",
     )
 
@@ -412,7 +412,7 @@ def main() -> int:
 
     if loaded_from is None:
         # Requested DDL discretization for training.
-        ddl_ms_values = [100, 125, 150, 175, 200]
+        ddl_ms_values = [40, 55, 70]
         action_set = ActionSet(ddl_ms_values=ddl_ms_values)
         ctx_cfg = ContextConfig(ewma_alpha=float(args.ctx_alpha), window=int(args.ctx_window))
         ctx = ContextBuilder(ctx_cfg)
@@ -474,7 +474,7 @@ def main() -> int:
 
     # Clarify metric semantics for overhead shaping.
     print(
-        "note: reward overhead term uses fec_overhead = tx_repair_symbols / tx_source_symbols (sender-side ratio)"
+        "note: reward overhead term uses fec_overhead = quic_overhead_ratio = max(0,(quic_sent_bytes-file_bytes)/file_bytes)"
     )
 
     env = FecEnv(env_cfg)

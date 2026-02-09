@@ -301,6 +301,15 @@ if [[ -n "$TOTAL_MS" ]]; then
   DUR_MS_CLIENT=$TOTAL_MS
 fi
 
+# Extract raw client phase breakdown when available.
+RAW_DIAL_MS=$(echo "$STAGES_LINE" | sed -n 's/.*dial_ms=\([0-9]\+\).*/\1/p')
+RAW_OPEN_STREAM_MS=$(echo "$STAGES_LINE" | sed -n 's/.*open_stream_ms=\([0-9]\+\).*/\1/p')
+RAW_HEADER_MS=$(echo "$STAGES_LINE" | sed -n 's/.*header_ms=\([0-9]\+\).*/\1/p')
+RAW_SEND_MS=$(echo "$STAGES_LINE" | sed -n 's/.*send_ms=\([0-9]\+\).*/\1/p')
+RAW_ACK_MS=$(echo "$STAGES_LINE" | sed -n 's/.*ack_ms=\([0-9]\+\).*/\1/p')
+RAW_ACK_OK=$(echo "$STAGES_LINE" | sed -n 's/.*ack_ok=\([0-9]\+\).*/\1/p')
+RAW_POST_WAIT_MS=$(echo "$STAGES_LINE" | sed -n 's/.*post_wait_ms=\([0-9]\+\).*/\1/p')
+
 # Optional QUIC-layer stats (attempted sends, including packets later dropped by qdisc).
 RAW_QUIC_SENT_PKTS=
 RAW_QUIC_SENT_BYTES=
@@ -308,6 +317,12 @@ RAW_QUIC_SENT_SHORT_PKTS=
 RAW_QUIC_SENT_SHORT_BYTES=
 RAW_QUIC_LOST_1RTT_PKTS=
 RAW_QUIC_ACKED_1RTT_PKTS=
+RAW_QUIC_SRTT_MS=
+RAW_QUIC_MIN_RTT_MS=
+RAW_QUIC_LATEST_RTT_MS=
+RAW_QUIC_CWND_BYTES=
+RAW_QUIC_INFLIGHT_BYTES=
+RAW_QUIC_INFLIGHT_PKTS=
 RAW_QUIC_OVERHEAD_RATIO=
 RAW_QUIC_LINE=$(grep -E '^\[raw-client-quic-stats\] ' "$CLI_LOG" | tail -n1 || true)
 if [[ -n "$RAW_QUIC_LINE" ]]; then
@@ -317,6 +332,12 @@ if [[ -n "$RAW_QUIC_LINE" ]]; then
   RAW_QUIC_SENT_SHORT_BYTES=$(echo "$RAW_QUIC_LINE" | sed -n 's/.*sent_short_bytes=\([0-9]\+\).*/\1/p')
   RAW_QUIC_LOST_1RTT_PKTS=$(echo "$RAW_QUIC_LINE" | sed -n 's/.*lost_1rtt_pkts=\([0-9]\+\).*/\1/p')
   RAW_QUIC_ACKED_1RTT_PKTS=$(echo "$RAW_QUIC_LINE" | sed -n 's/.*acked_1rtt_pkts=\([0-9]\+\).*/\1/p')
+  RAW_QUIC_SRTT_MS=$(echo "$RAW_QUIC_LINE" | sed -n 's/.*srtt_ms=\([0-9]\+\).*/\1/p')
+  RAW_QUIC_MIN_RTT_MS=$(echo "$RAW_QUIC_LINE" | sed -n 's/.*min_rtt_ms=\([0-9]\+\).*/\1/p')
+  RAW_QUIC_LATEST_RTT_MS=$(echo "$RAW_QUIC_LINE" | sed -n 's/.*latest_rtt_ms=\([0-9]\+\).*/\1/p')
+  RAW_QUIC_CWND_BYTES=$(echo "$RAW_QUIC_LINE" | sed -n 's/.*cwnd_bytes=\([0-9]\+\).*/\1/p')
+  RAW_QUIC_INFLIGHT_BYTES=$(echo "$RAW_QUIC_LINE" | sed -n 's/.*inflight_bytes=\([0-9]\+\).*/\1/p')
+  RAW_QUIC_INFLIGHT_PKTS=$(echo "$RAW_QUIC_LINE" | sed -n 's/.*inflight_pkts=\([0-9\-]\+\).*/\1/p')
   if [[ -n "${RAW_QUIC_SENT_BYTES}" && "$FILE_SIZE" -gt 0 ]]; then
     RAW_QUIC_OVERHEAD_RATIO=$(awk -v tx="$RAW_QUIC_SENT_BYTES" -v fb="$FILE_SIZE" 'BEGIN{v=(tx-fb)/fb; if(v<0)v=0; printf "%.6f", v}')
   fi
@@ -327,7 +348,7 @@ if [[ -n "${LOSS_MODE}" ]]; then
   LOSS_TAG="${LOSS_MODE}"
 fi
 
-echo "[run] proto=quic_raw bitrate=${BITRATE_MBPS}Mbps rtt=${RTT_MS}ms loss=${LOSS_TAG} dur_ms=${DUR_MS_SERVER} dur_ms_client=${DUR_MS_CLIENT} timed_out=${TIMED_OUT} client_ok=${CLIENT_OK} client_rc=${RC} md5_ok=${MD5_OK} s_mbps=${S_MBPS} overhead_ratio=${OVERHEAD_RATIO} file_bytes=${FILE_SIZE} tx_bytes=${TX_BYTES} rx_bytes=${RX_BYTES} netem_sent_pkts=${NETEM_SENT_PKTS} netem_dropped_pkts=${NETEM_DROPPED_PKTS} netem_sent_bytes=${NETEM_SENT_BYTES} netem_drop_rate=${NETEM_DROP_RATE:-} raw_quic_sent_pkts=${RAW_QUIC_SENT_PKTS:-} raw_quic_sent_bytes=${RAW_QUIC_SENT_BYTES:-} raw_quic_sent_short_pkts=${RAW_QUIC_SENT_SHORT_PKTS:-} raw_quic_sent_short_bytes=${RAW_QUIC_SENT_SHORT_BYTES:-} raw_quic_lost_1rtt_pkts=${RAW_QUIC_LOST_1RTT_PKTS:-} raw_quic_acked_1rtt_pkts=${RAW_QUIC_ACKED_1RTT_PKTS:-} raw_quic_overhead_ratio=${RAW_QUIC_OVERHEAD_RATIO:-}" >&2
+echo "[run] proto=quic_raw bitrate=${BITRATE_MBPS}Mbps rtt=${RTT_MS}ms loss=${LOSS_TAG} dur_ms=${DUR_MS_SERVER} dur_ms_client=${DUR_MS_CLIENT} timed_out=${TIMED_OUT} client_ok=${CLIENT_OK} client_rc=${RC} md5_ok=${MD5_OK} s_mbps=${S_MBPS} overhead_ratio=${OVERHEAD_RATIO} file_bytes=${FILE_SIZE} tx_bytes=${TX_BYTES} rx_bytes=${RX_BYTES} netem_sent_pkts=${NETEM_SENT_PKTS} netem_dropped_pkts=${NETEM_DROPPED_PKTS} netem_sent_bytes=${NETEM_SENT_BYTES} netem_drop_rate=${NETEM_DROP_RATE:-} raw_dial_ms=${RAW_DIAL_MS:-} raw_open_stream_ms=${RAW_OPEN_STREAM_MS:-} raw_header_ms=${RAW_HEADER_MS:-} raw_send_ms=${RAW_SEND_MS:-} raw_ack_ms=${RAW_ACK_MS:-} raw_ack_ok=${RAW_ACK_OK:-} raw_post_wait_ms=${RAW_POST_WAIT_MS:-} raw_total_ms=${TOTAL_MS:-} raw_quic_sent_pkts=${RAW_QUIC_SENT_PKTS:-} raw_quic_sent_bytes=${RAW_QUIC_SENT_BYTES:-} raw_quic_sent_short_pkts=${RAW_QUIC_SENT_SHORT_PKTS:-} raw_quic_sent_short_bytes=${RAW_QUIC_SENT_SHORT_BYTES:-} raw_quic_lost_1rtt_pkts=${RAW_QUIC_LOST_1RTT_PKTS:-} raw_quic_acked_1rtt_pkts=${RAW_QUIC_ACKED_1RTT_PKTS:-} raw_quic_srtt_ms=${RAW_QUIC_SRTT_MS:-} raw_quic_min_rtt_ms=${RAW_QUIC_MIN_RTT_MS:-} raw_quic_latest_rtt_ms=${RAW_QUIC_LATEST_RTT_MS:-} raw_quic_cwnd_bytes=${RAW_QUIC_CWND_BYTES:-} raw_quic_inflight_bytes=${RAW_QUIC_INFLIGHT_BYTES:-} raw_quic_inflight_pkts=${RAW_QUIC_INFLIGHT_PKTS:-} raw_quic_overhead_ratio=${RAW_QUIC_OVERHEAD_RATIO:-}" >&2
 
 # Emit AoI-style average one-way delay from server output.
 DELAY_LINE=$(grep -E '^\[delay\] ' "$SRV_LOG" | tail -n1 || true)

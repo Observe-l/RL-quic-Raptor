@@ -41,8 +41,8 @@ class ActionSet:
     ):
         # Defaults: representable, moderately sized, aligned with bandit.md intent.
         if k_values is None:
-            # Requested discretization: K in [20, 50] step 2.
-            k_values = list(range(20, 51, 2))
+            # Requested discretization: K in [20, 60] step 2.
+            k_values = list(range(20, 61, 2))
 
         # Requested discretization: R0 in [0, 20] step 2 (symbols).
         if r0_values is None and r0_pct_values is None:
@@ -59,7 +59,8 @@ class ActionSet:
             # Requested discretization: RSTEP in [0, 20] step 2.
             rstep_values = list(range(0, 21, 2))
         if ddl_ms_values is None:
-            ddl_ms_values = [100, 125, 150, 175, 200]
+            # Requested discretization: receiver ARQ soft deadline in ms.
+            ddl_ms_values = [40, 55, 70]
 
         self.k_values = sorted({int(x) for x in k_values})
         self.r0_values = sorted({int(x) for x in (r0_values or [])})

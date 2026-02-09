@@ -28,7 +28,7 @@ func main() {
 		ackEvery  = flag.Int("ack-every", 8, "write 1B on a stream every N datagrams (0=auto)")
 		transport = flag.String("transport", "dgram", "symbol transport: dgram|stream")
 		arq       = flag.Bool("arq", false, "enable ARQ control plane (NACK/ACK)")
-		rxDDL     = flag.Duration("rx-ddl", 0, "receiver decode deadline per block (sent to server via header; 0=unspecified)")
+		rxDDL     = flag.Duration("rx-ddl", 0, "receiver ARQ soft deadline (DDL_MS) in ms (sent to server via header; 0=unspecified)")
 		R0        = flag.Int("R0", -1, "initial extra repairs (>=0 exact; -1=auto: N-K)")
 		W         = flag.Int("W", 8, "ARQ window W (unfinished clusters)")
 		Rstep     = flag.Int("Rstep", 4, "ARQ extra repairs appended per NACK (0 allowed; <0 uses default)")

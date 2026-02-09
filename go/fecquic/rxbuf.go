@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,7 +18,8 @@ import (
 // RXOptions configures the receiver buffer and scheduler.
 type RXOptions struct {
 	BudgetBytes int           // total bytes for buffered symbols (default 10MB)
-	DDL         time.Duration // fixed decode deadline per block (default 50ms)
+	DecodeDDL   time.Duration // receiver decode/check pacing (default 25ms)
+	SoftDDL     time.Duration // receiver ARQ soft deadline (default 25ms)
 	Workers     int           // decode workers (default numCPU)
 }
 
@@ -25,8 +27,11 @@ func (o *RXOptions) setDefaults() {
 	if o.BudgetBytes <= 0 {
 		o.BudgetBytes = 64 * 1024 * 1024
 	}
-	if o.DDL <= 0 {
-		o.DDL = 50 * time.Millisecond
+	if o.DecodeDDL <= 0 {
+		o.DecodeDDL = 25 * time.Millisecond
+	}
+	if o.SoftDDL <= 0 {
+		o.SoftDDL = 25 * time.Millisecond
 	}
 	if o.Workers <= 0 {
 		o.Workers = 1 // keep simple; can tune later
@@ -61,6 +66,13 @@ type rxBlock struct {
 	srcSeenCount int
 	// metrics timestamps
 	firstSeen time.Time
+	lastSymAt time.Time // last time we observed any symbol for this block (unique or duplicate)
+	// decodeFailed is set when the decoder returns not-ok even though we may have
+	// rx_unique>=K. This can happen due to linear dependence / rank deficiency.
+	// In that case, the scheduler should keep NACKing for extra repairs.
+	decodeFailed           bool
+	lastDecodeFailAt       time.Time
+	lastDecodeFailRxUnique int
 	// ARQ de-bounce state
 	lastNackAt       time.Time
 	lastNackRxUnique int
@@ -73,6 +85,10 @@ type rxManager struct {
 	// config
 	budget int
 	ddl    time.Duration
+	// softDDL is the soft-deadline for seen blocks: if a seen block has a deficit and
+	// we haven't observed any symbol for that block for softDDL, we trigger a NACK.
+	// This is measured from lastSymAt and is refreshed on every symbol arrival.
+	softDDL time.Duration
 
 	// file params
 	fileSize uint64
@@ -139,7 +155,8 @@ func newRXManager(fileSize uint64, K, L int, outDir, baseName string, rx RXOptio
 	rx.setDefaults()
 	m := &rxManager{
 		budget:    rx.BudgetBytes,
-		ddl:       rx.DDL,
+		ddl:       rx.DecodeDDL,
+		softDDL:   rx.SoftDDL,
 		fileSize:  fileSize,
 		K:         K,
 		L:         L,
@@ -154,6 +171,7 @@ func newRXManager(fileSize uint64, K, L int, outDir, baseName string, rx RXOptio
 		minSeen:   -1,
 		maxSeen:   -1,
 	}
+	// softDDL is configured via rx.SoftDDL (typically from the client-provided header).
 	finalBase := baseName
 	if finalBase == "" {
 		finalBase = "qfec_recv.bin"
@@ -279,6 +297,12 @@ func (m *rxManager) start(rx RXOptions) {
 					if err != nil || !ok {
 						// Decoding failed; unqueue and wait for next DDL tick to decide NACK.
 						m.mu.Lock()
+						// Mark decode failure so the scheduler can request additional repairs
+						// even if rx_unique>=K.
+						rxu := b.srcSeenCount + len(b.syms)
+						b.decodeFailed = true
+						b.lastDecodeFailAt = time.Now()
+						b.lastDecodeFailRxUnique = rxu
 						b.queued = false
 						m.mu.Unlock()
 						continue
@@ -379,15 +403,29 @@ func (m *rxManager) start(rx RXOptions) {
 			}
 		}()
 	}
-	// DDL scheduler
+	// DDL scheduler (soft deadline is configured via file header; see transfer.go).
+	softDDL := m.softDDL
 	m.wgDec.Add(1)
 	go func() {
 		defer m.wgDec.Done()
 		// Faster scheduler tick for more responsive ARQ without large sleeps.
 		t := time.NewTicker(1 * time.Millisecond)
 		defer t.Stop()
-		minSeenNack := 20 * time.Millisecond
+		arqPoll := 8 * time.Millisecond
+		if v := os.Getenv("QUIC_FEC_ARQ_POLL_MS"); v != "" {
+			if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
+				arqPoll = time.Duration(ms) * time.Millisecond
+			}
+		}
 		minUnseenNack := 200 * time.Millisecond
+		recSeenMax := 4
+		recSeenMaxEnvSet := false
+		if v := os.Getenv("QUIC_FEC_ARQ_REC_SEEN_MAX"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				recSeenMax = n
+				recSeenMaxEnvSet = true
+			}
+		}
 		for {
 			select {
 			case <-m.stopCh:
@@ -411,29 +449,55 @@ func (m *rxManager) start(rx RXOptions) {
 					continue
 				}
 				if now.After(b.nextDDL) || now.Equal(b.nextDDL) {
+					nextDDL := now.Add(m.ddl)
 					// Calculate NACK recommendation under lock for deficit cases.
 					if m.ctrlOut != nil {
 						rxu := b.srcSeenCount + len(b.syms)
 						deficit := b.K - rxu
+						// If decoding is failing despite rx_unique>=K, treat as a small
+						// effective deficit so we continue ARQ for extra repairs.
+						if deficit <= 0 && b.decodeFailed {
+							deficit = 2
+						}
 						if deficit > 0 {
+							// Seen-block soft deadline:
+							// Count from lastSymAt (refreshed on every arrival). If idle for softDDL,
+							// trigger NACK immediately.
+							if !b.firstSeen.IsZero() {
+								if !b.lastSymAt.IsZero() {
+									due := b.lastSymAt.Add(softDDL)
+									if now.Before(due) {
+										// Not yet reached soft deadline; schedule exactly at due.
+										nextDDL = due
+										goto advanceDDL
+									}
+								} else {
+									// If we somehow missed lastSymAt, fall back to firstSeen.
+									due := b.firstSeen.Add(softDDL)
+									if now.Before(due) {
+										nextDDL = due
+										goto advanceDDL
+									}
+								}
+								// Soft deadline reached (or no timestamps): poll quickly after NACK scheduling.
+								nextDDL = now.Add(minDur(m.ddl, arqPoll))
+							}
 							// Debounce: avoid spamming NACKs when nothing changes.
 							// - For seen blocks: allow NACK after a short grace and then with backoff.
 							// - For unseen placeholders: send at most once (or very rarely) only when
 							//   the block ID is within the observed range.
 							canNack := false
 							if !b.firstSeen.IsZero() {
-								// Seen block: require a minimum time since first symbol.
-								if now.Sub(b.firstSeen) >= minSeenNack {
-									if b.nackBackoff <= 0 {
-										b.nackBackoff = m.ddl
-									}
-									// If progress since last NACK, reset backoff.
-									if rxu > b.lastNackRxUnique {
-										b.nackBackoff = m.ddl
-									}
-									if b.lastNackAt.IsZero() || now.Sub(b.lastNackAt) >= b.nackBackoff {
-										canNack = true
-									}
+								// Seen block: NACK is governed by the soft deadline and a post-NACK wait.
+								if b.nackBackoff <= 0 {
+									b.nackBackoff = m.ddl
+								}
+								// If progress since last NACK, reset backoff.
+								if rxu > b.lastNackRxUnique {
+									b.nackBackoff = m.ddl
+								}
+								if b.lastNackAt.IsZero() || now.Sub(b.lastNackAt) >= b.nackBackoff {
+									canNack = true
 								}
 							} else {
 								// Unseen placeholder: only NACK if block is within [minSeen,maxSeen]
@@ -456,10 +520,11 @@ func (m *rxManager) start(rx RXOptions) {
 								} else {
 									inRange = (m.minSeen >= 0 && int(b.id) >= m.minSeen && int(b.id) <= m.maxSeen)
 								}
-								// For the immediate tail block (maxSeen+1), wait longer than for gaps,
-								// to avoid preemptive repairs during transient burst-loss gaps.
+								// For the immediate tail block (maxSeen+1), we still require a global idle
+								// gap to avoid preemptive repairs during transient burst-loss gaps.
+								isTail := int(b.id) == m.maxSeen+1
 								needIdle := minUnseenNack
-								if int(b.id) == m.maxSeen+1 {
+								if isTail {
 									longer := 6 * m.ddl
 									if longer > needIdle {
 										needIdle = longer
@@ -470,7 +535,16 @@ func (m *rxManager) start(rx RXOptions) {
 								if lastRx > 0 {
 									idleOK = now.Sub(time.Unix(0, lastRx)) >= needIdle
 								}
-								if inRange && idleOK {
+								// For interior gaps (b.id <= maxSeen), do NOT wait for global idle.
+								// Otherwise a completely-erased block during a burst can only be NACKed
+								// after traffic stops, which creates bimodal tail latency and low success
+								// rates when R0 is small.
+								gapOK := !isTail
+								ageOK := false
+								if !b.t0.IsZero() {
+									ageOK = now.Sub(b.t0) >= minUnseenNack
+								}
+								if inRange && ((gapOK && ageOK) || (isTail && idleOK)) {
 									if !b.unseenNackSent {
 										canNack = true
 									} else if !b.lastNackAt.IsZero() && now.Sub(b.lastNackAt) >= 4*m.ddl {
@@ -482,18 +556,52 @@ func (m *rxManager) start(rx RXOptions) {
 							if canNack {
 								// Only count ARQ attempts when we actually send a NACK.
 								b.attempt++
+								// Clear decodeFailed when we decide to request more; this prevents
+								// repeated decode-failure-driven NACKs from persisting after new symbols arrive.
+								// It will be re-set by the decode worker if decode still fails.
+								b.decodeFailed = false
 								// Recommend repairs.
 								// - Unseen placeholders (no symbols received at all): request a small bootstrap.
-								// - Seen blocks: cap recommendation to avoid large bursts that inflate overhead.
+								// - Seen blocks: scale up with deficit/attempt to reduce multi-round ARQ.
 								rec := deficit
 								if b.firstSeen.IsZero() {
-									rec = 4
-								} else {
+									// Unseen block (no symbols observed): bootstrap more aggressively than a fixed 4.
+									// This avoids many RTT-rounds and improves success when an entire block is
+									// erased by a burst and R0 is small.
+									unseenCap := 4
+									if b.K > 0 {
+										unseenCap = b.K / 2
+									}
+									if unseenCap < 4 {
+										unseenCap = 4
+									}
+									if unseenCap > 20 {
+										unseenCap = 20
+									}
 									if rec < 1 {
 										rec = 1
 									}
-									if rec > 4 {
-										rec = 4
+									if rec > unseenCap {
+										rec = unseenCap
+									}
+								} else {
+									seenCap := recSeenMax
+									if !recSeenMaxEnvSet {
+										// Default cap scales with block size so larger K doesn't require dozens
+										// of RTT-rounds to fill a big deficit (which causes overhead spikes).
+										seenCap = b.K / 4
+										if seenCap < 4 {
+											seenCap = 4
+										}
+										if seenCap > 20 {
+											seenCap = 20
+										}
+									}
+									if rec < 1 {
+										rec = 1
+									}
+									if rec > seenCap {
+										rec = seenCap
 									}
 								}
 								nacks = append(nacks, nackMsg{blockID: b.id, attempt: b.attempt, rxu: rxu, rec: rec, send: true})
@@ -512,18 +620,35 @@ func (m *rxManager) start(rx RXOptions) {
 								}
 								b.lastNackAt = now
 								b.lastNackRxUnique = rxu
+								// After sending a NACK, wait for repairs to arrive.
+								// The wait is softDDL + 1.5*SRTT (using quic-go's smoothed RTT when available).
+								srtt := latestServerSRTT()
+								if srtt <= 0 {
+									// Fallback to configured RTT when SRTT is not yet available.
+									if rttStr := os.Getenv("RTT_MS"); rttStr != "" {
+										if ms, err := strconv.Atoi(rttStr); err == nil && ms > 0 {
+											srtt = time.Duration(ms) * time.Millisecond
+										}
+									}
+								}
+								wait := softDDL
+								if srtt > 0 {
+									wait += srtt + srtt/2
+								}
+								nextDDL = now.Add(wait)
 							}
 						}
 					}
 					// Only queue for decode when we have at least K uniques (decoder likely to succeed).
 					// IMPORTANT: Do not mark b.queued unless we actually enqueue for decode; otherwise
 					// blocks with syms<K would be stuck as 'queued' and stop receiving NACKs.
-					if len(b.syms) >= b.K {
+					if (b.srcSeenCount + len(b.syms)) >= b.K {
 						b.queued = true
 						toDecode = append(toDecode, b)
 					}
+				advanceDDL:
 					// Always advance nextDDL so we retry after the interval.
-					b.nextDDL = now.Add(m.ddl)
+					b.nextDDL = nextDDL
 				}
 			}
 			m.mu.Unlock()
@@ -589,7 +714,12 @@ func (m *rxManager) start(rx RXOptions) {
 				select {
 				case m.decodeQ <- b:
 				default:
-					// drop if queue is full; next tick will retry
+					// If enqueue fails, do NOT leave the block stuck as queued.
+					// Otherwise the scheduler will skip it (b.queued==true) and it will never
+					// be retried for decode or NACKed again.
+					m.mu.Lock()
+					b.queued = false
+					m.mu.Unlock()
 				}
 			}
 		}
@@ -617,14 +747,16 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 			for i := 0; i < m.totalBlocks; i++ {
 				bid := uint16(i)
 				if _, ok := m.blocks[bid]; !ok {
+					now := time.Now()
 					m.blocks[bid] = &rxBlock{
 						id:       bid,
+						t0:       now,
 						K:        m.K,
 						N:        m.K,
 						L:        m.L,
 						dataSize: m.K * m.L,
 						attempt:  0,
-						nextDDL:  time.Now().Add(m.ddl),
+						nextDDL:  now.Add(m.ddl),
 						syms:     make(map[int][]byte, m.K),
 					}
 				}
@@ -639,6 +771,7 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 	}
 	b := m.blocks[blockID]
 	if b == nil {
+		next := time.Now().Add(minDur(m.ddl, 20*time.Millisecond))
 		b = &rxBlock{
 			id:       blockID,
 			t0:       time.Now(),
@@ -647,7 +780,7 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 			L:        L,
 			dataSize: dataSize,
 			attempt:  0,
-			nextDDL:  time.Now().Add(m.ddl),
+			nextDDL:  next,
 			syms:     make(map[int][]byte, N),
 		}
 		m.blocks[blockID] = b
@@ -669,22 +802,31 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 			}
 		}
 	}
+	// Note: we intentionally update per-block activity timestamps only after we
+	// know this symbol is innovative (non-duplicate) and admitted into state.
+	// Otherwise, repeated duplicate retransmissions could indefinitely postpone
+	// the soft-deadline and suppress NACK retries for a still-deficit block.
 	// If this is the first time we observe any block (minSeen==-1), backfill placeholders for [0..blockID-1].
+	// Note: block numbering always starts from 0. If the first observed block has blockID>0 (i.e., block 0
+	// was fully erased), we must still consider block 0 in-range for unseen-block ARQ; otherwise the receiver
+	// would never NACK it and the transfer can complete with exactly one block missing.
 	if m.minSeen == -1 {
-		m.minSeen = int(blockID)
+		m.minSeen = 0
 		m.maxSeen = int(blockID)
 		if blockID > 0 && m.ctrlOut != nil && m.K > 0 && m.L > 0 {
 			for i := 0; i < int(blockID); i++ {
 				bid := uint16(i)
 				if _, ok := m.blocks[bid]; !ok {
+					now := time.Now()
 					m.blocks[bid] = &rxBlock{
 						id:       bid,
+						t0:       now,
 						K:        m.K,
 						N:        m.K, // unknown yet; doesn't matter for NACK
 						L:        m.L,
 						dataSize: m.K * m.L,
 						attempt:  0,
-						nextDDL:  time.Now().Add(m.ddl),
+						nextDDL:  now.Add(m.ddl),
 						syms:     make(map[int][]byte, m.K),
 					}
 				}
@@ -699,14 +841,16 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 				for i := prev + 1; i < int(blockID); i++ {
 					bid := uint16(i)
 					if _, ok := m.blocks[bid]; !ok {
+						now := time.Now()
 						m.blocks[bid] = &rxBlock{
 							id:       bid,
+							t0:       now,
 							K:        m.K,
 							N:        m.K,
 							L:        m.L,
 							dataSize: m.K * m.L,
 							attempt:  0,
-							nextDDL:  time.Now().Add(m.ddl),
+							nextDDL:  now.Add(m.ddl),
 							syms:     make(map[int][]byte, m.K),
 						}
 					}
@@ -768,6 +912,19 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 		m.mu.Unlock()
 		m.dropsRepairs.Add(1)
 		return false
+	}
+	// Track innovative per-block receive activity.
+	nowSym := time.Now()
+	b.lastSymAt = nowSym
+	// Any innovative symbol arrival may resolve rank deficiency.
+	b.decodeFailed = false
+	// If we previously scheduled a long post-NACK wait, receiving any *innovative*
+	// symbol should restart the soft-deadline countdown as soon as possible.
+	if m.softDDL > 0 && !b.done && !b.queued {
+		due := nowSym.Add(m.softDDL)
+		if b.nextDDL.After(due) {
+			b.nextDDL = due
+		}
 	}
 	// Update block meta from header for placeholders or unknowns.
 	if b.K != K || b.L != L || b.dataSize != dataSize {
@@ -951,7 +1108,10 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 				select {
 				case m.decodeQ <- b:
 				default:
-					// drop if full; next DDL tick will schedule
+					// If enqueue fails, clear queued so the scheduler can retry / NACK.
+					m.mu.Lock()
+					b.queued = false
+					m.mu.Unlock()
 				}
 			}
 		}

@@ -15,7 +15,7 @@ import (
 //	FILESIZE u64  exact byte length
 //	SHA256   32B  digest of the original bytes
 //	CHUNK    u32  bytes per symbol (L)
-//	RESERVED 8B   reserved; currently carries RX_DDL_MS (u32 LE) + 4B zeros
+//	RESERVED 8B   reserved; currently carries DDL_MS (soft deadline, u32 LE) + 4B zeros
 const (
 	fileHeaderMagic = "QFEC"
 	fileHeaderLen   = 4 + 2 + 8 + 32 + 4 + 8
@@ -26,9 +26,9 @@ type FileHeader struct {
 	FileSize uint64
 	SHA256   [32]byte
 	ChunkL   uint32
-	// RxDDLMS is the receiver decode deadline per block, in milliseconds.
+	// RxDDLMS is the receiver soft deadline for ARQ (seen-block idle-from-lastSymAt), in milliseconds.
 	// It is encoded into the reserved bytes to keep the header length unchanged.
-	// 0 means "not specified".
+	// 0 means "not specified" (receiver uses its default).
 	RxDDLMS uint32
 }
 

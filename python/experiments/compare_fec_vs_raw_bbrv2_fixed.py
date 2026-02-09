@@ -142,6 +142,24 @@ def _to_float(d: Dict[str, str], k: str, default: float = 0.0) -> float:
 		return default
 
 
+def _to_int_opt(d: Dict[str, str], k: str) -> Optional[int]:
+	"""Best-effort parse int field; returns None when missing/unparseable."""
+	if k not in d:
+		return None
+	try:
+		return int(float(d.get(k, "") or ""))
+	except Exception:
+		return None
+
+
+def _pick_int_opt(d: Dict[str, str], keys: Sequence[str]) -> Optional[int]:
+	for k in keys:
+		v = _to_int_opt(d, k)
+		if v is not None:
+			return v
+	return None
+
+
 def _run_script(*, script: Path, env: Dict[str, str], timeout_s: int) -> str:
 	p = subprocess.run(
 		["bash", str(script)],
@@ -231,6 +249,13 @@ class Rec:
 	dur_ms: int
 	overhead_ratio: float
 	overhead_quic_ratio: float
+	stage_total_ms: Optional[int]
+	stage_send_ms: Optional[int]
+	stage_ack_ms: Optional[int]
+	stage_arq_drain_ms: Optional[int]
+	stage_done_wait_ms: Optional[int]
+	arq_attempts: Optional[int]
+	arq_tx_repairs: Optional[int]
 	extra: Dict[str, Any]
 
 
@@ -261,19 +286,19 @@ def _summarize(recs: List[Rec]) -> Dict[str, Any]:
 
 def main() -> int:
 	ap = argparse.ArgumentParser(description="Compare QUIC-FEC vs QUIC-raw under fixed bw/rtt and loss modes")
-	ap.add_argument("--reps", type=int, default=20)
+	ap.add_argument("--reps", type=int, default=10)
 	ap.add_argument("--bitrate-mbps", type=int, default=10)
-	ap.add_argument("--rtt-ms", type=int, default=60)
+	ap.add_argument("--rtt-ms", type=int, default=136)
 	ap.add_argument(
 		"--loss-modes",
 		type=str,
-		default="none;gemodel:15.384615,70.000000,0.000000,99.000000",
+		default="gemodel:15.384615,70.000000,0.000000,99.000000",
 		help="Loss modes list. Use ';' separated values. Example: 'none;gemodel:p,r,h,k'.",
 	)
 	ap.add_argument(
 		"--files",
 		type=str,
-		default="128k,1m",
+		default="1m",
 		help="Which file sizes to run: '128k', '1m' (comma list).",
 	)
 	ap.add_argument("--timeout-s", type=int, default=180)
@@ -287,9 +312,23 @@ def main() -> int:
 
 	# QUIC-FEC knobs (passed to scripts/quicfec_run_once.sh)
 	ap.add_argument("--k", type=int, default=40)
-	ap.add_argument("--r0", type=int, default=8)
-	ap.add_argument("--rstep", type=int, default=8)
+	ap.add_argument("--r0", type=int, default=10)
+	ap.add_argument("--rstep", type=int, default=2)
 	ap.add_argument("--symbol-bytes", type=int, default=1200)
+	ap.add_argument(
+		"--ddl-ms",
+		type=int,
+		default=50,
+		help="Receiver ARQ soft deadline in ms (header-carried; passed as DDL_MS to quicfec_run_once.sh)",
+	)
+	ap.add_argument(
+		"--decode-ddl-ms",
+		type=int,
+		default=25,
+		help="Receiver decode/check pacing in ms (server-side; passed as DECODE_DDL_MS to quicfec_run_once.sh)",
+	)
+	ap.add_argument("--w", type=int, default=8, help="ARQ window W (passed to quicfec_run_once.sh)")
+	ap.add_argument("--max-attempts", type=int, default=0, help="ARQ max attempts per cluster (passed to quicfec_run_once.sh; 0 means no cap)")
 
 	ap.add_argument("--run-tag", type=str, default="")
 	ap.add_argument("--out-dir", type=str, default="")
@@ -355,7 +394,7 @@ def main() -> int:
 		**net_env,
 		"SKIP_NETNS_RESET": "1",
 		"SKIP_SYSCTL": "1",
-		"SKIP_BUILD": "1",
+		"SKIP_BUILD": "0",
 		"BITRATE_MBPS": str(int(args.bitrate_mbps)),
 		"RTT_MS": str(int(args.rtt_ms)),
 		"TIMEOUT_S": str(int(args.timeout_transfer_s)),
@@ -370,6 +409,11 @@ def main() -> int:
 		file_path = file_map[file_label]
 		for loss_mode in loss_modes:
 			for rep in range(int(args.reps)):
+				r0_eff = int(args.r0)
+				# For a pure no-loss baseline, sending initial parity (R0>0) only adds bytes
+				# and can make dur_ms worse than quic-raw. Keep R0=0 and rely on ARQ if needed.
+				if str(loss_mode).strip().lower() == "none":
+					r0_eff = 0
 				env_raw = {**common_env, "LOSS_MODE": str(loss_mode), "FILE": str(file_path)}
 				if args.enable_quic_overhead:
 					env_raw["RAW_STATS"] = "1"
@@ -380,6 +424,9 @@ def main() -> int:
 				)
 				raw_line = _extract_last_run_record(raw_stderr)
 				raw_kv = _parse_kv_from_run_line(raw_line)
+				raw_stage_total_ms = _pick_int_opt(raw_kv, ["raw_total_ms", "dur_ms_client"])
+				raw_stage_send_ms = _to_int_opt(raw_kv, "raw_send_ms")
+				raw_stage_ack_ms = _to_int_opt(raw_kv, "raw_ack_ms")
 				raw_ok = 1 if (
 					_to_int(raw_kv, "timed_out", 0) == 0
 					and _to_int(raw_kv, "md5_ok", 0) == 1
@@ -396,6 +443,13 @@ def main() -> int:
 						dur_ms=int(_to_int(raw_kv, "dur_ms", 0)),
 						overhead_ratio=float(_overhead_quic_ratio_from_kv(kv=raw_kv)),
 						overhead_quic_ratio=float(_overhead_quic_ratio_from_kv(kv=raw_kv)),
+						stage_total_ms=raw_stage_total_ms,
+						stage_send_ms=raw_stage_send_ms,
+						stage_ack_ms=raw_stage_ack_ms,
+						stage_arq_drain_ms=None,
+						stage_done_wait_ms=None,
+						arq_attempts=None,
+						arq_tx_repairs=None,
 						extra={"run": raw_kv},
 					)
 				)
@@ -405,11 +459,16 @@ def main() -> int:
 					"LOSS_MODE": str(loss_mode),
 					"FILE": str(file_path),
 					"K": str(int(args.k)),
-					"R0": str(int(args.r0)),
+					"R0": str(int(r0_eff)),
 					"RSTEP": str(int(args.rstep)),
 					"SYMBOL_BYTES": str(int(args.symbol_bytes)),
+					"DDL_MS": str(int(args.ddl_ms)),
+					"DECODE_DDL_MS": str(int(args.decode_ddl_ms)),
+					"W": str(int(args.w)),
+					"MAX_ATTEMPTS": str(int(args.max_attempts)),
 					"USE_ARQ": "1",
 				}
+				# Soft deadline is carried by the header (DDL_MS). Keep only one source of truth.
 				if args.enable_quic_overhead:
 					env_fec["FEC_STATS"] = "1"
 				fec_stderr = _run_script(
@@ -419,6 +478,12 @@ def main() -> int:
 				)
 				fec_line = _extract_last_run_record(fec_stderr)
 				fec_kv = _parse_kv_from_run_line(fec_line)
+				fec_stage_total_ms = _pick_int_opt(fec_kv, ["fec_total_ms", "dur_ms_client"])
+				fec_stage_send_ms = _pick_int_opt(fec_kv, ["fec_send_blocks_ms"])
+				fec_stage_arq_drain_ms = _to_int_opt(fec_kv, "fec_arq_drain_ms")
+				fec_stage_done_wait_ms = _to_int_opt(fec_kv, "fec_done_wait_ms")
+				fec_arq_attempts = _to_int_opt(fec_kv, "arq_attempts")
+				fec_arq_tx_repairs = _to_int_opt(fec_kv, "arq_tx_repairs")
 				fec_ok = 1 if (
 					_to_int(fec_kv, "timed_out", 0) == 0
 					and _to_int(fec_kv, "md5_ok", 0) == 1
@@ -435,14 +500,21 @@ def main() -> int:
 						dur_ms=int(_to_int(fec_kv, "dur_ms", 0)),
 						overhead_ratio=float(_overhead_quic_ratio_from_kv(kv=fec_kv)),
 						overhead_quic_ratio=float(_overhead_quic_ratio_from_kv(kv=fec_kv)),
+						stage_total_ms=fec_stage_total_ms,
+						stage_send_ms=fec_stage_send_ms,
+						stage_ack_ms=None,
+						stage_arq_drain_ms=fec_stage_arq_drain_ms,
+						stage_done_wait_ms=fec_stage_done_wait_ms,
+						arq_attempts=fec_arq_attempts,
+						arq_tx_repairs=fec_arq_tx_repairs,
 						extra={"run": fec_kv},
 					)
 				)
 
 				print(
 					f"rep={rep:02d} file={file_label} loss={loss_mode} "
-					f"raw(ok={raw_ok} dur_ms={_to_int(raw_kv,'dur_ms',0)} ov={_overhead_quic_ratio_from_kv(kv=raw_kv)*100:.2f}%) "
-					f"fec(ok={fec_ok} dur_ms={_to_int(fec_kv,'dur_ms',0)} ov={_overhead_quic_ratio_from_kv(kv=fec_kv)*100:.2f}%)"
+					f"raw(ok={raw_ok} dur_ms={_to_int(raw_kv,'dur_ms',0)} total_ms={raw_stage_total_ms} send_ms={raw_stage_send_ms} ack_ms={raw_stage_ack_ms} ov={_overhead_quic_ratio_from_kv(kv=raw_kv)*100:.2f}%) "
+					f"fec(ok={fec_ok} dur_ms={_to_int(fec_kv,'dur_ms',0)} total_ms={fec_stage_total_ms} send_blocks_ms={fec_stage_send_ms} arq_drain_ms={fec_stage_arq_drain_ms} done_wait_ms={fec_stage_done_wait_ms} arq_attempts={fec_arq_attempts} arq_repairs={fec_arq_tx_repairs} ov={_overhead_quic_ratio_from_kv(kv=fec_kv)*100:.2f}%)"
 				)
 
 	out_jsonl = out_dir / "results.jsonl"
@@ -460,6 +532,13 @@ def main() -> int:
 						"dur_ms": r.dur_ms,
 						"overhead_ratio": r.overhead_ratio,
 						"overhead_quic_ratio": r.overhead_quic_ratio,
+						"stage_total_ms": r.stage_total_ms,
+						"stage_send_ms": r.stage_send_ms,
+						"stage_ack_ms": r.stage_ack_ms,
+						"stage_arq_drain_ms": r.stage_arq_drain_ms,
+						"stage_done_wait_ms": r.stage_done_wait_ms,
+						"arq_attempts": r.arq_attempts,
+						"arq_tx_repairs": r.arq_tx_repairs,
 						"extra": r.extra,
 					},
 					ensure_ascii=False,
@@ -471,7 +550,24 @@ def main() -> int:
 	with out_csv.open("w", newline="", encoding="utf-8") as f:
 		w = csv.DictWriter(
 			f,
-			fieldnames=["file", "loss_mode", "proto", "rep", "ok", "goodput_mbps", "dur_ms", "overhead_pct", "overhead_quic_pct"],
+			fieldnames=[
+				"file",
+				"loss_mode",
+				"proto",
+				"rep",
+				"ok",
+				"goodput_mbps",
+				"dur_ms",
+				"stage_total_ms",
+				"stage_send_ms",
+				"stage_ack_ms",
+				"stage_arq_drain_ms",
+				"stage_done_wait_ms",
+				"arq_attempts",
+				"arq_tx_repairs",
+				"overhead_pct",
+				"overhead_quic_pct",
+			],
 		)
 		w.writeheader()
 		for r in recs:
@@ -484,6 +580,13 @@ def main() -> int:
 					"ok": r.ok,
 					"goodput_mbps": f"{r.goodput_mbps:.6f}",
 					"dur_ms": r.dur_ms,
+					"stage_total_ms": "" if r.stage_total_ms is None else int(r.stage_total_ms),
+					"stage_send_ms": "" if r.stage_send_ms is None else int(r.stage_send_ms),
+					"stage_ack_ms": "" if r.stage_ack_ms is None else int(r.stage_ack_ms),
+					"stage_arq_drain_ms": "" if r.stage_arq_drain_ms is None else int(r.stage_arq_drain_ms),
+					"stage_done_wait_ms": "" if r.stage_done_wait_ms is None else int(r.stage_done_wait_ms),
+					"arq_attempts": "" if r.arq_attempts is None else int(r.arq_attempts),
+					"arq_tx_repairs": "" if r.arq_tx_repairs is None else int(r.arq_tx_repairs),
 					"overhead_pct": f"{r.overhead_ratio*100.0:.6f}",
 					"overhead_quic_pct": f"{r.overhead_quic_ratio*100.0:.6f}",
 				}
@@ -509,7 +612,16 @@ def main() -> int:
 				"run_tag": run_tag,
 				"run_tag_effective": run_tag_effective,
 				"net_env": net_env,
-				"fec": {"K": int(args.k), "R0": int(args.r0), "RSTEP": int(args.rstep), "SYMBOL_BYTES": int(args.symbol_bytes)},
+				"fec": {
+					"K": int(args.k),
+					"R0": int(args.r0),
+					"RSTEP": int(args.rstep),
+					"SYMBOL_BYTES": int(args.symbol_bytes),
+					"DDL_MS": int(args.ddl_ms),
+					"DECODE_DDL_MS": int(args.decode_ddl_ms),
+					"W": int(args.w),
+					"MAX_ATTEMPTS": int(args.max_attempts),
+				},
 				"overhead_definition": "overhead_ratio = max(0, (quic_sent_bytes - file_bytes)/file_bytes), quic_sent_bytes from QUIC tracer (attempted send bytes, pre-qdisc)",
 				"overhead_quic_definition": "overhead_quic_ratio = max(0, (quic_sent_bytes - file_bytes)/file_bytes), quic_sent_bytes from QUIC tracer (attempted send bytes, pre-qdisc)",
 			},
