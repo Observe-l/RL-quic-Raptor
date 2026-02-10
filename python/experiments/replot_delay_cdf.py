@@ -143,7 +143,7 @@ def main() -> int:
     # No title (paper figure style)
     ax.set_xlabel("E2E delay per message (ms)")
     ax.set_ylabel("CDF")
-    ax.set_ylim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.02)
     # if args.xmax_ms is not None and float(args.xmax_ms) > 0:
     ax.set_xlim(float(args.xmin_ms), float(args.xmax_ms))
 
