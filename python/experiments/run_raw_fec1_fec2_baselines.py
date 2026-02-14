@@ -331,6 +331,18 @@ def main() -> int:
 
 	ap.add_argument("--file-bytes", type=int, default=128 * 1024)
 	ap.add_argument("--symbol-bytes", type=int, default=1200)
+	ap.add_argument(
+		"--ddl-ms",
+		type=int,
+		default=55,
+		help="Receiver ARQ soft deadline in ms (passed as DDL_MS to quicfec_run_once.sh)",
+	)
+	ap.add_argument(
+		"--decode-ddl-ms",
+		type=int,
+		default=25,
+		help="Receiver decode/check pacing in ms (passed as DECODE_DDL_MS to quicfec_run_once.sh)",
+	)
 
 	ap.add_argument("--enable-quic-overhead", type=int, default=1, choices=[0, 1])
 
@@ -348,6 +360,7 @@ def main() -> int:
 	file_path = _REPO_ROOT / "go" / "test_data" / f"baseline_payload_{int(args.file_bytes)}B_{run_tag}.bin"
 	_ensure_file_of_size(file_path=file_path, file_bytes=int(args.file_bytes))
 
+	# Setup netns once using quicfec script (has SETUP_ONLY) to build QUIC-FEC binaries.
 	setup_env = {
 		**net_env,
 		"OUT_DIR": str(tmp_out_dir),
@@ -360,14 +373,30 @@ def main() -> int:
 		"LOSS_MODE": "none",
 		"TIMEOUT_S": str(int(args.timeout_transfer_s)),
 	}
-	_run_script(script=_REPO_ROOT / "scripts" / "quicraw_run_once.sh", env=setup_env, timeout_s=60)
+	_run_script(script=_REPO_ROOT / "scripts" / "quicfec_run_once.sh", env=setup_env, timeout_s=60)
+
+	# Build quic-raw binaries once as well.
+	raw_setup_env = {
+		**net_env,
+		"OUT_DIR": str(tmp_out_dir),
+		"SETUP_ONLY": "1",
+		"SKIP_NETNS_RESET": "1",
+		"SKIP_TC_CONFIG": "1",
+		"SKIP_BUILD": "0",
+		"BITRATE_MBPS": str(int(args.bitrate_mbps)),
+		"RTT_MS": str(int(args.rtt_ms)),
+		"LOSS_MODE": "none",
+		"TIMEOUT_S": str(int(args.timeout_transfer_s)),
+	}
+	_run_script(script=_REPO_ROOT / "scripts" / "quicraw_run_once.sh", env=raw_setup_env, timeout_s=60)
 
 	common_env = {
 		**net_env,
 		"OUT_DIR": str(tmp_out_dir),
 		"SKIP_NETNS_RESET": "1",
 		"SKIP_TC_CONFIG": "0",
-		"SKIP_BUILD": "1",
+		"SKIP_SYSCTL": "1",
+		"SKIP_BUILD": "0",
 		"BITRATE_MBPS": str(int(args.bitrate_mbps)),
 		"TIMEOUT_S": str(int(args.timeout_transfer_s)),
 		"QUIC_FEC_CC_BYPASS": "0",
@@ -468,15 +497,19 @@ def main() -> int:
 				rep=int(rep),
 			)
 
-			for method, r0 in (("fec_k30_r0_2_rstep_6", 2), ("fec_k30_r0_10_rstep_6", 10)):
+			for method, k, r0, rstep in (
+				("fec_k60_r0_2_rstep_2", 60, 2, 2),
+				("fec_k40_r0_10_rstep_8", 40, 10, 8),
+			):
 				env_fec = {
 					**common_env,
 					"RTT_MS": str(int(rtt_ms)),
 					"LOSS_MODE": str(loss_mode),
-					"K": "30",
+					"K": str(int(k)),
 					"R0": str(int(r0)),
-					"RSTEP": "6",
-					"DDL_MS": "150",
+					"RSTEP": str(int(rstep)),
+					"DDL_MS": str(int(args.ddl_ms)),
+					"DECODE_DDL_MS": str(int(args.decode_ddl_ms)),
 					"SYMBOL_BYTES": str(int(args.symbol_bytes)),
 					"USE_ARQ": "1",
 				}

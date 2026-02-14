@@ -302,7 +302,7 @@ def main() -> int:
 		help="Which file sizes to run: '128k', '1m' (comma list).",
 	)
 	ap.add_argument("--timeout-s", type=int, default=180)
-	ap.add_argument("--timeout-transfer-s", type=int, default=60)
+	ap.add_argument("--timeout-transfer-s", type=int, default=10)
 	ap.add_argument(
 		"--enable-quic-overhead",
 		action="store_true",

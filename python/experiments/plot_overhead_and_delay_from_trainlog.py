@@ -18,52 +18,90 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 
 _METHOD_ORDER = [
+    # Ours first (legend order requirement)
     "bandit",
+    "fec_k60_r0_2_rstep_2",
+    "fec_k40_r0_10_rstep_8",
+    # Baselines
     "quic_bbrv2",
-    "fec_k30_r0_2_rstep_6",
-    "fec_k30_r0_10_rstep_6",
+    "flec",
 ]
 
 _METHOD_LABELS = {
     "bandit": "BCIR",
     "quic_bbrv2": "QUIC",
-    "fec_k30_r0_2_rstep_6": "IR-FEC1",
-    "fec_k30_r0_10_rstep_6": "IR-FEC2",
+    "fec_k60_r0_2_rstep_2": "IR-FEC1",
+    "fec_k40_r0_10_rstep_8": "IR-FEC2",
+    "flec": "FLEC",
 }
 
 _METHOD_COLORS = {
     "bandit": "#1f77b4",
     "quic_bbrv2": "#ff7f0e",
-    "fec_k30_r0_2_rstep_6": "#2ca02c",
-    "fec_k30_r0_10_rstep_6": "#d62728",
+    "fec_k60_r0_2_rstep_2": "#2ca02c",
+    "fec_k40_r0_10_rstep_8": "#d62728",
+    "flec": "#9467bd",
 }
 
 _METHOD_MARKERS = {
-    "bandit": "o",
-    "quic_bbrv2": "^",
-    "fec_k30_r0_2_rstep_6": "s",
-    "fec_k30_r0_10_rstep_6": "D",
+    # Prefer small, line-constructed markers for dense IEEE plots.
+    "bandit": "+",
+    "fec_k60_r0_2_rstep_2": "x",
+    "fec_k40_r0_10_rstep_8": "1",
+    "quic_bbrv2": "2",
+    "flec": ".",
 }
 
 
 def _configure_matplotlib() -> None:
+    # Avoid inheriting any global style (e.g., seaborn defaults from user matplotlibrc).
+    plt.style.use("default")
     plt.rcParams.update(
         {
-            "figure.figsize": (8.6, 3.4),
-            "font.size": 10,
-            "axes.labelsize": 10,
-            "axes.titlesize": 10,
-            "legend.fontsize": 8,
-            "xtick.labelsize": 9,
-            "ytick.labelsize": 9,
+            # IEEE-friendly defaults (single-column-ish). Individual plots may override size.
+            "figure.figsize": (3.8, 2.40),
+            "font.size": 8,
+            "axes.labelsize": 8,
+            "axes.titlesize": 8,
+            "legend.fontsize": 7,
+            "xtick.labelsize": 7,
+            "ytick.labelsize": 7,
+            # White background + thin gray grid.
+            "figure.facecolor": "white",
+            "axes.facecolor": "white",
+            "savefig.facecolor": "white",
+            "axes.axisbelow": True,
+            "axes.edgecolor": "black",
+            "axes.spines.top": True,
+            "axes.spines.right": True,
             "axes.grid": True,
-            "grid.alpha": 0.25,
-            "lines.linewidth": 1.1,
+            "grid.color": "#d0d0d0",
+            "grid.alpha": 0.55,
+            "grid.linewidth": 0.4,
+            "grid.linestyle": "-",
+            "lines.linewidth": 0.9,
+            # Ticks point inward (paper style).
+            "xtick.direction": "in",
+            "ytick.direction": "in",
+            "xtick.major.size": 3.0,
+            "ytick.major.size": 3.0,
             "savefig.dpi": 400,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
+            # Try a Times-like serif for IEEE; fall back gracefully.
+            "font.family": "serif",
+            "font.serif": ["Times New Roman", "Times", "DejaVu Serif"],
         }
     )
+
+
+def _is_ours_method(method: str) -> bool:
+    m = str(method or "")
+    if m == "bandit":
+        return True
+    if m.startswith("fec_"):
+        return True
+    return False
 
 
 def _ecdf(values: Sequence[float]) -> Tuple[np.ndarray, np.ndarray]:
@@ -82,6 +120,21 @@ def _goodput_mbps(*, file_bytes: int, dur_ms: float) -> float:
         return 0.0
     sec = float(dur_ms) / 1000.0
     return float(file_bytes) * 8.0 / 1e6 / sec
+
+
+def _goodput_mbps_from_flec(*, data_bytes: int, e2e_s: float, rtt_ms: float) -> float:
+    # Requirement (FLEC): goodput := data_size / (e2e_delay - RTT/2)
+    # with e2e_delay from file and RTT matching the baseline RTT.
+    if int(data_bytes) <= 0:
+        return 0.0
+    if not np.isfinite(float(e2e_s)) or float(e2e_s) <= 0:
+        return 0.0
+    if not np.isfinite(float(rtt_ms)) or float(rtt_ms) < 0:
+        rtt_ms = 0.0
+    denom_s = float(e2e_s) - float(rtt_ms) / 2000.0
+    if not np.isfinite(denom_s) or denom_s <= 0:
+        return 0.0
+    return float(data_bytes) * 8.0 / 1e6 / float(denom_s)
 
 
 @dataclass
@@ -138,6 +191,27 @@ def _filter_trials(
         if int(t.dur_ms) <= 0:
             continue
         if not math.isfinite(float(t.overhead_ratio)):
+            continue
+        out.append(t)
+    return out
+
+
+def _filter_trials_for_completion(trials: Iterable[Trial], *, task: str) -> List[Trial]:
+    """Filter only by task and basic numeric sanity.
+
+    IMPORTANT: Do NOT drop failures here.
+    Completion ratio should have denominator = all trials (including failures/timeouts),
+    otherwise it becomes a conditional ratio over successes only.
+    """
+
+    out: List[Trial] = []
+    for t in trials:
+        if t.task != task:
+            continue
+        if not math.isfinite(float(t.overhead_ratio)):
+            continue
+        # Allow dur_ms==0 for failures; they count as not completed.
+        if int(t.dur_ms) < 0:
             continue
         out.append(t)
     return out
@@ -208,7 +282,7 @@ def _scatter_plot(
     pts: List[Tuple[str, float, float]],
 ) -> None:
     _configure_matplotlib()
-    fig, ax = plt.subplots()
+    fig, ax = plt.subplots(figsize=(3.8, 2.40))
 
     methods: List[str] = []
     for method, _x, _y in pts:
@@ -223,23 +297,25 @@ def _scatter_plot(
         if not xs:
             continue
         marker = markers.get(method, "o")
-        edgecolors = "none" if marker not in {"x", "+"} else None
+        # Smaller points + transparency for dense scatter.
         ax.scatter(
             xs,
             ys,
-            s=26,
-            alpha=0.85,
+            s=14,
+            alpha=0.55,
             marker=marker,
             label=labels.get(method, method),
             color=colors.get(method, None),
-            edgecolors=edgecolors,
+            linewidths=0.45,
+            rasterized=True,
         )
 
-    if title:
-        ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
+
+    # Keep legend placement as before (do not move to top).
     ax.legend(loc="best", frameon=True)
+
     fig.tight_layout()
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -251,24 +327,29 @@ def _scatter_plot(
 
 def _plot_delay_cdf(*, out_path: Path, title: str, series: List[Tuple[str, Sequence[float]]], xin_ms: float, xmax_ms: float) -> None:
     _configure_matplotlib()
-    fig, ax = plt.subplots()
+    fig, ax = plt.subplots(figsize=(3.8, 2.40))
 
     labels, colors, _markers = _style_maps_for_methods([m for m, _ in series])
     for method, vals in series:
         x, y = _ecdf(vals)
         if x.size == 0:
             continue
-        ax.plot(x, y, label=labels.get(method, method), color=colors.get(method, None))
-
-    if title:
-        ax.set_title(title)
+        ax.plot(
+            x,
+            y,
+            label=labels.get(method, method),
+            color=colors.get(method, None),
+            linestyle=("-" if _is_ours_method(method) else "--"),
+            linewidth=0.85,
+        )
     ax.set_xlabel("E2E delay per message (ms)")
     ax.set_ylabel("CDF")
     ax.set_ylim(0.0, 1.0)
     # if xmax_ms is not None and float(xmax_ms) > 0:
     ax.set_xlim(float(xin_ms), float(xmax_ms))
 
-    ax.legend(loc="lower right", frameon=True)
+    # Keep legend placement as before.
+    ax.legend(loc="upper left", frameon=True)
     fig.tight_layout()
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -294,7 +375,8 @@ def _plot_completion_ratio_2x2(
     labels, colors, markers = _style_maps_for_methods(methods)
 
     _configure_matplotlib()
-    fig, axes = plt.subplots(2, 2, figsize=(7.2, 6.0), sharex=False, sharey=True)
+    # Two-column-ish figure.
+    fig, axes = plt.subplots(2, 2, figsize=(7.00, 3.60), sharex=False, sharey=True)
     axes_flat = list(axes.flatten())
 
     for i, ddl_ms in enumerate(ddl_ms_list):
@@ -309,14 +391,25 @@ def _plot_completion_ratio_2x2(
             ax.scatter(
                 xs,
                 ys,
-                s=26,
-                alpha=0.85,
+                s=12,
+                alpha=0.55,
                 marker=markers.get(method, "o"),
                 color=colors.get(method, None),
                 label=labels.get(method, method),
+                linewidths=0.45,
+                rasterized=True,
             )
 
-        ax.set_title(f"DDL={int(ddl_ms)}ms")
+        # No subplot titles (paper-style). Use a small in-axes annotation instead.
+        ax.text(
+            0.02,
+            0.96,
+            f"DDL={int(ddl_ms)}ms",
+            transform=ax.transAxes,
+            va="top",
+            ha="left",
+            fontsize=7,
+        )
         ax.set_xlabel("overhead")
         ax.set_ylim(float(ylim[0]), float(ylim[1]))
         if i % 2 == 0:
@@ -426,7 +519,21 @@ def _load_bandit_trials_from_trainlog(
             dur_ms_server = float(env_info.get("dur_ms", 0.0) or 0.0)
             e2e_delay_ms = float(env_info.get("e2e_delay_ms", 0.0) or 0.0)
             raw_obs = env_info.get("raw_obs") if isinstance(env_info.get("raw_obs"), dict) else {}
-            overhead_ratio = float(raw_obs.get("fec_overhead", 0.0) or 0.0)
+
+            # Fair comparison requirement:
+            # Use QUIC-layer byte overhead ratio for both raw QUIC and QUIC-FEC.
+            # Prefer env_info.quic_overhead_ratio when present; fall back to old fec_overhead
+            # (repair/source) only for backwards compatibility with older logs.
+            overhead_ratio: float
+            qov = env_info.get("quic_overhead_ratio", None)
+            try:
+                qov_f = float(qov) if qov is not None else float("nan")
+            except Exception:
+                qov_f = float("nan")
+            if np.isfinite(qov_f) and qov_f >= 0:
+                overhead_ratio = float(qov_f)
+            else:
+                overhead_ratio = float(raw_obs.get("fec_overhead", 0.0) or 0.0)
 
             # Requirement: goodput := file_size / dur_ms (server dur_ms).
             goodput_mbps = _goodput_mbps(file_bytes=int(file_bytes), dur_ms=float(dur_ms_server))
@@ -453,6 +560,90 @@ def _load_bandit_trials_from_trainlog(
     return out
 
 
+def _load_flec_trials(
+    *,
+    flec_jsonl: Path,
+    file_bytes: int,
+    duration_field: str,
+    sender_ids: Optional[Sequence[int]],
+    fallback_rtt_ms: Optional[int],
+) -> List[Trial]:
+    out: List[Trial] = []
+    if not flec_jsonl.exists():
+        return out
+
+    sender_allow: Optional[set[int]] = None
+    if sender_ids is not None and len(sender_ids) > 0:
+        sender_allow = set(int(x) for x in sender_ids)
+
+    task = "delay_128kb" if int(file_bytes) == 128 * 1024 else f"file_{int(file_bytes)}B"
+
+    with flec_jsonl.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = (line or "").strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(d, dict):
+                continue
+
+            try:
+                sid = int(d.get("sender", 0) or 0)
+            except Exception:
+                sid = 0
+            if sender_allow is not None and sid not in sender_allow:
+                continue
+
+            ok = int(d.get("ok", 0) or 0)
+            # e2e delay and overhead are used directly from file.
+            e2e_s = float(d.get("e2e_s", 0.0) or 0.0)
+            overhead = float(d.get("overhead", 0.0) or 0.0)
+
+            # Prefer RTT from file; fall back to baseline RTT if missing.
+            rtt_ms = d.get("rtt_ms", None)
+            try:
+                rtt_ms_f = float(rtt_ms) if rtt_ms is not None else float(fallback_rtt_ms or 0)
+            except Exception:
+                rtt_ms_f = float(fallback_rtt_ms or 0)
+
+            # Determine payload size for goodput.
+            data_bytes = d.get("payload_bytes", None)
+            if data_bytes is None:
+                data_bytes = d.get("resp_bytes", None)
+            if data_bytes is None:
+                data_bytes = d.get("received_bytes", None)
+            try:
+                data_i = int(data_bytes) if data_bytes is not None else int(file_bytes)
+            except Exception:
+                data_i = int(file_bytes)
+
+            goodput = _goodput_mbps_from_flec(data_bytes=int(data_i), e2e_s=float(e2e_s), rtt_ms=float(rtt_ms_f))
+
+            delay_ms = int(round(float(e2e_s) * 1000.0)) if float(e2e_s) > 0 else 0
+            if duration_field not in {"dur_ms", "e2e_delay_ms"}:
+                duration_field = "e2e_delay_ms"
+            # FLEC only provides E2E; we use it for both plotting modes.
+            dur_ms_plot = int(delay_ms)
+
+            out.append(
+                Trial(
+                    task=str(task),
+                    method="flec",
+                    sender_id=int(sid),
+                    is_warmup=0,
+                    success=int(ok),
+                    dur_ms=int(dur_ms_plot),
+                    goodput_mbps=float(goodput),
+                    overhead_ratio=float(overhead),
+                )
+            )
+
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=(
@@ -461,6 +652,7 @@ def main() -> int:
     )
     ap.add_argument("--baseline-in-dir", type=str, required=True, help="Directory containing results.csv from run_raw_fec1_fec2_baselines.py")
     ap.add_argument("--bandit-train-log", type=str, required=True, help="Bandit training log JSONL file")
+    ap.add_argument("--flec-jsonl", type=str, default="", help="Optional FLEC results jsonl (adds method 'flec')")
     ap.add_argument("--out-dir", type=str, default="", help="Output directory (default: baseline-in-dir)")
 
     ap.add_argument("--file-bytes", type=int, default=128 * 1024, help="Payload size in bytes (default 128KB)")
@@ -479,7 +671,7 @@ def main() -> int:
     ap.add_argument(
         "--methods",
         type=str,
-        default="bandit,quic_bbrv2,fec_k30_r0_2_rstep_6,fec_k30_r0_10_rstep_6",
+        default="bandit,quic_bbrv2,fec_k60_r0_2_rstep_2,fec_k40_r0_10_rstep_8",
         help="Comma list of methods to include",
     )
 
@@ -524,21 +716,49 @@ def main() -> int:
     )
     trials.extend([t for t in baseline_trials if t.method in methods_wanted])
 
+    # Optional: load FLEC jsonl if requested and included in methods.
+    flec_path_s = str(args.flec_jsonl or "").strip()
+    if "flec" in methods_wanted and flec_path_s:
+        # Fallback RTT: try baseline meta.json args.rtt_ms (IID default), else 0.
+        fallback_rtt_ms: Optional[int] = None
+        meta_path = baseline_in_dir / "meta.json"
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                if isinstance(meta, dict):
+                    a = meta.get("args")
+                    if isinstance(a, dict):
+                        fallback_rtt_ms = int(a.get("rtt_ms", 0) or 0)
+            except Exception:
+                fallback_rtt_ms = None
+
+        trials.extend(
+            _load_flec_trials(
+                flec_jsonl=Path(flec_path_s),
+                file_bytes=int(args.file_bytes),
+                duration_field=str(args.duration_field),
+                sender_ids=sender_ids,
+                fallback_rtt_ms=fallback_rtt_ms,
+            )
+        )
+
     task = "delay_128kb" if int(args.file_bytes) == 128 * 1024 else f"file_{int(args.file_bytes)}B"
 
-    trials_f = _filter_trials(trials, task=task, include_failures=bool(args.include_failures))
-    if not trials_f:
+    trials_scatter = _filter_trials(trials, task=task, include_failures=bool(args.include_failures))
+    if not trials_scatter:
         raise SystemExit("no trials after filtering")
 
-    methods_in_data = _method_list_in_data(trials_f, methods_preferred=_METHOD_ORDER)
+    trials_completion = _filter_trials_for_completion(trials, task=task)
+
+    methods_in_data = _method_list_in_data(trials_scatter, methods_preferred=_METHOD_ORDER)
 
     # Scatter: goodput vs overhead
     if str(args.aggregate) == "sender_method_mean":
-        pts_goodput = _aggregate_sender_method_mean(trials_f, y="goodput")
-        pts_delay = _aggregate_sender_method_mean(trials_f, y="delay")
+        pts_goodput = _aggregate_sender_method_mean(trials_scatter, y="goodput")
+        pts_delay = _aggregate_sender_method_mean(trials_scatter, y="delay")
     else:
-        pts_goodput = [(t.method, float(t.overhead_ratio), float(t.goodput_mbps)) for t in trials_f]
-        pts_delay = [(t.method, float(t.overhead_ratio), float(t.dur_ms)) for t in trials_f]
+        pts_goodput = [(t.method, float(t.overhead_ratio), float(t.goodput_mbps)) for t in trials_scatter]
+        pts_delay = [(t.method, float(t.overhead_ratio), float(t.dur_ms)) for t in trials_scatter]
 
     title_suffix = f"file={int(args.file_bytes)}B"
     if args.t_min is not None or args.t_max is not None:
@@ -563,7 +783,7 @@ def main() -> int:
     # Delay CDF
     series: List[Tuple[str, Sequence[float]]] = []
     for m in methods_in_data:
-        xs = [float(t.dur_ms) for t in trials_f if t.method == m and int(t.success) == 1 and int(t.dur_ms) > 0]
+        xs = [float(t.dur_ms) for t in trials_scatter if t.method == m and int(t.success) == 1 and int(t.dur_ms) > 0]
         series.append((m, xs))
 
     _plot_delay_cdf(
@@ -578,7 +798,7 @@ def main() -> int:
     _plot_completion_ratio_2x2(
         out_path=out_dir / "completion_vs_overhead_2x2.pdf",
         ddl_ms_list=[200, 300, 400, 500],
-        trials=trials_f,
+        trials=trials_completion,
         ylim=(-0.02, 1.02),
     )
 
