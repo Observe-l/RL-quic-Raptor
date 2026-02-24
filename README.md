@@ -86,3 +86,120 @@ python3 python/experiments/replot_delay_cdf.py --in-dir python/results/paper-del
 
 python3 python/bandit/run_lints_ge_schedule.py --reward-w-goodput 1.0 --reward-w-overhead 0.8 --result-dir python/results/bandit-ge-rg1.0-ro0.8
 ```
+
+## Plotting: paper-style “10 figures” (script version)
+
+These scripts re-create the **10 plot types** that were previously produced by the notebook.
+They load:
+- Baseline CSVs: `python/results/*-baseline-data/results.csv`
+- Bandit eval CSVs: `python/results/*-bandit-*/bandit_eval_results.csv` (matches both `*-bandit-data-*` and `*-bandit-date-*`)
+- FLEC JSONL (schema `flec_metrics_v2`): default `python/results/flec_data/*.jsonl`
+
+All scripts write figures to `python/results/paper10_figs/` by default.
+
+### Shared options
+- `--methods bandit,fec_k60_r0_2_rstep_2,fec_k40_r0_10_rstep_8,quic_bbrv2,flec`
+  - Controls which methods appear in the plot (comma-separated).
+- `--flec-e2e-offset-ms <float>`
+  - Applies an offset (ms, can be negative) to FLEC E2E delay using v2 field `e2e_s_minus_plugin_time_est`.
+  - Default is `0`.
+- `--xmin/--xmax/--ymin/--ymax <float>`
+  - Optional axis ranges for the plot. If omitted, the script keeps its default/auto limits.
+
+#### Shared options: explicit data sources (recommended)
+By default, paper10 scripts glob inputs from `python/results/`. To avoid mixing datasets, you can explicitly provide inputs:
+- `--baseline-in-dir <dir>` (repeatable)
+  - A baseline results directory containing `results.csv`.
+- `--baseline-results-csv <path>` (repeatable)
+  - A specific baseline `results.csv`.
+- `--bandit-eval-results-csv <path>` (repeatable)
+  - A specific `bandit_eval_results.csv`.
+- `--bandit-eval-log <path>` (repeatable)
+  - A specific `bandit_eval_metrics.jsonl`.
+- `--only-inputs-specified`
+  - If set, ignores `--baseline-glob/--bandit-glob` and loads only the explicit paths provided.
+
+### (1) E2E delay CDF
+```bash
+python3 python/experiments/paper10_plot_01_delay_cdf.py \
+  --scenario ge \
+  --flec-e2e-offset-ms 0 \
+  --out python/results/paper10_figs/01_delay_cdf.pdf
+```
+
+### (2) Overhead boxplot
+```bash
+python3 python/experiments/paper10_plot_02_overhead_boxplot.py \
+  --scenario ge \
+  --flec-e2e-offset-ms 0 \
+  --out python/results/paper10_figs/02_overhead_boxplot.pdf
+```
+
+### (3) Completion ratio vs DDL
+```bash
+python3 python/experiments/paper10_plot_03_completion_ratio_vs_ddl.py \
+  --scenario ge \
+  --ddl-ms-list 200,300,400,500 \
+  --flec-e2e-offset-ms 0 \
+  --out python/results/paper10_figs/03_completion_ratio_vs_ddl.pdf
+```
+
+### (4) Overhead vs E2E delay scatter
+```bash
+python3 python/experiments/paper10_plot_04_overhead_vs_delay_scatter.py \
+  --scenario ge \
+  --agg sender_loss_method_mean \
+  --flec-e2e-offset-ms 0 \
+  --out python/results/paper10_figs/04_overhead_vs_delay_scatter.pdf
+```
+
+### (5) Delay percentile bar chart (p50/p99)
+```bash
+python3 python/experiments/paper10_plot_05_delay_percentiles_bar.py \
+  --scenario ge \
+  --pcts 50,99 \
+  --flec-e2e-offset-ms 0 \
+  --out python/results/paper10_figs/05_delay_percentiles_bar.pdf
+```
+
+### (6) Failure/timeout rate bar chart (timeout default 1s)
+```bash
+python3 python/experiments/paper10_plot_06_failure_timeout_rate_bar.py \
+  --scenario ge \
+  --timeout-s 1.0 \
+  --flec-e2e-offset-ms 0 \
+  --out python/results/paper10_figs/06_failure_timeout_rate_bar.pdf
+```
+
+### (7) GE: completion ratio by `pi_bad` bins (default DDL=350ms)
+```bash
+python3 python/experiments/paper10_plot_07_ge_completion_by_pibad_bins.py \
+  --ge-ddl-ms 350 \
+  --bins 0,3,6,10,100 \
+  --bin-labels "<3%,3-6%,6-10%,>10%" \
+  --flec-e2e-offset-ms 0 \
+  --out python/results/paper10_figs/07_ge_completion_by_pibad_bins.pdf
+```
+
+### (8) IID: E2E delay vs loss rate boxplot
+```bash
+python3 python/experiments/paper10_plot_08_iid_delay_vs_loss_boxplot.py \
+  --flec-e2e-offset-ms 0 \
+  --out python/results/paper10_figs/08_iid_delay_vs_loss_boxplot.pdf
+```
+
+### (9) IID: overhead vs loss rate boxplot
+```bash
+python3 python/experiments/paper10_plot_09_iid_overhead_vs_loss_boxplot.py \
+  --flec-e2e-offset-ms 0 \
+  --out python/results/paper10_figs/09_iid_overhead_vs_loss_boxplot.pdf
+```
+
+### (10) Goodput vs overhead scatter
+```bash
+python3 python/experiments/paper10_plot_10_goodput_vs_overhead_scatter.py \
+  --scenario ge \
+  --agg sender_loss_method_mean \
+  --flec-e2e-offset-ms 0 \
+  --out python/results/paper10_figs/10_goodput_vs_overhead_scatter.pdf
+```

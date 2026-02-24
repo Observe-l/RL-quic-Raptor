@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import math
+import os
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -209,6 +210,8 @@ def _load_flec_ge_overhead(
     sender_ids: Optional[set[int]],
     loss_modes: Optional[set[str]],
 ) -> Dict[Tuple[str, int, str], List[float]]:
+    from flec_metrics import flec_corrected_overhead_ratio
+
     out: Dict[Tuple[str, int, str], List[float]] = {}
     if not flec_jsonl.exists():
         return out
@@ -245,11 +248,10 @@ def _load_flec_ge_overhead(
             if loss_modes is not None and loss_mode not in loss_modes:
                 continue
 
-            try:
-                overhead = float(d.get("overhead", float("nan")))
-            except Exception:
-                overhead = float("nan")
-            if not math.isfinite(float(overhead)) or overhead < 0:
+            overhead = flec_corrected_overhead_ratio(d)
+            if overhead is None:
+                continue
+            if not math.isfinite(float(overhead)) or float(overhead) < 0:
                 continue
 
             out.setdefault(("flec", int(sender), loss_mode), []).append(float(overhead))
@@ -336,6 +338,12 @@ def main() -> int:
     ap.add_argument("--bandit-eval-log", type=str, default="", help="bandit_eval_metrics.jsonl for BCIR")
     ap.add_argument("--flec-jsonl", type=str, default="", help="Optional explicit FLEC GE jsonl")
     ap.add_argument("--flec-dir", type=str, default="", help="Directory containing flec_GE_128k.jsonl / flec_GE_1m.jsonl")
+    ap.add_argument(
+        "--flec-e2e-offset-ms",
+        type=float,
+        default=0.0,
+        help="FLEC-only: add this offset (ms) to e2e delay (default 0).",
+    )
     ap.add_argument("--out", type=str, required=True, help="Output PDF path")
     ap.add_argument("--file-bytes", type=int, default=128 * 1024)
     ap.add_argument("--sender-ids", type=str, default="", help="Comma-separated sender ids to include")
@@ -356,6 +364,8 @@ def main() -> int:
     ap.add_argument("--title", type=str, default="")
 
     args = ap.parse_args()
+
+    os.environ["FLEC_E2E_OFFSET_MS"] = str(float(getattr(args, "flec_e2e_offset_ms", 0.0) or 0.0))
 
     baseline_in_dir = Path(str(args.baseline_in_dir))
     results_csv = baseline_in_dir / "results.csv"

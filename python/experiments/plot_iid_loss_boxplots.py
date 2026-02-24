@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -299,6 +300,8 @@ def _load_bandit_eval_points(*, eval_jsonl: Path, methods: set[str], sender_ids:
 
 
 def _load_flec_points(*, flec_jsonl: Path, methods: set[str], sender_ids: Optional[set[int]]) -> List[Point]:
+    from flec_metrics import flec_corrected_e2e_delay_s, flec_corrected_overhead_ratio
+
     pts: List[Point] = []
     if "flec" not in methods:
         return pts
@@ -337,17 +340,14 @@ def _load_flec_points(*, flec_jsonl: Path, methods: set[str], sender_ids: Option
             if not math.isfinite(loss_pct):
                 continue
 
-            try:
-                overhead = float(d.get("overhead", 0.0) or 0.0)
-            except Exception:
-                overhead = 0.0
+            overhead = flec_corrected_overhead_ratio(d)
+            if overhead is None:
+                continue
             if not math.isfinite(overhead) or overhead < 0:
                 continue
 
-            try:
-                delay_ms = float(d.get("e2e_s", 0.0) or 0.0) * 1000.0
-            except Exception:
-                delay_ms = 0.0
+            delay_s = flec_corrected_e2e_delay_s(d)
+            delay_ms = float(delay_s) * 1000.0 if delay_s is not None else 0.0
             if not math.isfinite(delay_ms) or delay_ms <= 0:
                 continue
 
@@ -561,6 +561,12 @@ def main() -> int:
 
     ap.add_argument("--flec-jsonl", type=str, default="", help="Optional FLEC jsonl to include as method 'flec'")
     ap.add_argument("--flec-dir", type=str, default="", help="Optional directory containing flec_iid_{128k,1m}.jsonl")
+    ap.add_argument(
+        "--flec-e2e-offset-ms",
+        type=float,
+        default=0.0,
+        help="FLEC-only: add this offset (ms) to e2e delay (default 0).",
+    )
 
     # Manual axis ranges for the 3 figures. Format: 'min,max'.
     ap.add_argument("--overhead-xlim", type=str, default="", help="xlim for overhead line plot, e.g. '0.08,0.52'")
@@ -571,6 +577,8 @@ def main() -> int:
     ap.add_argument("--tradeoff-ylim", type=str, default="", help="ylim for tradeoff plot, e.g. '0,1200'")
 
     args = ap.parse_args()
+
+    os.environ["FLEC_E2E_OFFSET_MS"] = str(float(getattr(args, "flec_e2e_offset_ms", 0.0) or 0.0))
 
     overhead_xlim = _parse_lim(str(args.overhead_xlim))
     overhead_ylim = _parse_lim(str(args.overhead_ylim))

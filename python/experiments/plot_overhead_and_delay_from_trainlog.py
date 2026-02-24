@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -280,6 +281,8 @@ def _scatter_plot(
     xlabel: str,
     ylabel: str,
     pts: List[Tuple[str, float, float]],
+    xlim: Optional[Tuple[Optional[float], Optional[float]]] = None,
+    ylim: Optional[Tuple[Optional[float], Optional[float]]] = None,
 ) -> None:
     _configure_matplotlib()
     fig, ax = plt.subplots(figsize=(3.8, 2.40))
@@ -313,6 +316,24 @@ def _scatter_plot(
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
 
+    if title:
+        ax.set_title(title)
+
+    if xlim is not None:
+        xmin, xmax = xlim
+        xmin0, xmax0 = ax.get_xlim()
+        ax.set_xlim(
+            left=(xmin if xmin is not None else xmin0),
+            right=(xmax if xmax is not None else xmax0),
+        )
+    if ylim is not None:
+        ymin, ymax = ylim
+        ymin0, ymax0 = ax.get_ylim()
+        ax.set_ylim(
+            bottom=(ymin if ymin is not None else ymin0),
+            top=(ymax if ymax is not None else ymax0),
+        )
+
     # Keep legend placement as before (do not move to top).
     ax.legend(loc="best", frameon=True)
 
@@ -325,7 +346,16 @@ def _scatter_plot(
     plt.close(fig)
 
 
-def _plot_delay_cdf(*, out_path: Path, title: str, series: List[Tuple[str, Sequence[float]]], xin_ms: float, xmax_ms: float) -> None:
+def _plot_delay_cdf(
+    *,
+    out_path: Path,
+    title: str,
+    series: List[Tuple[str, Sequence[float]]],
+    xin_ms: float,
+    xmax_ms: float,
+    yin: Optional[float] = None,
+    ymax: Optional[float] = None,
+) -> None:
     _configure_matplotlib()
     fig, ax = plt.subplots(figsize=(3.8, 2.40))
 
@@ -348,6 +378,13 @@ def _plot_delay_cdf(*, out_path: Path, title: str, series: List[Tuple[str, Seque
     # if xmax_ms is not None and float(xmax_ms) > 0:
     ax.set_xlim(float(xin_ms), float(xmax_ms))
 
+    if yin is not None or ymax is not None:
+        ymin0, ymax0 = ax.get_ylim()
+        ax.set_ylim(
+            bottom=(float(yin) if yin is not None else ymin0),
+            top=(float(ymax) if ymax is not None else ymax0),
+        )
+
     # Keep legend placement as before.
     ax.legend(loc="upper left", frameon=True)
     fig.tight_layout()
@@ -365,6 +402,7 @@ def _plot_completion_ratio_2x2(
     ddl_ms_list: Sequence[int],
     trials: List[Trial],
     ylim: Tuple[float, float],
+    xlim: Optional[Tuple[Optional[float], Optional[float]]] = None,
 ) -> None:
     ddl_ms_list = [int(x) for x in ddl_ms_list if int(x) > 0]
     ddl_ms_list = list(ddl_ms_list)[:4]
@@ -412,6 +450,13 @@ def _plot_completion_ratio_2x2(
         )
         ax.set_xlabel("overhead")
         ax.set_ylim(float(ylim[0]), float(ylim[1]))
+        if xlim is not None:
+            xmin, xmax = xlim
+            xmin0, xmax0 = ax.get_xlim()
+            ax.set_xlim(
+                left=(xmin if xmin is not None else xmin0),
+                right=(xmax if xmax is not None else xmax0),
+            )
         if i % 2 == 0:
             ax.set_ylabel("Completion ratio")
         ax.legend(loc="lower right", frameon=True)
@@ -568,6 +613,8 @@ def _load_flec_trials(
     sender_ids: Optional[Sequence[int]],
     fallback_rtt_ms: Optional[int],
 ) -> List[Trial]:
+    from flec_metrics import flec_corrected_e2e_delay_s, flec_corrected_overhead_ratio
+
     out: List[Trial] = []
     if not flec_jsonl.exists():
         return out
@@ -598,9 +645,12 @@ def _load_flec_trials(
                 continue
 
             ok = int(d.get("ok", 0) or 0)
-            # e2e delay and overhead are used directly from file.
-            e2e_s = float(d.get("e2e_s", 0.0) or 0.0)
-            overhead = float(d.get("overhead", 0.0) or 0.0)
+            # Use shared v2-aware metrics + optional offset.
+            delay_s = flec_corrected_e2e_delay_s(d)
+            overhead_ratio = flec_corrected_overhead_ratio(d)
+            if delay_s is None or overhead_ratio is None:
+                continue
+            e2e_s = float(delay_s)
 
             # Prefer RTT from file; fall back to baseline RTT if missing.
             rtt_ms = d.get("rtt_ms", None)
@@ -637,7 +687,7 @@ def _load_flec_trials(
                     success=int(ok),
                     dur_ms=int(dur_ms_plot),
                     goodput_mbps=float(goodput),
-                    overhead_ratio=float(overhead),
+                    overhead_ratio=float(overhead_ratio),
                 )
             )
 
@@ -653,6 +703,12 @@ def main() -> int:
     ap.add_argument("--baseline-in-dir", type=str, required=True, help="Directory containing results.csv from run_raw_fec1_fec2_baselines.py")
     ap.add_argument("--bandit-train-log", type=str, required=True, help="Bandit training log JSONL file")
     ap.add_argument("--flec-jsonl", type=str, default="", help="Optional FLEC results jsonl (adds method 'flec')")
+    ap.add_argument(
+        "--flec-e2e-offset-ms",
+        type=float,
+        default=0.0,
+        help="FLEC-only: add this offset (ms) to e2e delay (default 0).",
+    )
     ap.add_argument("--out-dir", type=str, default="", help="Output directory (default: baseline-in-dir)")
 
     ap.add_argument("--file-bytes", type=int, default=128 * 1024, help="Payload size in bytes (default 128KB)")
@@ -680,7 +736,25 @@ def main() -> int:
     ap.add_argument("--xmin-delay-ms", type=float, default=0.0)
     ap.add_argument("--xmax-delay-ms", type=float, default=800.0)
 
+    # Optional axis ranges for each output figure.
+    ap.add_argument("--xmin-overhead", type=float, default=None, help="Optional overhead-axis min for scatter/completion plots")
+    ap.add_argument("--xmax-overhead", type=float, default=None, help="Optional overhead-axis max for scatter/completion plots")
+
+    ap.add_argument("--ymin-goodput", type=float, default=None, help="Optional goodput-axis min for goodput_vs_overhead")
+    ap.add_argument("--ymax-goodput", type=float, default=None, help="Optional goodput-axis max for goodput_vs_overhead")
+
+    ap.add_argument("--ymin-delay", type=float, default=None, help="Optional delay-axis min for delay_vs_overhead")
+    ap.add_argument("--ymax-delay", type=float, default=None, help="Optional delay-axis max for delay_vs_overhead")
+
+    ap.add_argument("--ymin-cdf", type=float, default=None, help="Optional CDF-axis min for delay_cdf")
+    ap.add_argument("--ymax-cdf", type=float, default=None, help="Optional CDF-axis max for delay_cdf")
+
+    ap.add_argument("--ymin-completion", type=float, default=None, help="Optional completion-axis min for completion_vs_overhead_2x2")
+    ap.add_argument("--ymax-completion", type=float, default=None, help="Optional completion-axis max for completion_vs_overhead_2x2")
+
     args = ap.parse_args()
+
+    os.environ["FLEC_E2E_OFFSET_MS"] = str(float(getattr(args, "flec_e2e_offset_ms", 0.0) or 0.0))
 
     baseline_in_dir = Path(str(args.baseline_in_dir))
     baseline_csv = baseline_in_dir / "results.csv"
@@ -770,6 +844,8 @@ def main() -> int:
         xlabel="overhead",
         ylabel="goodput (Mbps)",
         pts=pts_goodput,
+        xlim=(args.xmin_overhead, args.xmax_overhead) if (args.xmin_overhead is not None or args.xmax_overhead is not None) else None,
+        ylim=(args.ymin_goodput, args.ymax_goodput) if (args.ymin_goodput is not None or args.ymax_goodput is not None) else None,
     )
 
     _scatter_plot(
@@ -778,6 +854,8 @@ def main() -> int:
         xlabel="overhead",
         ylabel=f"delay ({str(args.duration_field)})",
         pts=pts_delay,
+        xlim=(args.xmin_overhead, args.xmax_overhead) if (args.xmin_overhead is not None or args.xmax_overhead is not None) else None,
+        ylim=(args.ymin_delay, args.ymax_delay) if (args.ymin_delay is not None or args.ymax_delay is not None) else None,
     )
 
     # Delay CDF
@@ -792,14 +870,25 @@ def main() -> int:
         series=series,
         xin_ms=float(args.xmin_delay_ms),
         xmax_ms=float(args.xmax_delay_ms),
+        yin=args.ymin_cdf,
+        ymax=args.ymax_cdf,
     )
 
     # Completion ratio: use the same DDL grid as the paper plots.
+    ylim_completion = (-0.02, 1.02)
+    if args.ymin_completion is not None or args.ymax_completion is not None:
+        ymin0, ymax0 = ylim_completion
+        ylim_completion = (
+            float(args.ymin_completion) if args.ymin_completion is not None else float(ymin0),
+            float(args.ymax_completion) if args.ymax_completion is not None else float(ymax0),
+        )
+
     _plot_completion_ratio_2x2(
         out_path=out_dir / "completion_vs_overhead_2x2.pdf",
         ddl_ms_list=[200, 300, 400, 500],
         trials=trials_completion,
-        ylim=(-0.02, 1.02),
+        ylim=ylim_completion,
+        xlim=(args.xmin_overhead, args.xmax_overhead) if (args.xmin_overhead is not None or args.xmax_overhead is not None) else None,
     )
 
     print(f"OUT: {out_dir}")

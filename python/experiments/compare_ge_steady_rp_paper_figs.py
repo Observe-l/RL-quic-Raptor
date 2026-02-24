@@ -653,6 +653,8 @@ def _load_rows_from_results_jsonl(results_jsonl: Path) -> List[Row]:
 def _load_flec_delay_ms_from_jsonl(flec_jsonl: Path) -> Tuple[List[float], float]:
     """Return (dur_ms list for ok==1, ok_rate) from flec jsonl."""
 
+    from flec_metrics import flec_corrected_e2e_delay_s
+
     ok_ms: List[float] = []
     n = 0
     ok_n = 0
@@ -672,13 +674,10 @@ def _load_flec_delay_ms_from_jsonl(flec_jsonl: Path) -> Tuple[List[float], float
             ok = int(d.get("ok", 0) or 0)
             if ok != 1:
                 continue
-            e2e_s = d.get("e2e_s", None)
-            if e2e_s is None:
+            delay_s = flec_corrected_e2e_delay_s(d)
+            if delay_s is None:
                 continue
-            try:
-                dur_ms = float(e2e_s) * 1000.0
-            except Exception:
-                continue
+            dur_ms = float(delay_s) * 1000.0
             if np.isfinite(dur_ms) and dur_ms > 0:
                 ok_n += 1
                 ok_ms.append(float(dur_ms))
@@ -990,6 +989,12 @@ def main() -> int:
         default="",
         help="Plot-only mode: optional flec results jsonl to overlay (fields: ok,e2e_s).",
     )
+    ap.add_argument(
+        "--flec-e2e-offset-ms",
+        type=float,
+        default=0.0,
+        help="FLEC-only: add this offset (ms) to e2e delay (default 0).",
+    )
     ap.add_argument("--ge-params", type=str, default=str(_REPO_ROOT / "python" / "bandit" / "quic_fec_params.json"))
     ap.add_argument("--ge-key", type=str, default="GE_steady_rp")
     ap.add_argument("--sender-ids", type=str, default="100", help="Comma list / ranges, e.g. 100,106,112 or 100-160 or 'all'")
@@ -1134,6 +1139,8 @@ def main() -> int:
     ap.add_argument("--out-dir", type=str, default="")
 
     args = ap.parse_args()
+
+    os.environ["FLEC_E2E_OFFSET_MS"] = str(float(getattr(args, "flec_e2e_offset_ms", 0.0) or 0.0))
 
     # Plot-only mode: read existing results.jsonl and optionally add flec.
     if str(getattr(args, "results_jsonl", "")).strip():

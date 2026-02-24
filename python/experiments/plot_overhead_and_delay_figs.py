@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -139,6 +140,7 @@ def _load_flec_trials(*, flec_jsonl: Path) -> List[Trial]:
     """
 
     import json
+    from flec_metrics import flec_corrected_e2e_delay_s, flec_corrected_goodput_mbps, flec_corrected_overhead_ratio
 
     out: List[Trial] = []
     with flec_jsonl.open("r", encoding="utf-8") as f:
@@ -156,20 +158,13 @@ def _load_flec_trials(*, flec_jsonl: Path) -> List[Trial]:
             try:
                 sender_id = int(d.get("sender", 0) or 0)
                 ok = int(d.get("ok", 0) or 0)
-                e2e_s = d.get("e2e_s", None)
-                dur_ms = int(float(e2e_s) * 1000.0) if e2e_s is not None else 0
-                tx_data = int(d.get("tx_data_bytes", 0) or 0)
-                tx_total = int(d.get("tx_total_bytes", 0) or 0)
-                overhead = d.get("overhead", None)
-                if overhead is not None:
-                    overhead_ratio = float(overhead)
-                else:
-                    overhead_ratio = (
-                        float(tx_total - tx_data) / float(tx_data)
-                        if tx_data > 0 and tx_total > 0
-                        else 0.0
-                    )
-                goodput_mbps = (float(tx_data) * 8.0 / 1e6) / float(e2e_s) if tx_data > 0 and e2e_s and float(e2e_s) > 0 else 0.0
+                delay_s = flec_corrected_e2e_delay_s(d)
+                dur_ms = int(float(delay_s) * 1000.0) if delay_s is not None else 0
+                overhead_ratio = flec_corrected_overhead_ratio(d)
+                if overhead_ratio is None:
+                    overhead_ratio = 0.0
+                gp = flec_corrected_goodput_mbps(d)
+                goodput_mbps = float(gp) if gp is not None else 0.0
             except Exception:
                 continue
 
@@ -485,6 +480,12 @@ def main() -> int:
         help="Optional FLEC jsonl to overlay as a baseline (default: paper-delay-rtt50 flec jsonl)",
     )
     ap.add_argument(
+        "--flec-e2e-offset-ms",
+        type=float,
+        default=0.0,
+        help="FLEC-only: add this offset (ms) to e2e delay (default 0).",
+    )
+    ap.add_argument(
         "--out-dir",
         type=str,
         default="",
@@ -522,6 +523,8 @@ def main() -> int:
     )
 
     args = ap.parse_args()
+
+    os.environ["FLEC_E2E_OFFSET_MS"] = str(float(getattr(args, "flec_e2e_offset_ms", 0.0) or 0.0))
 
     in_dir = Path(args.in_dir)
     results_csv = in_dir / "results.csv"

@@ -407,8 +407,14 @@ def _load_runrows_from_runs_csv(runs_csv: Path) -> List[RunRow]:
 def _load_flec_runrows_from_jsonl(flec_jsonl: Path) -> List[RunRow]:
     """Map flec jsonl into RunRow schema.
 
-    Expected keys per line: sender, trial, ok, e2e_s, tx_total_bytes, tx_data_bytes, overhead.
+    Expected keys per line: sender, trial, ok, and v2 metrics (preferred).
     """
+
+    from flec_metrics import (
+        flec_corrected_attempted_bytes,
+        flec_corrected_e2e_delay_s,
+        flec_corrected_overhead_ratio,
+    )
 
     out: List[RunRow] = []
     with flec_jsonl.open("r", encoding="utf-8") as f:
@@ -426,16 +432,22 @@ def _load_flec_runrows_from_jsonl(flec_jsonl: Path) -> List[RunRow]:
                 sender_id = int(d.get("sender", 0) or 0)
                 rep = int(d.get("trial", 0) or 0)
                 ok = int(d.get("ok", 0) or 0)
-                e2e_s = d.get("e2e_s", None)
-                dur_ms = int(float(e2e_s) * 1000.0) if e2e_s is not None else 0
-                tx_total = int(d.get("tx_total_bytes", 0) or 0)
                 file_bytes = int(d.get("tx_data_bytes", 0) or 0)
-                overhead = d.get("overhead", None)
-                overhead_ratio = (
-                    float(overhead)
-                    if overhead is not None
-                    else (float(tx_total - file_bytes) / float(file_bytes) if file_bytes > 0 and tx_total > 0 else 0.0)
-                )
+                delay_s = flec_corrected_e2e_delay_s(d)
+                dur_ms = int(float(delay_s) * 1000.0) if delay_s is not None else 0
+
+                tx_total = flec_corrected_attempted_bytes(d)
+                if tx_total is None:
+                    tx_total = int(d.get("tx_total_bytes", 0) or 0)
+                overhead_ratio = flec_corrected_overhead_ratio(d)
+                if overhead_ratio is None:
+                    overhead_ratio = float("nan")
+
+                rtt_ms = d.get("rtt_ms", None)
+                try:
+                    rtt_ms_i = int(float(rtt_ms)) if rtt_ms is not None else 0
+                except Exception:
+                    rtt_ms_i = 0
                 p_pct = d.get("p_pct", None)
                 r_pct = d.get("r_pct", None)
                 if p_pct is not None and r_pct is not None:
@@ -456,7 +468,7 @@ def _load_flec_runrows_from_jsonl(flec_jsonl: Path) -> List[RunRow]:
                     md5_ok=int(ok),
                     success=int(ok),
                     dur_ms=int(dur_ms),
-                    rtt_ms=0,
+                    rtt_ms=int(rtt_ms_i),
                     e2e_delay_ms=float(dur_ms),
                     tx_bytes=int(tx_total),
                     rx_bytes=0,
@@ -624,6 +636,12 @@ def main() -> int:
         default="",
         help="Optional: overlay flec runs from jsonl (fields: sender,trial,ok,e2e_s,tx_total_bytes,tx_data_bytes,overhead).",
     )
+    ap.add_argument(
+        "--flec-e2e-offset-ms",
+        type=float,
+        default=0.0,
+        help="FLEC-only: add this offset (ms) to e2e delay (default 0).",
+    )
     ap.add_argument("--ge-params", type=str, default=str(_REPO_ROOT / "python" / "bandit" / "quic_fec_params.json"))
     ap.add_argument("--ge-key", type=str, default="GE_steady_rp")
     ap.add_argument("--sender-ids", type=str, default="100", help="Comma list / ranges, or 'all'")
@@ -664,6 +682,8 @@ def main() -> int:
     ap.add_argument("--out-dir", type=str, default="")
 
     args = ap.parse_args()
+
+    os.environ["FLEC_E2E_OFFSET_MS"] = str(float(getattr(args, "flec_e2e_offset_ms", 0.0) or 0.0))
 
     plot_only = bool(str(getattr(args, "base_runs_csv", "")).strip())
     if not plot_only:

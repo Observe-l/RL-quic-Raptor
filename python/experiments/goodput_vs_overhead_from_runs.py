@@ -7,6 +7,7 @@ import json
 import math
 import re
 import time
+import os
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -110,6 +111,8 @@ def _load_runs(runs_csv: Path) -> List[Run]:
 def _load_flec_runs(flec_jsonl: Path) -> List[Run]:
     """Load per-trial flec jsonl and map into the same Run schema."""
 
+    from flec_metrics import flec_corrected_e2e_delay_s, flec_corrected_overhead_ratio
+
     out: List[Run] = []
     with flec_jsonl.open("r", encoding="utf-8") as f:
         for line in f:
@@ -125,16 +128,18 @@ def _load_flec_runs(flec_jsonl: Path) -> List[Run]:
             try:
                 sender_id = int(d.get("sender", 0) or 0)
                 ok = int(d.get("ok", 0) or 0)
-                e2e_s = d.get("e2e_s", None)
-                dur_ms = int(float(e2e_s) * 1000.0) if e2e_s is not None else 0
+                delay_s = flec_corrected_e2e_delay_s(d)
+                e2e_delay_ms = float(delay_s) * 1000.0 if delay_s is not None else 0.0
+                try:
+                    rtt_ms = float(d.get("rtt_ms", 0.0) or 0.0)
+                except Exception:
+                    rtt_ms = 0.0
+                # Match Run.goodput_mbps (uses dur_ms): goodput := data_bytes / (e2e_delay - RTT/2)
+                dur_ms = int(round(max(0.0, float(e2e_delay_ms) - 0.5 * float(rtt_ms))))
                 file_bytes = int(d.get("tx_data_bytes", 0) or 0)
-                tx_total = int(d.get("tx_total_bytes", 0) or 0)
-                overhead = d.get("overhead", None)
-                overhead_ratio = (
-                    float(overhead)
-                    if overhead is not None
-                    else (float(tx_total - file_bytes) / float(file_bytes) if file_bytes > 0 and tx_total > 0 else 0.0)
-                )
+                overhead_ratio = flec_corrected_overhead_ratio(d)
+                if overhead_ratio is None:
+                    overhead_ratio = 0.0
             except Exception:
                 continue
 
@@ -179,6 +184,12 @@ def main() -> int:
         default="",
         help="Optional: overlay flec points from jsonl (fields: sender,ok,e2e_s,tx_total_bytes,tx_data_bytes,overhead).",
     )
+    ap.add_argument(
+        "--flec-e2e-offset-ms",
+        type=float,
+        default=0.0,
+        help="FLEC-only: add this offset (ms) to e2e delay (default 0).",
+    )
     ap.add_argument("--out-dir", type=str, default="", help="Output directory (default: alongside runs.csv)")
     ap.add_argument(
         "--max-goodput-mbps",
@@ -200,6 +211,8 @@ def main() -> int:
     )
 
     args = ap.parse_args()
+
+    os.environ["FLEC_E2E_OFFSET_MS"] = str(float(getattr(args, "flec_e2e_offset_ms", 0.0) or 0.0))
 
     runs_csv = Path(args.runs_csv)
     if not runs_csv.exists():

@@ -370,7 +370,15 @@ def main() -> int:
     ap.add_argument("--timeout-s", type=int, default=60)
     ap.add_argument("--steps-per-scenario", type=int, default=30, help="How many transfers to run per (sender, loss_mode) scenario")
 
-    ap.add_argument("--file-bytes", type=int, default=128 * 1024)
+    ap.add_argument(
+        "--cc",
+        type=str,
+        default="bbrv2",
+        choices=["bbrv2", "bbr", "bbrv1", "bbr1", "cubic", "reno"],
+        help="Congestion control algorithm (passed as QUIC_FEC_CC_ALGO to quicfec_run_once.sh)",
+    )
+
+    ap.add_argument("--file-bytes", type=int, default=100 * 1024)
     ap.add_argument("--symbol-bytes", type=int, default=1200)
     ap.add_argument("--decode-ddl-ms", type=int, default=25)
 
@@ -441,7 +449,7 @@ def main() -> int:
         "BITRATE_MBPS": str(int(args.bitrate_mbps)),
         "TIMEOUT_S": str(int(args.timeout_transfer_s)),
         "QUIC_FEC_CC_BYPASS": "0",
-        "QUIC_FEC_CC_ALGO": "bbrv2",
+        "QUIC_FEC_CC_ALGO": str(args.cc),
         "FILE": str(file_path),
     }
 

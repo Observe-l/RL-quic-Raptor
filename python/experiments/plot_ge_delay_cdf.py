@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -215,6 +216,8 @@ def _load_flec_trials(
     ddl_ms: int,
     include_failures: bool,
 ) -> List[Trial]:
+    from flec_metrics import flec_corrected_e2e_delay_s
+
     out: List[Trial] = []
     if not flec_jsonl.exists():
         return out
@@ -249,10 +252,8 @@ def _load_flec_trials(
                     continue
 
             ok = int(d.get("ok", 0) or 0)
-            try:
-                delay_ms = float(d.get("e2e_s", 0.0) or 0.0) * 1000.0
-            except Exception:
-                delay_ms = 0.0
+            delay_s = flec_corrected_e2e_delay_s(d)
+            delay_ms = float(delay_s) * 1000.0 if delay_s is not None else 0.0
 
             if int(ok) == 1 and math.isfinite(delay_ms) and delay_ms > 0:
                 out.append(Trial(method="flec", delay_ms=float(min(delay_ms, float(ddl_ms)))))
@@ -315,6 +316,12 @@ def main() -> int:
     ap.add_argument("--bandit-eval-log", type=str, default="", help="bandit_eval_metrics.jsonl for BCIR")
     ap.add_argument("--flec-jsonl", type=str, default="", help="Optional explicit FLEC GE jsonl")
     ap.add_argument("--flec-dir", type=str, default="", help="Directory containing flec_GE_128k.jsonl / flec_GE_1m.jsonl")
+    ap.add_argument(
+        "--flec-e2e-offset-ms",
+        type=float,
+        default=0.0,
+        help="FLEC-only: add this offset (ms) to e2e delay (default 0).",
+    )
     ap.add_argument("--out", type=str, required=True, help="Output PDF path")
     ap.add_argument("--file-bytes", type=int, default=128 * 1024)
     ap.add_argument("--ddl-ms", type=int, default=0, help="Override DDL in ms")
@@ -325,6 +332,8 @@ def main() -> int:
     ap.add_argument("--include-failures", type=int, default=1, help="Include failures as delay=DDL (1/0)")
 
     args = ap.parse_args()
+
+    os.environ["FLEC_E2E_OFFSET_MS"] = str(float(getattr(args, "flec_e2e_offset_ms", 0.0) or 0.0))
 
     baseline_in_dir = Path(str(args.baseline_in_dir))
     results_csv = baseline_in_dir / "results.csv"

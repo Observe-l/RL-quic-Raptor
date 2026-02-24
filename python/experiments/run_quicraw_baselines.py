@@ -146,7 +146,6 @@ def _goodput_mbps_from_file_and_dur(*, file_bytes: int, dur_ms: float) -> float:
 def _overhead_quic_ratio_from_kv(*, kv: Dict[str, str]) -> float:
 	for key in (
 		"raw_quic_overhead_ratio",
-		"fec_quic_overhead_ratio",
 		"quic_overhead_ratio",
 		"overhead_ratio",
 	):
@@ -158,15 +157,12 @@ def _overhead_quic_ratio_from_kv(*, kv: Dict[str, str]) -> float:
 			except Exception:
 				pass
 
-	for sent_key in ("raw_quic_sent_bytes", "fec_quic_sent_bytes"):
-		if sent_key in kv:
-			file_bytes = _to_int(kv, "file_bytes", 0)
-			sent_bytes = _to_int(kv, sent_key, 0)
-			if file_bytes > 0 and sent_bytes > 0:
-				return float(max(0.0, (float(sent_bytes) - float(file_bytes)) / float(file_bytes)))
+	file_bytes = _to_int(kv, "file_bytes", 0)
+	sent_bytes = _to_int(kv, "raw_quic_sent_bytes", 0)
+	if file_bytes > 0 and sent_bytes > 0:
+		return float(max(0.0, (float(sent_bytes) - float(file_bytes)) / float(file_bytes)))
 
 	tx_bytes = _to_int(kv, "tx_bytes", 0)
-	file_bytes = _to_int(kv, "file_bytes", 0)
 	if file_bytes > 0 and tx_bytes > 0:
 		return float(max(0.0, (float(tx_bytes) - float(file_bytes)) / float(file_bytes)))
 	return 0.0
@@ -297,20 +293,25 @@ class Rec:
 	e2e_delay_ms: float
 	goodput_mbps: float
 	overhead_ratio: float
+	recovery_triggers: int
+	loss_detection_events: int
+	pto_events: int
+	retx_1rtt_pkts: int
+	retx_1rtt_bytes: int
 	extra: Dict[str, Any]
 
 
 def main() -> int:
 	ap = argparse.ArgumentParser(
 		description=(
-			"Run baselines only (quic-raw, IR-FEC1, IR-FEC2) under IID or GE loss, and write results (no plotting)."
+			"Re-run quic-raw only (no FEC/ARQ), collect QUIC recovery/retransmission trigger metrics, and write results."
 		)
 	)
 	ap.add_argument("--out-dir", type=str, required=True, help="Output directory")
 	ap.add_argument("--run-tag", type=str, default="", help="Tag for netns/veth isolation")
 
 	ap.add_argument("--loss-profile", type=str, default="ge", choices=["ge", "iid"], help="Loss profile")
-	ap.add_argument("--iid-loss-pcts", type=str, default="0.1,0.2,0.3,0.4,0.5", help="IID loss percents list, e.g. '0.1,0.5,1.0'")
+	ap.add_argument("--iid-loss-pcts", type=str, default="0.1,0.2,0.3,0.4,0.5", help="IID loss percents list")
 	ap.add_argument(
 		"--rtt-ms",
 		type=int,
@@ -333,25 +334,17 @@ def main() -> int:
 		type=str,
 		default="bbrv2",
 		choices=["bbrv2", "bbr", "bbrv1", "bbr1", "cubic", "reno"],
-		help="Congestion control algorithm (passed as QUIC_FEC_CC_ALGO to quicfec/quicraw scripts)",
+		help="Congestion control algorithm (QUIC_FEC_CC_ALGO passed to quicraw script)",
 	)
 
-	ap.add_argument("--file-bytes", type=int, default=100 * 1024)
-	ap.add_argument("--symbol-bytes", type=int, default=1200)
+	ap.add_argument("--file-bytes", type=int, default=128 * 1024)
 	ap.add_argument(
-		"--ddl-ms",
+		"--enable-quic-stats",
 		type=int,
-		default=55,
-		help="Receiver ARQ soft deadline in ms (passed as DDL_MS to quicfec_run_once.sh)",
+		default=1,
+		choices=[0, 1],
+		help="Enable QUIC tracer stats in quicraw-client (required for recovery/retx metrics)",
 	)
-	ap.add_argument(
-		"--decode-ddl-ms",
-		type=int,
-		default=25,
-		help="Receiver decode/check pacing in ms (passed as DECODE_DDL_MS to quicfec_run_once.sh)",
-	)
-
-	ap.add_argument("--enable-quic-overhead", type=int, default=1, choices=[0, 1])
 
 	args = ap.parse_args()
 
@@ -364,10 +357,10 @@ def main() -> int:
 	tmp_out_dir = Path("/tmp") / f"rl-quic-out-{net_env['NS']}"
 	tmp_out_dir.mkdir(parents=True, exist_ok=True)
 
-	file_path = _REPO_ROOT / "go" / "test_data" / f"baseline_payload_{int(args.file_bytes)}B_{run_tag}.bin"
+	file_path = _REPO_ROOT / "go" / "test_data" / f"raw_payload_{int(args.file_bytes)}B_{run_tag}.bin"
 	_ensure_file_of_size(file_path=file_path, file_bytes=int(args.file_bytes))
 
-	# Setup netns once using quicfec script (has SETUP_ONLY) to build QUIC-FEC binaries.
+	# Setup netns and build binaries once.
 	setup_env = {
 		**net_env,
 		"OUT_DIR": str(tmp_out_dir),
@@ -380,29 +373,13 @@ def main() -> int:
 		"LOSS_MODE": "none",
 		"TIMEOUT_S": str(int(args.timeout_transfer_s)),
 	}
-	_run_script(script=_REPO_ROOT / "scripts" / "quicfec_run_once.sh", env=setup_env, timeout_s=60)
-
-	# Build quic-raw binaries once as well.
-	raw_setup_env = {
-		**net_env,
-		"OUT_DIR": str(tmp_out_dir),
-		"SETUP_ONLY": "1",
-		"SKIP_NETNS_RESET": "1",
-		"SKIP_TC_CONFIG": "1",
-		"SKIP_BUILD": "0",
-		"BITRATE_MBPS": str(int(args.bitrate_mbps)),
-		"RTT_MS": str(int(args.rtt_ms)),
-		"LOSS_MODE": "none",
-		"TIMEOUT_S": str(int(args.timeout_transfer_s)),
-	}
-	_run_script(script=_REPO_ROOT / "scripts" / "quicraw_run_once.sh", env=raw_setup_env, timeout_s=60)
+	_run_script(script=_REPO_ROOT / "scripts" / "quicraw_run_once.sh", env=setup_env, timeout_s=60)
 
 	common_env = {
 		**net_env,
 		"OUT_DIR": str(tmp_out_dir),
 		"SKIP_NETNS_RESET": "1",
 		"SKIP_TC_CONFIG": "0",
-		"SKIP_SYSCTL": "1",
 		"SKIP_BUILD": "0",
 		"BITRATE_MBPS": str(int(args.bitrate_mbps)),
 		"TIMEOUT_S": str(int(args.timeout_transfer_s)),
@@ -412,9 +389,6 @@ def main() -> int:
 	}
 
 	task = f"file_{int(args.file_bytes)}B"
-	if int(args.file_bytes) == 128 * 1024:
-		task = "delay_128kb"
-
 	recs: List[Rec] = []
 
 	loss_profile = str(args.loss_profile)
@@ -451,8 +425,8 @@ def main() -> int:
 			for pct in iid_loss_pcts:
 				scenarios.append((int(sid), int(args.rtt_ms), f"iid:{float(pct):g}"))
 
-	def _run_one(*, method: str, script: Path, env: Dict[str, str], sender_id: int, loss_mode: str, rtt_ms: int, rep: int) -> None:
-		stderr = _run_script(script=script, env=env, timeout_s=int(args.timeout_s))
+	def _run_one(*, env: Dict[str, str], sender_id: int, loss_mode: str, rtt_ms: int, rep: int) -> None:
+		stderr = _run_script(script=_REPO_ROOT / "scripts" / "quicraw_run_once.sh", env=env, timeout_s=int(args.timeout_s))
 		run_line = _extract_last_run_record(stderr)
 		kv = _parse_kv_from_run_line(run_line)
 
@@ -464,12 +438,18 @@ def main() -> int:
 		dur_ms = float(_to_float(kv, "dur_ms", 0.0))
 		e2e_delay_ms = float(dur_ms) + float(rtt_ms) / 2.0 if dur_ms > 0 else 0.0
 		goodput_mbps = _goodput_mbps_from_file_and_dur(file_bytes=int(args.file_bytes), dur_ms=dur_ms)
-		overhead_ratio = _overhead_quic_ratio_from_kv(kv=kv) if int(args.enable_quic_overhead) == 1 else 0.0
+		overhead_ratio = _overhead_quic_ratio_from_kv(kv=kv)
+
+		recovery_triggers = _to_int(kv, "raw_quic_recovery_triggers", 0)
+		loss_detection_events = _to_int(kv, "raw_quic_loss_detection_events", 0)
+		pto_events = _to_int(kv, "raw_quic_pto_events", 0)
+		retx_pkts = _to_int(kv, "raw_quic_retx_1rtt_pkts", 0)
+		retx_bytes = _to_int(kv, "raw_quic_retx_1rtt_bytes", 0)
 
 		recs.append(
 			Rec(
 				task=str(task),
-				method=str(method),
+				method=f"quic_{str(args.cc)}",
 				sender_id=int(sender_id),
 				loss_mode=str(loss_mode),
 				rep=int(rep),
@@ -481,6 +461,11 @@ def main() -> int:
 				e2e_delay_ms=float(e2e_delay_ms),
 				goodput_mbps=float(goodput_mbps),
 				overhead_ratio=float(overhead_ratio),
+				recovery_triggers=int(recovery_triggers),
+				loss_detection_events=int(loss_detection_events),
+				pto_events=int(pto_events),
+				retx_1rtt_pkts=int(retx_pkts),
+				retx_1rtt_bytes=int(retx_bytes),
 				extra={"run": kv},
 			)
 		)
@@ -492,49 +477,16 @@ def main() -> int:
 				"RTT_MS": str(int(rtt_ms)),
 				"LOSS_MODE": str(loss_mode),
 			}
-			if int(args.enable_quic_overhead) == 1:
+			if int(args.enable_quic_stats) == 1:
 				env_raw["RAW_STATS"] = "1"
-			_run_one(
-				method=f"quic_{str(args.cc)}",
-				script=_REPO_ROOT / "scripts" / "quicraw_run_once.sh",
-				env=env_raw,
-				sender_id=int(sender_id),
-				loss_mode=str(loss_mode),
-				rtt_ms=int(rtt_ms),
-				rep=int(rep),
+			_run_one(env=env_raw, sender_id=int(sender_id), loss_mode=str(loss_mode), rtt_ms=int(rtt_ms), rep=int(rep))
+
+			r = recs[-1]
+			print(
+				f"rep={rep:02d} sender={sender_id} rtt_ms={rtt_ms} loss={loss_mode} "
+				f"ok={r.success} dur_ms={int(r.dur_ms)} recovery_triggers={r.recovery_triggers} "
+				f"loss_detection_events={r.loss_detection_events} pto_events={r.pto_events} retx_pkts={r.retx_1rtt_pkts}"
 			)
-
-			for method, k, r0, rstep in (
-				("fec_k60_r0_2_rstep_2", 60, 2, 2),
-				("fec_k40_r0_10_rstep_8", 40, 10, 8),
-			):
-				env_fec = {
-					**common_env,
-					"RTT_MS": str(int(rtt_ms)),
-					"LOSS_MODE": str(loss_mode),
-					"K": str(int(k)),
-					"R0": str(int(r0)),
-					"RSTEP": str(int(rstep)),
-					"DDL_MS": str(int(args.ddl_ms)),
-					"DECODE_DDL_MS": str(int(args.decode_ddl_ms)),
-					"SYMBOL_BYTES": str(int(args.symbol_bytes)),
-					"USE_ARQ": "1",
-				}
-				if int(args.enable_quic_overhead) == 1:
-					env_fec["FEC_STATS"] = "1"
-				_run_one(
-					method=str(method),
-					script=_REPO_ROOT / "scripts" / "quicfec_run_once.sh",
-					env=env_fec,
-					sender_id=int(sender_id),
-					loss_mode=str(loss_mode),
-					rtt_ms=int(rtt_ms),
-					rep=int(rep),
-				)
-
-			last = recs[-3:]
-			ok_str = " ".join([f"{r.method}(ok={r.success} dur_ms={int(r.dur_ms)})" for r in last])
-			print(f"rep={rep:02d} sender={sender_id} rtt_ms={rtt_ms} loss={loss_mode} {ok_str}")
 
 	out_csv = out_dir / "results.csv"
 	with out_csv.open("w", encoding="utf-8", newline="") as f:
@@ -554,6 +506,11 @@ def main() -> int:
 				"e2e_delay_ms",
 				"goodput_mbps",
 				"overhead_ratio",
+				"recovery_triggers",
+				"loss_detection_events",
+				"pto_events",
+				"retx_1rtt_pkts",
+				"retx_1rtt_bytes",
 			],
 		)
 		w.writeheader()
