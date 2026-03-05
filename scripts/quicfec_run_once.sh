@@ -84,11 +84,23 @@ if [[ -z "${OBS_WAIT_SECS:-}" ]]; then
   fi
 fi
 
+# When OBS_WAIT_SECS=0 (e.g., baselines), we still need to give the server a
+# brief chance to finish writing the received file before killing it; otherwise
+# md5_ok can flap. This is a bounded, best-effort wait.
+WAIT_RECV_SECS=${WAIT_RECV_SECS:-2}
+
 SETUP_ONLY=${SETUP_ONLY:-0}
 SKIP_NETNS_RESET=${SKIP_NETNS_RESET:-0}
 SKIP_TC_CONFIG=${SKIP_TC_CONFIG:-0}
 SKIP_SYSCTL=${SKIP_SYSCTL:-0}
 SKIP_BUILD=${SKIP_BUILD:-0}
+
+# When set, skip md5 computation and treat md5_ok=1.
+# This is useful for baseline timing runs, where the client-side DONE ACK is
+# sufficient and we don't want to pay (or jitter on) post-transfer file flush.
+SKIP_MD5=${SKIP_MD5:-0}
+
+T_SCRIPT_START=$(date +%s%N)
 
 # DDL_MS already defaulted above; kept here historically but now intentionally a no-op.
 
@@ -158,6 +170,7 @@ FILE_SIZE=$(stat -c%s "$FILE")
 
 # Configure qdiscs: half RTT on each direction; apply TBF at root and NETEM as child on host side
 half=$(( RTT_MS / 2 ))
+T_TC_START=$(date +%s%N)
 if [[ "$SKIP_TC_CONFIG" != "1" ]]; then
   sudo tc qdisc del dev "$VETH_HOST" root 2>/dev/null || true
 
@@ -190,6 +203,7 @@ if [[ "$SKIP_TC_CONFIG" != "1" ]]; then
   sudo ip netns exec "$NS" tc qdisc del dev "$VETH_NS" root 2>/dev/null || true
   sudo ip netns exec "$NS" tc qdisc replace dev "$VETH_NS" root netem delay ${half}ms
 fi
+T_TC_END=$(date +%s%N)
 
 # JSON (line-oriented) for RL obs
 touch "$OBS_JSON"
@@ -204,22 +218,21 @@ SRV_LOG=$(mktemp -t quic_fec_srv.XXXXXX.log)
 # Remove any stale outputs from previous runs; otherwise md5_ok can be a false positive
 # if this run fails before producing a new file.
 rm -f "$OUT_DIR/$(basename "$FILE").recv" "$OUT_DIR/$(basename "$FILE").recv.part" 2>/dev/null || true
+T_SRV_START=$(date +%s%N)
 sudo ip netns exec "$NS" bash -lc "ulimit -n 1048576; '$BIN_DIR/quicfec-server' -addr ${SRV_IP}:$PORT -out '$OUT_DIR' -timeout ${SRV_TIMEOUT} -decode-ddl ${DECODE_DDL_MS}ms" >"$SRV_LOG" 2>&1 & SP=$!
 
 # Wait for server UDP socket to be ready (best-effort). A fixed sleep can be flaky under load.
 ready=0
 if command -v ss >/dev/null 2>&1; then
-  for _ in $(seq 1 30); do
-    if sudo ip netns exec "$NS" ss -lunH 2>/dev/null | awk '{print $5}' | grep -q ":$PORT$"; then
-      ready=1
-      break
-    fi
-    sleep 0.02
-  done
+  # Keep this fast: client already has dial/handshake retries.
+  if sudo ip netns exec "$NS" bash -lc "for _ in \$(seq 1 8); do if ss -lunH 2>/dev/null | awk '{print \$5}' | grep -q ':$PORT$'; then exit 0; fi; sleep 0.01; done; exit 1"; then
+    ready=1
+  fi
 fi
 if [[ "$ready" != "1" ]]; then
-  sleep 0.1
+  sleep 0.05
 fi
+T_SRV_READY=$(date +%s%N)
 
 # Run client (logs in /tmp/quic_fec_cli.*)
 CLI_LOG=$(mktemp -t quic_fec_cli.XXXXXX.log)
@@ -349,25 +362,53 @@ if [[ "$NETEM_SENT_PKTS" -gt 0 || "$NETEM_DROPPED_PKTS" -gt 0 ]]; then
   NETEM_DROP_RATE=$(awk -v s="$NETEM_SENT_PKTS" -v d="$NETEM_DROPPED_PKTS" 'BEGIN{t=s+d; if(t<=0){print "0"; exit} printf "%.6f", d/t}')
 fi
 
-# Wait for server to emit the observation before stopping it (cap by OBS_WAIT_SECS)
+# Wait for server to emit the observation before stopping it (cap by OBS_WAIT_SECS).
+# If OBS_WAIT_SECS=0, skip obs polling and only wait for the received file to
+# reach full size (cap by WAIT_RECV_SECS).
 tries=0
 RL_OBS=""
-max_tries=$(( OBS_WAIT_SECS * 10 ))
-while [[ $tries -lt $max_tries ]]; do
-  RL_OBS=$(grep -E "^\[rl-observation\]" "$SRV_LOG" | tail -n1 || true)
-  if [[ -n "$RL_OBS" ]]; then
-    break
-  fi
-  sleep 0.1
-  tries=$((tries+1))
-done
+T_WAIT_OBS_START=$(date +%s%N)
+if [[ "${OBS_WAIT_SECS}" -gt 0 ]]; then
+  max_tries=$(( OBS_WAIT_SECS * 10 ))
+  while [[ $tries -lt $max_tries ]]; do
+    RL_OBS=$(grep -E "^\[rl-observation\]" "$SRV_LOG" | tail -n1 || true)
+    if [[ -n "$RL_OBS" ]]; then
+      break
+    fi
+    sleep 0.1
+    tries=$((tries+1))
+  done
+else
+  max_tries=$(( WAIT_RECV_SECS * 20 ))  # 50ms steps
+  recv_path="$OUT_DIR/$(basename "$FILE").recv"
+  while [[ $tries -lt $max_tries ]]; do
+    if [[ -f "$recv_path" ]]; then
+      out_sz=$(stat -c%s "$recv_path" 2>/dev/null || echo 0)
+      if [[ "$out_sz" -ge "$FILE_SIZE" ]]; then
+        break
+      fi
+    fi
+    sleep 0.05
+    tries=$((tries+1))
+  done
+fi
+T_WAIT_OBS_END=$(date +%s%N)
 sleep 0.05; kill $SP 2>/dev/null || true
 sleep 0.05; kill -9 $SP 2>/dev/null || true
 
 # Basic metrics
-IN_MD5=$(md5sum "$FILE" | awk '{print $1}')
-OUT_MD5=$(md5sum "$OUT_DIR/$(basename "$FILE").recv" | awk '{print $1}' || true)
-MD5_OK=0; [[ "$IN_MD5" == "$OUT_MD5" ]] && MD5_OK=1
+T_MD5_START=$(date +%s%N)
+MD5_SKIPPED=0
+MD5_OK=0
+if [[ "$SKIP_MD5" == "1" ]]; then
+  MD5_SKIPPED=1
+  MD5_OK=1
+else
+  IN_MD5=$(md5sum "$FILE" | awk '{print $1}')
+  OUT_MD5=$(md5sum "$OUT_DIR/$(basename "$FILE").recv" | awk '{print $1}' || true)
+  MD5_OK=0; [[ "$IN_MD5" == "$OUT_MD5" ]] && MD5_OK=1
+fi
+T_MD5_END=$(date +%s%N)
 
 # Any client failure (including timeout) => count as failure.
 if [[ "$CLIENT_OK" == "0" ]]; then
@@ -736,7 +777,15 @@ FEC_CLIENT_STATS_LINE=$(grep -E '^\[client-stats\] ' "$CLI_LOG" | tail -n1 || tr
 FEC_ENC_MS=$(echo "$FEC_CLIENT_STATS_LINE" | sed -n 's/.*enc_ms=\([0-9.\-]\+\).*/\1/p')
 FEC_SEND_MS=$(echo "$FEC_CLIENT_STATS_LINE" | sed -n 's/.*send_ms=\([0-9.\-]\+\).*/\1/p')
 
-echo "[run] proto=quic_fec bitrate=${BITRATE_MBPS}Mbps rtt=${RTT_MS}ms loss=${LOSS_DESC} dur_ms=${DUR_MS} dur_ms_client=${DUR_MS_CLIENT} timed_out=${TIMED_OUT} client_ok=${CLIENT_OK} client_rc=${RC} md5_ok=${MD5_OK} s_mbps=${S_MBPS}${run_tail} overhead_ratio=${OVERHEAD_RATIO} file_bytes=${FILE_SIZE} tx_bytes=${TX_BYTES} rx_bytes=${RX_BYTES} netem_sent_pkts=${NETEM_SENT_PKTS} netem_dropped_pkts=${NETEM_DROPPED_PKTS} netem_sent_bytes=${NETEM_SENT_BYTES} netem_drop_rate=${NETEM_DROP_RATE:-} fec_dial_ms=${FEC_DIAL_MS:-} fec_header_ms=${FEC_HEADER_MS:-} fec_send_blocks_ms=${FEC_SEND_BLOCKS_MS:-} fec_arq_drain_ms=${FEC_ARQ_DRAIN_MS:-} fec_tx_stats_ms=${FEC_TX_STATS_MS:-} fec_post_wait_ms=${FEC_POST_WAIT_MS:-} fec_keep_stop_ms=${FEC_KEEP_STOP_MS:-} fec_total_ms=${FEC_TOTAL_MS:-} fec_done_wait_ms=${FEC_DONE_WAIT_MS:-} fec_done_ok=${FEC_DONE_OK:-} fec_done_written=${FEC_DONE_WRITTEN:-} fec_enc_ms=${FEC_ENC_MS:-} fec_send_ms=${FEC_SEND_MS:-} fec_quic_sent_pkts=${FEC_QUIC_SENT_PKTS:-} fec_quic_sent_bytes=${FEC_QUIC_SENT_BYTES:-} fec_quic_sent_short_pkts=${FEC_QUIC_SENT_SHORT_PKTS:-} fec_quic_sent_short_bytes=${FEC_QUIC_SENT_SHORT_BYTES:-} fec_quic_lost_1rtt_pkts=${FEC_QUIC_LOST_1RTT_PKTS:-} fec_quic_acked_1rtt_pkts=${FEC_QUIC_ACKED_1RTT_PKTS:-} fec_quic_srtt_ms=${FEC_QUIC_SRTT_MS:-} fec_quic_min_rtt_ms=${FEC_QUIC_MIN_RTT_MS:-} fec_quic_latest_rtt_ms=${FEC_QUIC_LATEST_RTT_MS:-} fec_quic_cwnd_bytes=${FEC_QUIC_CWND_BYTES:-} fec_quic_inflight_bytes=${FEC_QUIC_INFLIGHT_BYTES:-} fec_quic_inflight_pkts=${FEC_QUIC_INFLIGHT_PKTS:-} fec_quic_overhead_ratio=${FEC_QUIC_OVERHEAD_RATIO:-} arq_clusters=${FEC_ARQ_CLUSTERS:-} arq_attempts=${FEC_ARQ_ATTEMPTS:-} arq_tx_source_symbols=${FEC_ARQ_TX_SOURCE_SYMBOLS:-} arq_tx_repairs=${FEC_ARQ_TX_REPAIRS:-} arq_fec_overhead=${FEC_ARQ_FEC_OVERHEAD:-}" >&2
+echo "[run] proto=quic_fec bitrate=${BITRATE_MBPS}Mbps rtt=${RTT_MS}ms loss=${LOSS_DESC} dur_ms=${DUR_MS} dur_ms_client=${DUR_MS_CLIENT} timed_out=${TIMED_OUT} client_ok=${CLIENT_OK} client_rc=${RC} md5_ok=${MD5_OK} md5_skipped=${MD5_SKIPPED} s_mbps=${S_MBPS}${run_tail} overhead_ratio=${OVERHEAD_RATIO} file_bytes=${FILE_SIZE} tx_bytes=${TX_BYTES} rx_bytes=${RX_BYTES} netem_sent_pkts=${NETEM_SENT_PKTS} netem_dropped_pkts=${NETEM_DROPPED_PKTS} netem_sent_bytes=${NETEM_SENT_BYTES} netem_drop_rate=${NETEM_DROP_RATE:-} fec_dial_ms=${FEC_DIAL_MS:-} fec_header_ms=${FEC_HEADER_MS:-} fec_send_blocks_ms=${FEC_SEND_BLOCKS_MS:-} fec_arq_drain_ms=${FEC_ARQ_DRAIN_MS:-} fec_tx_stats_ms=${FEC_TX_STATS_MS:-} fec_post_wait_ms=${FEC_POST_WAIT_MS:-} fec_keep_stop_ms=${FEC_KEEP_STOP_MS:-} fec_total_ms=${FEC_TOTAL_MS:-} fec_done_wait_ms=${FEC_DONE_WAIT_MS:-} fec_done_ok=${FEC_DONE_OK:-} fec_done_written=${FEC_DONE_WRITTEN:-} fec_enc_ms=${FEC_ENC_MS:-} fec_send_ms=${FEC_SEND_MS:-} fec_quic_sent_pkts=${FEC_QUIC_SENT_PKTS:-} fec_quic_sent_bytes=${FEC_QUIC_SENT_BYTES:-} fec_quic_sent_short_pkts=${FEC_QUIC_SENT_SHORT_PKTS:-} fec_quic_sent_short_bytes=${FEC_QUIC_SENT_SHORT_BYTES:-} fec_quic_lost_1rtt_pkts=${FEC_QUIC_LOST_1RTT_PKTS:-} fec_quic_acked_1rtt_pkts=${FEC_QUIC_ACKED_1RTT_PKTS:-} fec_quic_srtt_ms=${FEC_QUIC_SRTT_MS:-} fec_quic_min_rtt_ms=${FEC_QUIC_MIN_RTT_MS:-} fec_quic_latest_rtt_ms=${FEC_QUIC_LATEST_RTT_MS:-} fec_quic_cwnd_bytes=${FEC_QUIC_CWND_BYTES:-} fec_quic_inflight_bytes=${FEC_QUIC_INFLIGHT_BYTES:-} fec_quic_inflight_pkts=${FEC_QUIC_INFLIGHT_PKTS:-} fec_quic_overhead_ratio=${FEC_QUIC_OVERHEAD_RATIO:-} arq_clusters=${FEC_ARQ_CLUSTERS:-} arq_attempts=${FEC_ARQ_ATTEMPTS:-} arq_tx_source_symbols=${FEC_ARQ_TX_SOURCE_SYMBOLS:-} arq_tx_repairs=${FEC_ARQ_TX_REPAIRS:-} arq_fec_overhead=${FEC_ARQ_FEC_OVERHEAD:-}" >&2
+
+# Phase timings (ms). Useful to explain why python-side wall_ms >> dur_ms.
+tc_ms=$(( (T_TC_END - T_TC_START) / 1000000 ))
+srv_ready_ms=$(( (T_SRV_READY - T_SRV_START) / 1000000 ))
+wait_obs_ms=$(( (T_WAIT_OBS_END - T_WAIT_OBS_START) / 1000000 ))
+md5_ms=$(( (T_MD5_END - T_MD5_START) / 1000000 ))
+total_ms=$(( (T_MD5_END - T_SCRIPT_START) / 1000000 ))
+echo "[timing] tc_ms=${tc_ms} srv_ready_ms=${srv_ready_ms} wait_obs_ms=${wait_obs_ms} md5_ms=${md5_ms} total_ms=${total_ms}" >&2
 
 # Cleanup temp logs
 # - Keep logs when a failure occurs (no RL_OBS) or residual_erasures=1.

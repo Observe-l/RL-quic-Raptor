@@ -44,6 +44,8 @@ SKIP_NETNS_RESET=${SKIP_NETNS_RESET:-0}
 SKIP_TC_CONFIG=${SKIP_TC_CONFIG:-0}
 SKIP_BUILD=${SKIP_BUILD:-0}
 
+T_SCRIPT_START=$(date +%s%N)
+
 if ! sudo -n true 2>/dev/null; then
   echo "[error] sudo privileges are required. Run 'sudo -v' once and rerun." >&2
   exit 1
@@ -95,6 +97,7 @@ fi
 
 # Configure qdiscs: same as quicfec_run_once.sh
 half=$(( RTT_MS / 2 ))
+T_TC_START=$(date +%s%N)
 if [[ "$SKIP_TC_CONFIG" != "1" ]]; then
   sudo tc qdisc del dev "$VETH_HOST" root 2>/dev/null || true
   NETEM_ARGS=(delay ${half}ms)
@@ -117,6 +120,7 @@ if [[ "$SKIP_TC_CONFIG" != "1" ]]; then
   sudo ip netns exec "$NS" tc qdisc del dev "$VETH_NS" root 2>/dev/null || true
   sudo ip netns exec "$NS" tc qdisc replace dev "$VETH_NS" root netem delay ${half}ms
 fi
+T_TC_END=$(date +%s%N)
 
 if [[ "$SETUP_ONLY" == "1" ]]; then
   exit 0
@@ -125,22 +129,21 @@ fi
 # Run server
 SRV_LOG=$(mktemp -t quic_raw_srv.XXXXXX.log)
 rm -f "$OUT_DIR/$(basename "$FILE").recv" 2>/dev/null || true
+T_SRV_START=$(date +%s%N)
 sudo ip netns exec "$NS" bash -lc "ulimit -n 1048576; '$BIN_DIR/quicraw-server' -addr ${SRV_IP}:$PORT -out '$OUT_DIR' -timeout 45s" >"$SRV_LOG" 2>&1 & SP=$!
 
 # Wait for server UDP socket to be ready (best-effort). A fixed sleep can be flaky under load.
 ready=0
 if command -v ss >/dev/null 2>&1; then
-  for _ in $(seq 1 30); do
-    if sudo ip netns exec "$NS" ss -lunH 2>/dev/null | awk '{print $5}' | grep -q ":$PORT$"; then
-      ready=1
-      break
-    fi
-    sleep 0.02
-  done
+  # Keep this fast: client already has dial/handshake retries.
+  if sudo ip netns exec "$NS" bash -lc "for _ in \$(seq 1 8); do if ss -lunH 2>/dev/null | awk '{print \$5}' | grep -q ':$PORT$'; then exit 0; fi; sleep 0.01; done; exit 1"; then
+    ready=1
+  fi
 fi
 if [[ "$ready" != "1" ]]; then
-  sleep 0.1
+  sleep 0.05
 fi
+T_SRV_READY=$(date +%s%N)
 
 # Run client
 CLI_LOG=$(mktemp -t quic_raw_cli.XXXXXX.log)
@@ -242,6 +245,7 @@ fi
 IN_SIZE=$(stat -c%s "$FILE")
 tries=0
 max_tries=100  # ~10s
+T_WAIT_SRV_START=$(date +%s%N)
 while [[ $tries -lt $max_tries ]]; do
   if grep -q "^\[raw-server\]" "$SRV_LOG" 2>/dev/null; then
     break
@@ -255,13 +259,16 @@ while [[ $tries -lt $max_tries ]]; do
   sleep 0.1
   tries=$((tries+1))
 done
+T_WAIT_SRV_END=$(date +%s%N)
 
 sleep 0.05; kill $SP 2>/dev/null || true
 sleep 0.05; kill -9 $SP 2>/dev/null || true
 
+T_MD5_START=$(date +%s%N)
 IN_MD5=$(md5sum "$FILE" | awk '{print $1}')
 OUT_MD5=$(md5sum "$OUT_DIR/$(basename "$FILE").recv" | awk '{print $1}' || true)
 MD5_OK=0; [[ "$IN_MD5" == "$OUT_MD5" ]] && MD5_OK=1
+T_MD5_END=$(date +%s%N)
 
 # Client wall duration (includes dial/open/header/send/ack; does not include md5 below).
 DUR_MS_CLIENT=$(( (END-START)/1000000 ))
@@ -365,6 +372,14 @@ if [[ -n "${LOSS_MODE}" ]]; then
 fi
 
 echo "[run] proto=quic_raw bitrate=${BITRATE_MBPS}Mbps rtt=${RTT_MS}ms loss=${LOSS_TAG} dur_ms=${DUR_MS_SERVER} dur_ms_client=${DUR_MS_CLIENT} timed_out=${TIMED_OUT} client_ok=${CLIENT_OK} client_rc=${RC} md5_ok=${MD5_OK} s_mbps=${S_MBPS} overhead_ratio=${OVERHEAD_RATIO} file_bytes=${FILE_SIZE} tx_bytes=${TX_BYTES} rx_bytes=${RX_BYTES} netem_sent_pkts=${NETEM_SENT_PKTS} netem_dropped_pkts=${NETEM_DROPPED_PKTS} netem_sent_bytes=${NETEM_SENT_BYTES} netem_drop_rate=${NETEM_DROP_RATE:-} raw_dial_ms=${RAW_DIAL_MS:-} raw_open_stream_ms=${RAW_OPEN_STREAM_MS:-} raw_header_ms=${RAW_HEADER_MS:-} raw_send_ms=${RAW_SEND_MS:-} raw_ack_ms=${RAW_ACK_MS:-} raw_ack_ok=${RAW_ACK_OK:-} raw_post_wait_ms=${RAW_POST_WAIT_MS:-} raw_total_ms=${TOTAL_MS:-} raw_quic_sent_pkts=${RAW_QUIC_SENT_PKTS:-} raw_quic_sent_bytes=${RAW_QUIC_SENT_BYTES:-} raw_quic_sent_short_pkts=${RAW_QUIC_SENT_SHORT_PKTS:-} raw_quic_sent_short_bytes=${RAW_QUIC_SENT_SHORT_BYTES:-} raw_quic_lost_1rtt_pkts=${RAW_QUIC_LOST_1RTT_PKTS:-} raw_quic_acked_1rtt_pkts=${RAW_QUIC_ACKED_1RTT_PKTS:-} raw_quic_retx_1rtt_pkts=${RAW_QUIC_RETX_1RTT_PKTS:-} raw_quic_retx_1rtt_bytes=${RAW_QUIC_RETX_1RTT_BYTES:-} raw_quic_recovery_triggers=${RAW_QUIC_RECOVERY_TRIGGERS:-} raw_quic_loss_detection_events=${RAW_QUIC_LOSS_DETECTION_EVENTS:-} raw_quic_loss_timer_expired_ack=${RAW_QUIC_LTE_ACK:-} raw_quic_loss_timer_expired_pto=${RAW_QUIC_LTE_PTO:-} raw_quic_loss_timer_expired_path_probe=${RAW_QUIC_LTE_PATH_PROBE:-} raw_quic_pto_events=${RAW_QUIC_PTO_EVENTS:-} raw_quic_srtt_ms=${RAW_QUIC_SRTT_MS:-} raw_quic_min_rtt_ms=${RAW_QUIC_MIN_RTT_MS:-} raw_quic_latest_rtt_ms=${RAW_QUIC_LATEST_RTT_MS:-} raw_quic_cwnd_bytes=${RAW_QUIC_CWND_BYTES:-} raw_quic_inflight_bytes=${RAW_QUIC_INFLIGHT_BYTES:-} raw_quic_inflight_pkts=${RAW_QUIC_INFLIGHT_PKTS:-} raw_quic_overhead_ratio=${RAW_QUIC_OVERHEAD_RATIO:-}" >&2
+
+# Phase timings (ms). Useful to explain why python-side wall_ms >> dur_ms.
+tc_ms=$(( (T_TC_END - T_TC_START) / 1000000 ))
+srv_ready_ms=$(( (T_SRV_READY - T_SRV_START) / 1000000 ))
+wait_srv_ms=$(( (T_WAIT_SRV_END - T_WAIT_SRV_START) / 1000000 ))
+md5_ms=$(( (T_MD5_END - T_MD5_START) / 1000000 ))
+total_ms=$(( (T_MD5_END - T_SCRIPT_START) / 1000000 ))
+echo "[timing] tc_ms=${tc_ms} srv_ready_ms=${srv_ready_ms} wait_srv_ms=${wait_srv_ms} md5_ms=${md5_ms} total_ms=${total_ms}" >&2
 
 # Emit AoI-style average one-way delay from server output.
 DELAY_LINE=$(grep -E '^\[delay\] ' "$SRV_LOG" | tail -n1 || true)

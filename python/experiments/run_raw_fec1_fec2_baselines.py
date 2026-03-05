@@ -108,6 +108,17 @@ def _extract_last_run_record(s: str) -> str:
 	return " ".join(parts).strip()
 
 
+def _extract_last_timing_record(s: str) -> str:
+	"""Extract the last [timing] record (single-line)."""
+	text = (s or "").replace("\r", "\n")
+	last = ""
+	for line in text.split("\n"):
+		line = (line or "").strip()
+		if line.startswith("[timing]"):
+			last = line
+	return last
+
+
 def _parse_kv_from_run_line(line: str) -> Dict[str, str]:
 	out: Dict[str, str] = {}
 	for tok in (line or "").strip().split():
@@ -172,17 +183,44 @@ def _overhead_quic_ratio_from_kv(*, kv: Dict[str, str]) -> float:
 	return 0.0
 
 
-def _run_script(*, script: Path, env: Dict[str, str], timeout_s: int) -> str:
-	p = subprocess.run(
-		["bash", str(script)],
-		cwd=str(_REPO_ROOT),
-		env={**os.environ, **env},
-		stdout=subprocess.DEVNULL,
-		stderr=subprocess.PIPE,
-		text=True,
-		timeout=int(timeout_s),
-	)
-	return str(p.stderr or "")
+def _run_script(*, script: Path, env: Dict[str, str], timeout_s: int) -> Tuple[str, str, int, float, int]:
+	"""Run a bash script and capture output.
+
+	Returns: (stdout, stderr, returncode, wall_ms, timed_out)
+	"""
+	start = time.perf_counter()
+	try:
+		p = subprocess.run(
+			["bash", str(script)],
+			cwd=str(_REPO_ROOT),
+			env={**os.environ, **env},
+			stdout=subprocess.PIPE,
+			stderr=subprocess.PIPE,
+			text=True,
+			timeout=int(timeout_s),
+		)
+		wall_ms = (time.perf_counter() - start) * 1000.0
+		return str(p.stdout or ""), str(p.stderr or ""), int(p.returncode), float(wall_ms), 0
+	except subprocess.TimeoutExpired as e:
+		wall_ms = (time.perf_counter() - start) * 1000.0
+		stdout = ""
+		stderr = ""
+		try:
+			stdout = str(e.stdout or "")
+		except Exception:
+			stdout = ""
+		try:
+			stderr = str(e.stderr or "")
+		except Exception:
+			stderr = ""
+		return stdout, stderr, -1, float(wall_ms), 1
+
+
+def _tail_text(s: str, *, max_chars: int = 4000) -> str:
+	s = str(s or "")
+	if len(s) <= max_chars:
+		return s
+	return s[-max_chars:]
 
 
 def _ensure_file_of_size(*, file_path: Path, file_bytes: int) -> None:
@@ -289,6 +327,7 @@ class Rec:
 	sender_id: int
 	loss_mode: str
 	rep: int
+	trial_wall_ms: float
 	success: int
 	timed_out: int
 	md5_ok: int
@@ -380,7 +419,18 @@ def main() -> int:
 		"LOSS_MODE": "none",
 		"TIMEOUT_S": str(int(args.timeout_transfer_s)),
 	}
-	_run_script(script=_REPO_ROOT / "scripts" / "quicfec_run_once.sh", env=setup_env, timeout_s=60)
+	setup_out, setup_err, setup_rc, _, setup_timed_out = _run_script(
+		script=_REPO_ROOT / "scripts" / "quicfec_run_once.sh", env=setup_env, timeout_s=60
+	)
+	if setup_timed_out == 1 or setup_rc != 0:
+		sys.stderr.write("[error] setup failed (quicfec_run_once.sh).\n")
+		sys.stderr.write("- If this is the first run: run `sudo -v` once, then retry.\n")
+		sys.stderr.write(f"- rc={setup_rc} timed_out={setup_timed_out}\n")
+		if setup_out.strip():
+			sys.stderr.write("--- setup stdout (tail) ---\n" + _tail_text(setup_out).rstrip() + "\n")
+		if setup_err.strip():
+			sys.stderr.write("--- setup stderr (tail) ---\n" + _tail_text(setup_err).rstrip() + "\n")
+		return 2
 
 	# Build quic-raw binaries once as well.
 	raw_setup_env = {
@@ -395,7 +445,18 @@ def main() -> int:
 		"LOSS_MODE": "none",
 		"TIMEOUT_S": str(int(args.timeout_transfer_s)),
 	}
-	_run_script(script=_REPO_ROOT / "scripts" / "quicraw_run_once.sh", env=raw_setup_env, timeout_s=60)
+	raw_setup_out, raw_setup_err, raw_setup_rc, _, raw_setup_timed_out = _run_script(
+		script=_REPO_ROOT / "scripts" / "quicraw_run_once.sh", env=raw_setup_env, timeout_s=60
+	)
+	if raw_setup_timed_out == 1 or raw_setup_rc != 0:
+		sys.stderr.write("[error] setup failed (quicraw_run_once.sh).\n")
+		sys.stderr.write("- If this is the first run: run `sudo -v` once, then retry.\n")
+		sys.stderr.write(f"- rc={raw_setup_rc} timed_out={raw_setup_timed_out}\n")
+		if raw_setup_out.strip():
+			sys.stderr.write("--- setup stdout (tail) ---\n" + _tail_text(raw_setup_out).rstrip() + "\n")
+		if raw_setup_err.strip():
+			sys.stderr.write("--- setup stderr (tail) ---\n" + _tail_text(raw_setup_err).rstrip() + "\n")
+		return 2
 
 	common_env = {
 		**net_env,
@@ -403,7 +464,7 @@ def main() -> int:
 		"SKIP_NETNS_RESET": "1",
 		"SKIP_TC_CONFIG": "0",
 		"SKIP_SYSCTL": "1",
-		"SKIP_BUILD": "0",
+		"SKIP_BUILD": "1",
 		"BITRATE_MBPS": str(int(args.bitrate_mbps)),
 		"TIMEOUT_S": str(int(args.timeout_transfer_s)),
 		"QUIC_FEC_CC_BYPASS": "0",
@@ -452,20 +513,42 @@ def main() -> int:
 				scenarios.append((int(sid), int(args.rtt_ms), f"iid:{float(pct):g}"))
 
 	def _run_one(*, method: str, script: Path, env: Dict[str, str], sender_id: int, loss_mode: str, rtt_ms: int, rep: int) -> None:
-		stderr = _run_script(script=script, env=env, timeout_s=int(args.timeout_s))
+		stdout, stderr, rc, trial_wall_ms, timed_out_flag = _run_script(
+			script=script, env=env, timeout_s=int(args.timeout_s)
+		)
 		run_line = _extract_last_run_record(stderr)
 		kv = _parse_kv_from_run_line(run_line)
+		timing_line = _extract_last_timing_record(stderr)
+		timing_kv = _parse_kv_from_run_line(timing_line) if timing_line else {}
 
-		timed_out = _to_int(kv, "timed_out", 0)
+		timed_out = 1 if timed_out_flag == 1 else _to_int(kv, "timed_out", 0)
 		md5_ok = _to_int(kv, "md5_ok", 0)
-		client_ok = _to_int(kv, "client_ok", 1)
+		client_ok = _to_int(kv, "client_ok", 0) if not kv else _to_int(kv, "client_ok", 1)
+		if rc != 0 and "client_ok" not in kv:
+			client_ok = 0
 		success = 1 if (timed_out == 0 and md5_ok == 1 and client_ok == 1) else 0
+		if str(method).startswith("fec_"):
+			# QUIC-FEC provides an explicit receiver DONE ACK. When baselines run
+			# with SKIP_MD5=1 to reduce wall-time jitter, this is our correctness guard.
+			done_ok = _to_int(kv, "fec_done_ok", 1)
+			done_written = _to_int(kv, "fec_done_written", 0)
+			if "fec_done_ok" in kv and done_ok != 1:
+				success = 0
+			if "fec_done_written" in kv and done_written < int(args.file_bytes):
+				success = 0
 
 		dur_ms = float(_to_float(kv, "dur_ms", 0.0))
 		e2e_delay_ms = float(dur_ms) + float(rtt_ms) / 2.0 if dur_ms > 0 else 0.0
 		goodput_mbps = _goodput_mbps_from_file_and_dur(file_bytes=int(args.file_bytes), dur_ms=dur_ms)
 		overhead_ratio = _overhead_quic_ratio_from_kv(kv=kv) if int(args.enable_quic_overhead) == 1 else 0.0
 
+		extra: Dict[str, Any] = {"run": kv, "timing": timing_kv, "script_rc": int(rc)}
+		if not kv:
+			# Store tails to make early failures diagnosable (e.g., missing sudo cache, missing netns).
+			if stdout.strip():
+				extra["stdout_tail"] = _tail_text(stdout)
+			if stderr.strip():
+				extra["stderr_tail"] = _tail_text(stderr)
 		recs.append(
 			Rec(
 				task=str(task),
@@ -473,6 +556,7 @@ def main() -> int:
 				sender_id=int(sender_id),
 				loss_mode=str(loss_mode),
 				rep=int(rep),
+				trial_wall_ms=float(trial_wall_ms),
 				success=int(success),
 				timed_out=int(timed_out),
 				md5_ok=int(md5_ok),
@@ -481,7 +565,7 @@ def main() -> int:
 				e2e_delay_ms=float(e2e_delay_ms),
 				goodput_mbps=float(goodput_mbps),
 				overhead_ratio=float(overhead_ratio),
-				extra={"run": kv},
+				extra=extra,
 			)
 		)
 
@@ -512,6 +596,13 @@ def main() -> int:
 					**common_env,
 					"RTT_MS": str(int(rtt_ms)),
 					"LOSS_MODE": str(loss_mode),
+					# Baseline runner doesn't consume RL observations, and uses client-side
+					# DONE ACK (fec_done_ok) instead of server-side md5.
+					# Disable post-transfer polling/flush to avoid ~0.5s wall-time jitter.
+					"OBS_JSON": "/dev/null",
+					"OBS_WAIT_SECS": "0",
+					"WAIT_RECV_SECS": "0",
+					"SKIP_MD5": "1",
 					"K": str(int(k)),
 					"R0": str(int(r0)),
 					"RSTEP": str(int(rstep)),
@@ -533,7 +624,7 @@ def main() -> int:
 				)
 
 			last = recs[-3:]
-			ok_str = " ".join([f"{r.method}(ok={r.success} dur_ms={int(r.dur_ms)})" for r in last])
+			ok_str = " ".join([f"{r.method}(ok={r.success} dur_ms={int(r.dur_ms)} wall_ms={int(r.trial_wall_ms)})" for r in last])
 			print(f"rep={rep:02d} sender={sender_id} rtt_ms={rtt_ms} loss={loss_mode} {ok_str}")
 
 	out_csv = out_dir / "results.csv"
@@ -546,6 +637,7 @@ def main() -> int:
 				"sender_id",
 				"loss_mode",
 				"rep",
+				"trial_wall_ms",
 				"success",
 				"timed_out",
 				"md5_ok",

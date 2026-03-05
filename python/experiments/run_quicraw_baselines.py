@@ -108,6 +108,17 @@ def _extract_last_run_record(s: str) -> str:
 	return " ".join(parts).strip()
 
 
+def _extract_last_timing_record(s: str) -> str:
+	"""Extract the last [timing] record (single-line)."""
+	text = (s or "").replace("\r", "\n")
+	last = ""
+	for line in text.split("\n"):
+		line = (line or "").strip()
+		if line.startswith("[timing]"):
+			last = line
+	return last
+
+
 def _parse_kv_from_run_line(line: str) -> Dict[str, str]:
 	out: Dict[str, str] = {}
 	for tok in (line or "").strip().split():
@@ -168,17 +179,30 @@ def _overhead_quic_ratio_from_kv(*, kv: Dict[str, str]) -> float:
 	return 0.0
 
 
-def _run_script(*, script: Path, env: Dict[str, str], timeout_s: int) -> str:
-	p = subprocess.run(
-		["bash", str(script)],
-		cwd=str(_REPO_ROOT),
-		env={**os.environ, **env},
-		stdout=subprocess.DEVNULL,
-		stderr=subprocess.PIPE,
-		text=True,
-		timeout=int(timeout_s),
-	)
-	return str(p.stderr or "")
+def _run_script(*, script: Path, env: Dict[str, str], timeout_s: int) -> Tuple[str, float]:
+	start = time.perf_counter()
+	try:
+		p = subprocess.run(
+			["bash", str(script)],
+			cwd=str(_REPO_ROOT),
+			env={**os.environ, **env},
+			stdout=subprocess.DEVNULL,
+			stderr=subprocess.PIPE,
+			text=True,
+			timeout=int(timeout_s),
+		)
+		wall_ms = (time.perf_counter() - start) * 1000.0
+		return str(p.stderr or ""), float(wall_ms)
+	except subprocess.TimeoutExpired as e:
+		wall_ms = (time.perf_counter() - start) * 1000.0
+		stderr = ""
+		try:
+			stderr = str(e.stderr or "")
+		except Exception:
+			stderr = ""
+		# Emit a synthetic [run] record so downstream parsing still works.
+		stderr = (stderr.rstrip() + "\n" if stderr else "") + "[run] timed_out=1 md5_ok=0 client_ok=0 dur_ms=0"
+		return stderr, float(wall_ms)
 
 
 def _ensure_file_of_size(*, file_path: Path, file_bytes: int) -> None:
@@ -285,6 +309,7 @@ class Rec:
 	sender_id: int
 	loss_mode: str
 	rep: int
+	trial_wall_ms: float
 	success: int
 	timed_out: int
 	md5_ok: int
@@ -380,7 +405,7 @@ def main() -> int:
 		"OUT_DIR": str(tmp_out_dir),
 		"SKIP_NETNS_RESET": "1",
 		"SKIP_TC_CONFIG": "0",
-		"SKIP_BUILD": "0",
+		"SKIP_BUILD": "1",
 		"BITRATE_MBPS": str(int(args.bitrate_mbps)),
 		"TIMEOUT_S": str(int(args.timeout_transfer_s)),
 		"QUIC_FEC_CC_BYPASS": "0",
@@ -426,9 +451,15 @@ def main() -> int:
 				scenarios.append((int(sid), int(args.rtt_ms), f"iid:{float(pct):g}"))
 
 	def _run_one(*, env: Dict[str, str], sender_id: int, loss_mode: str, rtt_ms: int, rep: int) -> None:
-		stderr = _run_script(script=_REPO_ROOT / "scripts" / "quicraw_run_once.sh", env=env, timeout_s=int(args.timeout_s))
+		stderr, trial_wall_ms = _run_script(
+			script=_REPO_ROOT / "scripts" / "quicraw_run_once.sh",
+			env=env,
+			timeout_s=int(args.timeout_s),
+		)
 		run_line = _extract_last_run_record(stderr)
 		kv = _parse_kv_from_run_line(run_line)
+		timing_line = _extract_last_timing_record(stderr)
+		timing_kv = _parse_kv_from_run_line(timing_line) if timing_line else {}
 
 		timed_out = _to_int(kv, "timed_out", 0)
 		md5_ok = _to_int(kv, "md5_ok", 0)
@@ -453,6 +484,7 @@ def main() -> int:
 				sender_id=int(sender_id),
 				loss_mode=str(loss_mode),
 				rep=int(rep),
+				trial_wall_ms=float(trial_wall_ms),
 				success=int(success),
 				timed_out=int(timed_out),
 				md5_ok=int(md5_ok),
@@ -466,7 +498,7 @@ def main() -> int:
 				pto_events=int(pto_events),
 				retx_1rtt_pkts=int(retx_pkts),
 				retx_1rtt_bytes=int(retx_bytes),
-				extra={"run": kv},
+				extra={"run": kv, "timing": timing_kv},
 			)
 		)
 
@@ -484,7 +516,7 @@ def main() -> int:
 			r = recs[-1]
 			print(
 				f"rep={rep:02d} sender={sender_id} rtt_ms={rtt_ms} loss={loss_mode} "
-				f"ok={r.success} dur_ms={int(r.dur_ms)} recovery_triggers={r.recovery_triggers} "
+				f"ok={r.success} dur_ms={int(r.dur_ms)} wall_ms={int(r.trial_wall_ms)} recovery_triggers={r.recovery_triggers} "
 				f"loss_detection_events={r.loss_detection_events} pto_events={r.pto_events} retx_pkts={r.retx_1rtt_pkts}"
 			)
 
@@ -498,6 +530,7 @@ def main() -> int:
 				"sender_id",
 				"loss_mode",
 				"rep",
+				"trial_wall_ms",
 				"success",
 				"timed_out",
 				"md5_ok",
