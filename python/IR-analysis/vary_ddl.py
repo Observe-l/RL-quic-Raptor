@@ -16,7 +16,7 @@ L = 1000
 Delta = (L * 8) / bw
 
 # Monte Carlo trials per (T, ΔR) point. Keep this modest since we sweep 5×51 points.
-TRIALS = 5000
+TRIALS = 2000
 
 def simulate_one_block_with_chain(deltaR, mode, rng):
     """Return (success, sent_packets, time_spent)."""
@@ -104,13 +104,14 @@ def simulate_session(B, T_deadline_s, deltaR, mode, trials=TRIALS, seed=9):
 
 deltaR_vals = list(range(0, 51))
 
-# Session has a fixed global deadline T; we vary the number of blocks B.
-T_deadline_s = 0.5
-B_vals = [1, 2, 3]
+# Session has a fixed number of blocks; we vary the global deadline T.
+B = 1
+T_vals_ms = [100, 125, 150]
 
 curves = {}
 rows = []
-for B in B_vals:
+for T_ms in T_vals_ms:
+    T_deadline_s = float(T_ms) / 1000.0
     pts = []
     for dR in deltaR_vals:
         # Note: ARQ is equivalent to IR with ΔR=0 under this model.
@@ -119,27 +120,27 @@ for B in B_vals:
         pts.append((int(dR), float(P_i), float(overhead)))
         rows.append(
             {
+                "T_ms": int(T_ms),
                 "B": int(B),
-                "T_s": float(T_deadline_s),
-                "T_ms": int(round(float(T_deadline_s) * 1000.0)),
                 "DeltaR": int(dR),
                 "P": float(P_i),
                 "overhead": float(overhead),
             }
         )
-    curves[int(B)] = pts
+    curves[int(T_ms)] = pts
 
-# Plot: One figure, curves for different B.
+# Plot: One figure, curves for different deadlines T.
 plt.figure()
-for i, B in enumerate(B_vals):
-    pts = curves[int(B)]
+for i, T_ms in enumerate(T_vals_ms):
+    pts = curves[int(T_ms)]
     xs = [p[0] for p in pts]
     ys = [p[1] for p in pts]
-    (ln,) = plt.plot(xs, ys, label=f"B={int(B)}")
+    (ln,) = plt.plot(xs, ys, label=f"T={int(T_ms)}ms")
 
     # Mark the curve start (ΔR=0), which corresponds to ARQ under this model.
     if xs and xs[0] == 0:
         plt.scatter([xs[0]], [ys[0]], marker="s", s=28, color=ln.get_color(), label="_nolegend_", zorder=3)
+
 
 plt.scatter([], [], marker="s", s=28, color="k", label=r"ARQ ($\Delta R=0$)")
 plt.xlabel(r"$\Delta R$")
@@ -149,14 +150,14 @@ plt.grid(True)
 plt.legend(loc="best")
 plt.show()
 
-def _head_rows_for(B: int, n: int = 8):
+def _head_rows_for(T_ms: int, n: int = 8):
     out = []
     for r in rows:
-        if int(r.get("B", -1)) != int(B):
+        if int(r.get("T_ms", -1)) != int(T_ms):
             continue
         out.append(r)
     out.sort(key=lambda r: int(r.get("DeltaR", 0)))
     return out[:n]
 
-_head_rows_for(1, 8), _head_rows_for(2, 8)
+_head_rows_for(100, 8), _head_rows_for(200, 8)
 

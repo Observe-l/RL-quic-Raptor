@@ -223,7 +223,7 @@ def main():
                     help="Fallback policy if steady_rp has too few good windows")
 
     # JSON filtering by success_rate_steady_rp
-    ap.add_argument("--min_success_steady_rp", type=float, default=0.8,
+    ap.add_argument("--min_success_steady_rp", type=float, default=0.6,
                     help="Filter quic_fec_params.json to keep only senders with success_rate_steady_rp >= this value")
     ap.add_argument("--filter_json_by_success_steady_rp", action=argparse.BooleanOptionalAction, default=True,
                     help="Enable/disable filtering senders in quic_fec_params.json by success_rate_steady_rp")
