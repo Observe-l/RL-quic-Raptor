@@ -1132,7 +1132,7 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 		}
 		// On failure (e.g., SHA mismatch / residual erasures), still emit a best-effort observation
 		// so external harnesses don't stall waiting for metrics.
-		if rxm != nil && rxm.met != nil {
+		if rxm != nil && rxm.met != nil && !rx.DisableObservation {
 			obs := rxm.met.Snapshot(time.Now())
 			// Mark residual erasures on failure path.
 			obs.ResidualErasures = 1
@@ -1151,7 +1151,7 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 	if rxm != nil {
 		fmt.Fprintf(os.Stderr, "[server-stats] dgrams=%d dur_s=%.3f mbps=%.2f dec_blocks=%d dec_ms=%d drop_repairs=%d -> %s\n",
 			rcvDgrams, rdur, mbps2, rxm.decBlocks.Load(), rxm.decTimeTotal.Load(), rxm.dropsRepairs.Load(), finalPath)
-		if rxm.met != nil {
+		if rxm.met != nil && !rx.DisableObservation {
 			obs := rxm.met.Snapshot(time.Now())
 			obs.PrintJSON()
 		}

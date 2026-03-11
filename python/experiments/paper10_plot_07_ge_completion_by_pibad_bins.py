@@ -67,7 +67,7 @@ def main() -> None:
     ap.add_argument("--file-bytes", type=int, default=128 * 1024)
     ap.add_argument("--methods", type=str, default="bandit,fec_k60_r0_2_rstep_2,fec_k40_r0_10_rstep_8,quic_bbrv2,flec")
 
-    ap.add_argument("--ge-ddl-ms", type=float, default=350.0)
+    ap.add_argument("--ge-ddl-ms", type=float, default=500.0)
 
     ap.add_argument("--bins", type=str, default="0,1,3,6,100")
     ap.add_argument("--bin-labels", type=str, default="<1%,1-3%,3-6%,>6%")

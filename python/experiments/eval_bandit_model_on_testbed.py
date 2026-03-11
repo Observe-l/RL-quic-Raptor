@@ -378,7 +378,7 @@ def main() -> int:
         help="Congestion control algorithm (passed as QUIC_FEC_CC_ALGO to quicfec_run_once.sh)",
     )
 
-    ap.add_argument("--file-bytes", type=int, default=100 * 1024)
+    ap.add_argument("--file-bytes", type=int, default=128 * 1024)
     ap.add_argument("--symbol-bytes", type=int, default=1200)
     ap.add_argument("--decode-ddl-ms", type=int, default=25)
 
