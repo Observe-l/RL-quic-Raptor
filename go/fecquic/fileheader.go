@@ -15,7 +15,7 @@ import (
 //	FILESIZE u64  exact byte length
 //	SHA256   32B  digest of the original bytes
 //	CHUNK    u32  bytes per symbol (L)
-//	RESERVED 8B   reserved; currently carries DDL_MS (soft deadline, u32 LE) + 4B zeros
+//	RESERVED 8B   carries DDL_MS (soft deadline, u32 LE) + MAX_ARQ_ATTEMPTS (u32 LE)
 const (
 	fileHeaderMagic = "QFEC"
 	fileHeaderLen   = 4 + 2 + 8 + 32 + 4 + 8
@@ -30,6 +30,9 @@ type FileHeader struct {
 	// It is encoded into the reserved bytes to keep the header length unchanged.
 	// 0 means "not specified" (receiver uses its default).
 	RxDDLMS uint32
+	// MaxARQAttempts is the sender's ARQ retry cap per block.
+	// 0 means "unlimited".
+	MaxARQAttempts uint32
 }
 
 func (h *FileHeader) MarshalBinary() []byte {
@@ -41,7 +44,7 @@ func (h *FileHeader) MarshalBinary() []byte {
 	binary.LittleEndian.PutUint32(b[46:50], h.ChunkL)
 	// reserved 50:58
 	binary.LittleEndian.PutUint32(b[50:54], h.RxDDLMS)
-	// 54:58 zeros
+	binary.LittleEndian.PutUint32(b[54:58], h.MaxARQAttempts)
 	return b
 }
 
@@ -60,6 +63,7 @@ func (h *FileHeader) UnmarshalBinary(b []byte) error {
 	copy(h.SHA256[:], b[14:46])
 	h.ChunkL = binary.LittleEndian.Uint32(b[46:50])
 	h.RxDDLMS = binary.LittleEndian.Uint32(b[50:54])
+	h.MaxARQAttempts = binary.LittleEndian.Uint32(b[54:58])
 	return nil
 }
 

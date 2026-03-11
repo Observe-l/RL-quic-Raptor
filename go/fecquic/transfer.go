@@ -167,6 +167,9 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	if opts.RxDDL > 0 {
 		hdr.RxDDLMS = uint32(opts.RxDDL.Milliseconds())
 	}
+	if opts.MaxAttempts > 0 {
+		hdr.MaxARQAttempts = uint32(opts.MaxAttempts)
+	}
 	if _, err := str.Write(hdr.MarshalBinary()); err != nil {
 		return err
 	}
@@ -874,6 +877,9 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 		prevSoft := rx.SoftDDL
 		if hdr.RxDDLMS > 0 {
 			rx.SoftDDL = time.Duration(hdr.RxDDLMS) * time.Millisecond
+		}
+		if hdr.MaxARQAttempts > 0 {
+			rx.MaxARQAttempts = int(hdr.MaxARQAttempts)
 		}
 		devLogRxDDL("server_softddl_before=%s hdr_ddl_ms=%d server_softddl_after=%s", prevSoft, hdr.RxDDLMS, rx.SoftDDL)
 		// Try read optional filename (u16 len + bytes); safe if EOF

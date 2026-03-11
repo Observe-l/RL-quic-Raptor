@@ -7,10 +7,26 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/quic-go/quic-go/fecquic"
 )
+
+func parseFlexibleDuration(value string) (time.Duration, error) {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return 0, fmt.Errorf("empty duration")
+	}
+	if !strings.ContainsAny(v, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") {
+		seconds, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return 0, err
+		}
+		return time.Duration(seconds * float64(time.Second)), nil
+	}
+	return time.ParseDuration(v)
+}
 
 func main() {
 	var (
@@ -19,8 +35,8 @@ func main() {
 		alpn       = flag.String("alpn", "quic-fec", "ALPN protocol")
 		filePath   = flag.String("in", "data/send.bin", "input file to send")
 		insecure   = flag.Bool("insecure", true, "skip TLS verification")
-		timeout    = flag.Duration("timeout", 60*time.Second, "client timeout (overall)")
-		connectTO  = flag.Duration("connect-timeout", 3*time.Second, "max time allowed for dialing + QUIC handshake (0=use -timeout)")
+		timeout    = flag.String("timeout", "60s", "client timeout; bare numbers mean seconds")
+		connectTO  = flag.String("connect-timeout", "3s", "max time allowed for dialing + QUIC handshake; bare numbers mean seconds (0=use -timeout)")
 
 		K      = flag.Int("K", 26, "source symbols K")
 		R0     = flag.Int("R0", 6, "initial repair symbols R0 (N=K+R0)")
@@ -34,6 +50,17 @@ func main() {
 		quicStats = flag.Bool("quic-stats", false, "enable QUIC-layer aggregate stats line")
 	)
 	flag.Parse()
+
+	timeoutDur, err := parseFlexibleDuration(*timeout)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "bad -timeout:", err)
+		os.Exit(2)
+	}
+	connectTODur, err := parseFlexibleDuration(*connectTO)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "bad -connect-timeout:", err)
+		os.Exit(2)
+	}
 
 	if *devRetx {
 		_ = os.Setenv("QUIC_FEC_DEV_RETX", "1")
@@ -68,10 +95,10 @@ func main() {
 
 	addr := net.JoinHostPort(*serverIP, strconv.Itoa(*serverPort))
 
-	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeoutDur)
 	defer cancel()
-	if *connectTO > 0 && *connectTO > *timeout {
-		*connectTO = *timeout
+	if connectTODur > 0 && connectTODur > timeoutDur {
+		connectTODur = timeoutDur
 	}
 
 	n := *K + *R0
@@ -86,7 +113,7 @@ func main() {
 		RStep:          *Rstep,
 		MaxAttempts:    *maxAtt,
 		RxDDL:          time.Duration(*ddlMS) * time.Millisecond,
-		DialTimeout:    *connectTO,
+		DialTimeout:    connectTODur,
 		Transport:      "dgram",
 	}
 

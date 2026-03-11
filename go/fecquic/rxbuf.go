@@ -20,6 +20,7 @@ type RXOptions struct {
 	BudgetBytes int           // total bytes for buffered symbols (default 10MB)
 	DecodeDDL   time.Duration // receiver decode/check pacing (default 25ms)
 	SoftDDL     time.Duration // receiver ARQ soft deadline (default 25ms)
+	MaxARQAttempts int        // sender-advertised ARQ retry cap per block (0=unlimited)
 	Workers     int           // decode workers (default numCPU)
 
 	// OutPath, if set, writes the received file to this exact path.
@@ -41,6 +42,9 @@ func (o *RXOptions) setDefaults() {
 	}
 	if o.SoftDDL <= 0 {
 		o.SoftDDL = 25 * time.Millisecond
+	}
+	if o.MaxARQAttempts < 0 {
+		o.MaxARQAttempts = 0
 	}
 	if o.Workers <= 0 {
 		o.Workers = 1 // keep simple; can tune later
@@ -91,6 +95,7 @@ type rxBlock struct {
 	// This preserves the intended softDDL + RTT-derived recovery wait.
 	nackWaitUntil  time.Time
 	unseenNackSent bool
+	stopLogged     bool
 }
 
 // rxManager owns memory accounting, blocks, decode and write queues.
@@ -98,6 +103,7 @@ type rxManager struct {
 	// config
 	budget int
 	ddl    time.Duration
+	maxARQAttempts int
 	// softDDL is the soft-deadline for seen blocks: if a seen block has a deficit and
 	// we haven't observed any symbol for that block for softDDL, we trigger a NACK.
 	// This is measured from lastSymAt and is refreshed on every symbol arrival.
@@ -183,6 +189,7 @@ func newRXManager(fileSize uint64, K, L int, outDir, baseName string, rx RXOptio
 	m := &rxManager{
 		budget:    rx.BudgetBytes,
 		ddl:       rx.DecodeDDL,
+		maxARQAttempts: rx.MaxARQAttempts,
 		softDDL:   rx.SoftDDL,
 		fileSize:  fileSize,
 		K:         K,
@@ -481,6 +488,13 @@ func (m *rxManager) start(rx RXOptions) {
 			}
 			var toDecode []*rxBlock
 			var nacks []nackMsg
+			type stopMsg struct {
+				blockID uint16
+				rxu     int
+				attempt int
+				max     int
+			}
+			var stops []stopMsg
 			m.mu.Lock()
 			for _, b := range m.blocks {
 				if b.done || b.queued {
@@ -498,6 +512,14 @@ func (m *rxManager) start(rx RXOptions) {
 							deficit = 2
 						}
 						if deficit > 0 {
+							if m.maxARQAttempts > 0 && b.attempt >= m.maxARQAttempts {
+								if !b.stopLogged {
+									stops = append(stops, stopMsg{blockID: b.id, rxu: rxu, attempt: b.attempt, max: m.maxARQAttempts})
+									b.stopLogged = true
+								}
+								nextDDL = now.Add(maxDur(softDDL, 500*time.Millisecond))
+								goto maybeQueueDecode
+							}
 							// Seen-block soft deadline:
 							// Count from lastSymAt (refreshed on every arrival). If idle for softDDL,
 							// trigger NACK immediately.
@@ -682,6 +704,7 @@ func (m *rxManager) start(rx RXOptions) {
 					// Only queue for decode when we have at least K uniques (decoder likely to succeed).
 					// IMPORTANT: Do not mark b.queued unless we actually enqueue for decode; otherwise
 					// blocks with syms<K would be stuck as 'queued' and stop receiving NACKs.
+				maybeQueueDecode:
 					if (b.srcSeenCount + len(b.syms)) >= b.K {
 						b.queued = true
 						toDecode = append(toDecode, b)
@@ -692,6 +715,9 @@ func (m *rxManager) start(rx RXOptions) {
 				}
 			}
 			m.mu.Unlock()
+			for _, s := range stops {
+				fmt.Fprintf(os.Stderr, "[arq] stop block=%d rx_unique=%d attempt=%d max=%d\n", s.blockID, s.rxu, s.attempt, s.max)
+			}
 			// metrics: record DDL snapshot for each block scheduled
 			if m.met != nil {
 				for _, b := range toDecode {
@@ -1248,6 +1274,13 @@ func max(a, b int) int {
 
 func minDur(a, b time.Duration) time.Duration {
 	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxDur(a, b time.Duration) time.Duration {
+	if a > b {
 		return a
 	}
 	return b

@@ -6,19 +6,36 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/quic-go/quic-go/fecquic"
 )
+
+func parseFlexibleDuration(value string) (time.Duration, error) {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return 0, fmt.Errorf("empty duration")
+	}
+	if !strings.ContainsAny(v, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") {
+		seconds, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return 0, err
+		}
+		return time.Duration(seconds * float64(time.Second)), nil
+	}
+	return time.ParseDuration(v)
+}
 
 func main() {
 	var (
 		addr      = flag.String("addr", "0.0.0.0:25569", "listen address")
 		alpn      = flag.String("alpn", "quic-fec", "ALPN protocol")
 		outPath   = flag.String("out", "data/receive.bin", "output file path")
-		timeout   = flag.Duration("timeout", 0, "server timeout (0=no timeout)")
+		timeout   = flag.String("timeout", "0", "server timeout; bare numbers mean seconds, 0 means no timeout")
 		rxBudget  = flag.Int("rx-budget-bytes", 64*1024*1024, "receiver buffer budget in bytes")
-		decodeDDL = flag.Duration("decode-ddl", 25*time.Millisecond, "receiver decode/check pacing (DECODE_DDL)")
+		decodeDDL = flag.String("decode-ddl", "25ms", "receiver decode/check pacing; bare numbers mean seconds")
 		rxWorkers = flag.Int("rx-workers", 2, "receiver decode workers")
 		enObs     = flag.Bool("enable-obs", false, "emit [rl-observation] JSON line")
 
@@ -26,6 +43,17 @@ func main() {
 		quicStats = flag.Bool("quic-stats", false, "enable QUIC-layer aggregate stats line")
 	)
 	flag.Parse()
+
+	timeoutDur, err := parseFlexibleDuration(*timeout)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "bad -timeout:", err)
+		os.Exit(2)
+	}
+	decodeDDLDur, err := parseFlexibleDuration(*decodeDDL)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "bad -decode-ddl:", err)
+		os.Exit(2)
+	}
 
 	if *devRetx {
 		_ = os.Setenv("QUIC_FEC_DEV_RETX", "1")
@@ -54,8 +82,8 @@ func main() {
 
 	ctx := context.Background()
 	cancel := func() {}
-	if *timeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, *timeout)
+	if timeoutDur > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeoutDur)
 	}
 	defer cancel()
 
@@ -64,7 +92,7 @@ func main() {
 
 	rx := fecquic.RXOptions{
 		BudgetBytes:        *rxBudget,
-		DecodeDDL:          *decodeDDL,
+		DecodeDDL:          decodeDDLDur,
 		Workers:            *rxWorkers,
 		OutPath:            *outPath,
 		DisableObservation: !*enObs,
