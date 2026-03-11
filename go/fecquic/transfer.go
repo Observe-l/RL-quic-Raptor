@@ -331,6 +331,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	waitDone := os.Getenv("QUIC_FEC_WAIT_DONE") != "0"
 	doneMsgCh := make(chan DoneFile, 1)
 	var doneSeen sync.Once
+	connDoneCh := conn.Context().Done()
 
 	// Control reader: accept server control uni stream(s) and react to NACK/ACK/DONE.
 	go func() {
@@ -766,6 +767,16 @@ afterArqDrain:
 			if d.Ok == 0 {
 				return fmt.Errorf("receiver reported not-ok (ok=0) written=%d", d.Written)
 			}
+		case <-connDoneCh:
+			txMu.Lock()
+			pending := len(active)
+			txMu.Unlock()
+			cause := context.Cause(conn.Context())
+			if pending == 0 {
+				fmt.Fprintf(os.Stderr, "[fec-client-done] wait_ms=%d ok=1 written=unknown fallback=conn_closed cause=%v\n", time.Since(t0).Milliseconds(), cause)
+				break
+			}
+			return fmt.Errorf("connection closed before DONE with %d pending blocks: %w", pending, cause)
 		case <-ctx.Done():
 			return ctx.Err()
 		}
