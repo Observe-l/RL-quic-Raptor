@@ -21,6 +21,15 @@ type RXOptions struct {
 	DecodeDDL   time.Duration // receiver decode/check pacing (default 25ms)
 	SoftDDL     time.Duration // receiver ARQ soft deadline (default 25ms)
 	Workers     int           // decode workers (default numCPU)
+
+	// OutPath, if set, writes the received file to this exact path.
+	// A temporary file is written at OutPath+".part" and renamed on finalize.
+	// If empty, the receiver writes to outDir/<baseName>.recv.
+	OutPath string
+
+	// DisableObservation disables emitting the final "[rl-observation]" JSON line.
+	// This only affects logging, not metric collection.
+	DisableObservation bool
 }
 
 func (o *RXOptions) setDefaults() {
@@ -153,6 +162,20 @@ type rxManager struct {
 
 func newRXManager(fileSize uint64, K, L int, outDir, baseName string, rx RXOptions) (*rxManager, error) {
 	rx.setDefaults()
+	if rx.OutPath != "" {
+		outDir = filepath.Dir(rx.OutPath)
+		baseName = filepath.Base(rx.OutPath)
+		// Avoid accidental writes to root when OutPath has no directory component.
+		if outDir == "" || outDir == "." {
+			outDir = "."
+		}
+	}
+	if outDir == "" {
+		outDir = "."
+	}
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return nil, err
+	}
 	m := &rxManager{
 		budget:    rx.BudgetBytes,
 		ddl:       rx.DecodeDDL,
@@ -172,12 +195,16 @@ func newRXManager(fileSize uint64, K, L int, outDir, baseName string, rx RXOptio
 		maxSeen:   -1,
 	}
 	// softDDL is configured via rx.SoftDDL (typically from the client-provided header).
-	finalBase := baseName
-	if finalBase == "" {
-		finalBase = "qfec_recv.bin"
+	if rx.OutPath != "" {
+		m.tmpPath = filepath.Join(outDir, baseName+".part")
+	} else {
+		finalBase := baseName
+		if finalBase == "" {
+			finalBase = "qfec_recv.bin"
+		}
+		finalBase += ".recv"
+		m.tmpPath = filepath.Join(outDir, finalBase+".part")
 	}
-	finalBase += ".recv"
-	m.tmpPath = filepath.Join(outDir, finalBase+".part")
 	out, err := os.Create(m.tmpPath)
 	if err != nil {
 		return nil, err

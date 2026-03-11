@@ -12,15 +12,15 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 _METHOD_LABELS_DEFAULT: Dict[str, str] = {
-    "bandit": "BCIR",
+    "bandit": "BC-DIR",
     "quic_bbrv2": "QUIC",
     "flec": "FLEC",
     # Common baselines in this repo (used by existing GE plot scripts).
-    "fec_k60_r0_2_rstep_2": "IR-FEC1",
-    "fec_k40_r0_10_rstep_8": "IR-FEC2",
+    "fec_k60_r0_2_rstep_2": "DIR-FEC1",
+    "fec_k40_r0_10_rstep_8": "DIR-FEC2",
     # Another common naming used by some paper scripts.
-    "fec_k30_r0_2_rstep_6": "IR-FEC1",
-    "fec_k30_r0_10_rstep_6": "IR-FEC2",
+    "fec_k30_r0_2_rstep_6": "DIR-FEC1",
+    "fec_k30_r0_10_rstep_6": "DIR-FEC2",
 }
 
 

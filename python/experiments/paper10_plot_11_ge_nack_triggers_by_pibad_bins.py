@@ -299,7 +299,7 @@ def main() -> None:
     ap.add_argument(
         "--raw-quic-metric",
         type=str,
-        default=_RAW_QUIC_METRIC_RETX_PKTS,
+        default=_RAW_QUIC_METRIC_TRIGGERS,
         choices=[_RAW_QUIC_METRIC_RETX_PKTS, _RAW_QUIC_METRIC_TRIGGERS],
         help="Metric for quic-raw: retx_1rtt_pkts (default) or triggers (loss_detection_events+pto_events).",
     )

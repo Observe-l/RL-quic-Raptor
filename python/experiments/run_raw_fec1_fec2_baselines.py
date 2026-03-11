@@ -336,6 +336,11 @@ class Rec:
 	e2e_delay_ms: float
 	goodput_mbps: float
 	overhead_ratio: float
+	recovery_triggers: int
+	loss_detection_events: int
+	pto_events: int
+	retx_1rtt_pkts: int
+	retx_1rtt_bytes: int
 	extra: Dict[str, Any]
 
 
@@ -375,7 +380,7 @@ def main() -> int:
 		help="Congestion control algorithm (passed as QUIC_FEC_CC_ALGO to quicfec/quicraw scripts)",
 	)
 
-	ap.add_argument("--file-bytes", type=int, default=100 * 1024)
+	ap.add_argument("--file-bytes", type=int, default=128 * 1024)
 	ap.add_argument("--symbol-bytes", type=int, default=1200)
 	ap.add_argument(
 		"--ddl-ms",
@@ -542,6 +547,12 @@ def main() -> int:
 		goodput_mbps = _goodput_mbps_from_file_and_dur(file_bytes=int(args.file_bytes), dur_ms=dur_ms)
 		overhead_ratio = _overhead_quic_ratio_from_kv(kv=kv) if int(args.enable_quic_overhead) == 1 else 0.0
 
+		recovery_triggers = _to_int(kv, "raw_quic_recovery_triggers", 0)
+		loss_detection_events = _to_int(kv, "raw_quic_loss_detection_events", 0)
+		pto_events = _to_int(kv, "raw_quic_pto_events", 0)
+		retx_1rtt_pkts = _to_int(kv, "raw_quic_retx_1rtt_pkts", 0)
+		retx_1rtt_bytes = _to_int(kv, "raw_quic_retx_1rtt_bytes", 0)
+
 		extra: Dict[str, Any] = {"run": kv, "timing": timing_kv, "script_rc": int(rc)}
 		if not kv:
 			# Store tails to make early failures diagnosable (e.g., missing sudo cache, missing netns).
@@ -565,6 +576,11 @@ def main() -> int:
 				e2e_delay_ms=float(e2e_delay_ms),
 				goodput_mbps=float(goodput_mbps),
 				overhead_ratio=float(overhead_ratio),
+				recovery_triggers=int(recovery_triggers),
+				loss_detection_events=int(loss_detection_events),
+				pto_events=int(pto_events),
+				retx_1rtt_pkts=int(retx_1rtt_pkts),
+				retx_1rtt_bytes=int(retx_1rtt_bytes),
 				extra=extra,
 			)
 		)
@@ -624,7 +640,18 @@ def main() -> int:
 				)
 
 			last = recs[-3:]
-			ok_str = " ".join([f"{r.method}(ok={r.success} dur_ms={int(r.dur_ms)} wall_ms={int(r.trial_wall_ms)})" for r in last])
+			parts: List[str] = []
+			for r in last:
+				part = f"{r.method}(ok={r.success} dur_ms={int(r.dur_ms)} wall_ms={int(r.trial_wall_ms)}"
+				if r.method.startswith("quic_"):
+					part += (
+						f" loss_detection_events={r.loss_detection_events}"
+						f" pto_events={r.pto_events}"
+						f" retx_pkts={r.retx_1rtt_pkts}"
+					)
+				part += ")"
+				parts.append(part)
+			ok_str = " ".join(parts)
 			print(f"rep={rep:02d} sender={sender_id} rtt_ms={rtt_ms} loss={loss_mode} {ok_str}")
 
 	out_csv = out_dir / "results.csv"
@@ -646,6 +673,11 @@ def main() -> int:
 				"e2e_delay_ms",
 				"goodput_mbps",
 				"overhead_ratio",
+				"recovery_triggers",
+				"loss_detection_events",
+				"pto_events",
+				"retx_1rtt_pkts",
+				"retx_1rtt_bytes",
 			],
 		)
 		w.writeheader()
