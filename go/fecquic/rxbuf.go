@@ -86,7 +86,11 @@ type rxBlock struct {
 	lastNackAt       time.Time
 	lastNackRxUnique int
 	nackBackoff      time.Duration
-	unseenNackSent   bool
+	// nackWaitUntil is the earliest time we should allow the next NACK after
+	// sending one, even if a few innovative repairs arrive in the meantime.
+	// This preserves the intended softDDL + RTT-derived recovery wait.
+	nackWaitUntil  time.Time
+	unseenNackSent bool
 }
 
 // rxManager owns memory accounting, blocks, decode and write queues.
@@ -278,9 +282,16 @@ func (m *rxManager) start(rx RXOptions) {
 		go func() {
 			defer m.ctrlWG.Done()
 			defer m.ctrlDead.Store(true)
+			type closeWriter interface{ Close() error }
 			// If the underlying writer supports SetWriteDeadline, use it to avoid indefinite blocks.
 			type deadlineWriter interface{ SetWriteDeadline(time.Time) error }
+			cw, _ := m.ctrlW.(closeWriter)
 			dw, _ := m.ctrlW.(deadlineWriter)
+			defer func() {
+				if cw != nil {
+					_ = cw.Close()
+				}
+			}()
 			for buf := range m.ctrlOut {
 				// best-effort full write
 				for off := 0; off < len(buf); {
@@ -523,7 +534,8 @@ func (m *rxManager) start(rx RXOptions) {
 								if rxu > b.lastNackRxUnique {
 									b.nackBackoff = m.ddl
 								}
-								if b.lastNackAt.IsZero() || now.Sub(b.lastNackAt) >= b.nackBackoff {
+								if (b.nackWaitUntil.IsZero() || !now.Before(b.nackWaitUntil)) &&
+									(b.lastNackAt.IsZero() || now.Sub(b.lastNackAt) >= b.nackBackoff) {
 									canNack = true
 								}
 							} else {
@@ -663,6 +675,7 @@ func (m *rxManager) start(rx RXOptions) {
 									wait += srtt + srtt/2
 								}
 								nextDDL = now.Add(wait)
+								b.nackWaitUntil = nextDDL
 							}
 						}
 					}
@@ -949,6 +962,9 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 	// symbol should restart the soft-deadline countdown as soon as possible.
 	if m.softDDL > 0 && !b.done && !b.queued {
 		due := nowSym.Add(m.softDDL)
+		if !b.nackWaitUntil.IsZero() && due.Before(b.nackWaitUntil) {
+			due = b.nackWaitUntil
+		}
 		if b.nextDDL.After(due) {
 			b.nextDDL = due
 		}

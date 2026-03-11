@@ -28,3 +28,4 @@ __pycache__/
 wandb/
 .venv/
 figures/
+data/
