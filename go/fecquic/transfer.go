@@ -32,6 +32,27 @@ const (
 	txStatsVersion = 1
 )
 
+func doneFlushGrace() time.Duration {
+	grace := 500 * time.Millisecond
+	if srtt := latestServerSRTT(); srtt > 0 {
+		if cand := 4 * srtt; cand > grace {
+			grace = cand
+		}
+	}
+	if v := os.Getenv("QUIC_FEC_DONE_GRACE_MS"); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil {
+			if ms <= 0 {
+				return 0
+			}
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+	if grace > 2*time.Second {
+		grace = 2 * time.Second
+	}
+	return grace
+}
+
 // SendOptions control ClientSendFile behavior.
 type SendOptions struct {
 	K, N, L     int
@@ -437,6 +458,9 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 						devARQOnClientNack(n, deficit, cand, bt.K, bt.nextESI, bt.repairsOut)
 						// send cand fresh repairs
 						for i := 0; i < cand; i++ {
+							if ctx.Err() != nil {
+								return
+							}
 							esi := bt.nextESI
 							payload := bt.enc.GenSymbol(uint32(esi))
 							// Avoid per-packet allocation: reuse a fixed-size buffer.
@@ -496,6 +520,9 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	}()
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		n, err := io.ReadFull(f, readBuf)
 		if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
 			return err
@@ -575,6 +602,9 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		txMu.Unlock()
 		// Emit initial symbols 0..initN-1
 		for esi := 0; esi < initN; esi++ {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			var b []byte
 			var pay []byte
 			payloadLen := L
@@ -724,6 +754,9 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		deadline := time.Now().Add(drainCap)
 		// Poll with short sleeps to avoid indefinite waits on missing broadcasts.
 		for time.Now().Before(deadline) {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			txMu.Lock()
 			n := len(active)
 			txMu.Unlock()
@@ -775,6 +808,11 @@ afterArqDrain:
 			pending := len(active)
 			txMu.Unlock()
 			cause := context.Cause(conn.Context())
+			var appErr *quic.ApplicationError
+			if errors.As(cause, &appErr) && appErr.Remote && appErr.ErrorCode == 0 {
+				fmt.Fprintf(os.Stderr, "[fec-client-done] wait_ms=%d ok=1 written=unknown fallback=remote_close pending=%d\n", time.Since(t0).Milliseconds(), pending)
+				break
+			}
 			if pending == 0 {
 				fmt.Fprintf(os.Stderr, "[fec-client-done] wait_ms=%d ok=1 written=unknown fallback=conn_closed cause=%v\n", time.Since(t0).Milliseconds(), cause)
 				break
@@ -1174,6 +1212,9 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 		}
 	} else {
 		fmt.Fprintf(os.Stderr, "[server-stats] dgrams=%d dur_s=%.3f mbps=%.2f -> %s\n", rcvDgrams, rdur, mbps2, finalPath)
+	}
+	if grace := doneFlushGrace(); grace > 0 {
+		time.Sleep(grace)
 	}
 	return finalPath, nil
 }
