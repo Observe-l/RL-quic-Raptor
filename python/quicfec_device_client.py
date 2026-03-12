@@ -41,7 +41,11 @@ def parse_args() -> argparse.Namespace:
 	ap.add_argument("--ddl-ms", type=int, default=25, help="receiver soft deadline in milliseconds")
 	ap.add_argument("--L", type=int, default=1200, help="symbol bytes L")
 	ap.add_argument("--W", type=int, default=8, help="ARQ unfinished-cluster window")
-	ap.add_argument("--max-attempts", type=int, default=5, help="ARQ max attempts per cluster")
+	ap.add_argument("--max-attempts", type=int, default=0, help="ARQ max attempts per cluster (0=unlimited)")
+	ap.add_argument("--ack-every", type=int, default=8, help="write 1B on a stream every N datagrams (0=disable)")
+	ap.add_argument("--post-wait", default="0s", help="linger after sending; bare numbers mean seconds")
+	ap.add_argument("--transport", default="dgram", choices=["dgram", "stream"], help="symbol transport")
+	ap.add_argument("--dgram-warn", type=int, default=1400, help="warn if datagram exceeds bytes (0=off)")
 
 	ap.add_argument(
 		"--dev-retx",
@@ -88,6 +92,14 @@ def build_cmd(args: argparse.Namespace) -> list[str]:
 		str(args.W),
 		"-max-attempts",
 		str(args.max_attempts),
+		"-ack-every",
+		str(args.ack_every),
+		"-post-wait",
+		args.post_wait,
+		"-transport",
+		args.transport,
+		"-dgram-warn",
+		str(args.dgram_warn),
 		f"-dev-retx={str(args.dev_retx).lower()}",
 		f"-quic-stats={str(args.quic_stats).lower()}",
 	]
@@ -99,6 +111,12 @@ def main() -> int:
 		return fail("bad --port: must be in 1..65535")
 	if args.K <= 0 or args.R0 < 0 or args.L <= 0 or args.ddl_ms < 0:
 		return fail("bad FEC arguments: require K>0, R0>=0, L>0, ddl-ms>=0")
+	if args.ack_every < 0:
+		return fail("bad --ack-every: must be >= 0")
+	if args.max_attempts < 0:
+		return fail("bad --max-attempts: must be >= 0")
+	if args.dgram_warn < 0:
+		return fail("bad --dgram-warn: must be >= 0")
 	if args.build:
 		build_binary(CLIENT_BIN, "./cmd/quicfec-device-client", args.build_tag or None)
 	try:

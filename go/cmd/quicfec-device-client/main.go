@@ -44,7 +44,11 @@ func main() {
 		ddlMS  = flag.Int("ddl-ms", 25, "receiver ARQ soft deadline (sent to server via header)")
 		L      = flag.Int("L", 1200, "symbol bytes L")
 		W      = flag.Int("W", 8, "ARQ window W (unfinished clusters)")
-		maxAtt = flag.Int("max-attempts", 5, "ARQ max attempts per cluster")
+		maxAtt = flag.Int("max-attempts", 0, "ARQ max attempts per cluster (0=unlimited)")
+		ackEvery = flag.Int("ack-every", 8, "write 1B on a stream every N datagrams (0=disable)")
+		postWait = flag.String("post-wait", "0s", "linger after sending; bare numbers mean seconds")
+		transport = flag.String("transport", "dgram", "symbol transport: dgram|stream")
+		dgramWarn = flag.Int("dgram-warn", 1400, "warn if datagram exceeds bytes (0=off)")
 
 		devRetx   = flag.Bool("dev-retx", true, "enable QUIC retransmission reason logging (requires build tag quicfecdev)")
 		quicStats = flag.Bool("quic-stats", false, "enable QUIC-layer aggregate stats line")
@@ -59,6 +63,11 @@ func main() {
 	connectTODur, err := parseFlexibleDuration(*connectTO)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "bad -connect-timeout:", err)
+		os.Exit(2)
+	}
+	postWaitDur, err := parseFlexibleDuration(*postWait)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "bad -post-wait:", err)
 		os.Exit(2)
 	}
 
@@ -92,6 +101,14 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bad -ddl-ms")
 		os.Exit(2)
 	}
+	if *ackEvery < 0 {
+		fmt.Fprintln(os.Stderr, "bad -ack-every")
+		os.Exit(2)
+	}
+	if *transport != "dgram" && *transport != "stream" {
+		fmt.Fprintln(os.Stderr, "bad -transport")
+		os.Exit(2)
+	}
 
 	addr := net.JoinHostPort(*serverIP, strconv.Itoa(*serverPort))
 
@@ -113,8 +130,11 @@ func main() {
 		RStep:          *Rstep,
 		MaxAttempts:    *maxAtt,
 		RxDDL:          time.Duration(*ddlMS) * time.Millisecond,
+		PostWait:       postWaitDur,
+		AckEvery:       *ackEvery,
+		WarnDgramSize:  *dgramWarn,
 		DialTimeout:    connectTODur,
-		Transport:      "dgram",
+		Transport:      *transport,
 	}
 
 	if err := fecquic.ClientSendFile(ctx, addr, *alpn, *filePath, opts); err != nil {
