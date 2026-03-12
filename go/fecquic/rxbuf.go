@@ -17,11 +17,11 @@ import (
 
 // RXOptions configures the receiver buffer and scheduler.
 type RXOptions struct {
-	BudgetBytes int           // total bytes for buffered symbols (default 10MB)
-	DecodeDDL   time.Duration // receiver decode/check pacing (default 25ms)
-	SoftDDL     time.Duration // receiver ARQ soft deadline (default 25ms)
-	MaxARQAttempts int        // sender-advertised ARQ retry cap per block (0=unlimited)
-	Workers     int           // decode workers (default numCPU)
+	BudgetBytes    int           // total bytes for buffered symbols (default 10MB)
+	DecodeDDL      time.Duration // receiver decode/check pacing (default 25ms)
+	SoftDDL        time.Duration // receiver ARQ soft deadline (default 25ms)
+	MaxARQAttempts int           // sender-advertised ARQ retry cap per block (0=unlimited)
+	Workers        int           // decode workers (default numCPU)
 
 	// OutPath, if set, writes the received file to this exact path.
 	// A temporary file is written at OutPath+".part" and renamed on finalize.
@@ -101,8 +101,8 @@ type rxBlock struct {
 // rxManager owns memory accounting, blocks, decode and write queues.
 type rxManager struct {
 	// config
-	budget int
-	ddl    time.Duration
+	budget         int
+	ddl            time.Duration
 	maxARQAttempts int
 	// softDDL is the soft-deadline for seen blocks: if a seen block has a deficit and
 	// we haven't observed any symbol for that block for softDDL, we trigger a NACK.
@@ -187,23 +187,23 @@ func newRXManager(fileSize uint64, K, L int, outDir, baseName string, rx RXOptio
 		return nil, err
 	}
 	m := &rxManager{
-		budget:    rx.BudgetBytes,
-		ddl:       rx.DecodeDDL,
+		budget:         rx.BudgetBytes,
+		ddl:            rx.DecodeDDL,
 		maxARQAttempts: rx.MaxARQAttempts,
-		softDDL:   rx.SoftDDL,
-		fileSize:  fileSize,
-		K:         K,
-		L:         L,
-		outDir:    outDir,
-		baseName:  baseName,
-		blocks:    make(map[uint16]*rxBlock),
-		completed: make(map[uint16]struct{}),
-		decodeQ:   make(chan *rxBlock, 1024),
-		writeQ:    make(chan writeTask, 8192),
-		stopCh:    make(chan struct{}),
-		doneCh:    make(chan struct{}),
-		minSeen:   -1,
-		maxSeen:   -1,
+		softDDL:        rx.SoftDDL,
+		fileSize:       fileSize,
+		K:              K,
+		L:              L,
+		outDir:         outDir,
+		baseName:       baseName,
+		blocks:         make(map[uint16]*rxBlock),
+		completed:      make(map[uint16]struct{}),
+		decodeQ:        make(chan *rxBlock, 1024),
+		writeQ:         make(chan writeTask, 8192),
+		stopCh:         make(chan struct{}),
+		doneCh:         make(chan struct{}),
+		minSeen:        -1,
+		maxSeen:        -1,
 	}
 	// softDDL is configured via rx.SoftDDL (typically from the client-provided header).
 	if rx.OutPath != "" {
@@ -484,6 +484,9 @@ func (m *rxManager) start(rx RXOptions) {
 				attempt int
 				rxu     int
 				rec     int
+				tau     time.Duration
+				srtt    time.Duration
+				wait    time.Duration
 				send    bool
 			}
 			var toDecode []*rxBlock
@@ -665,7 +668,6 @@ func (m *rxManager) start(rx RXOptions) {
 										rec = seenCap
 									}
 								}
-								nacks = append(nacks, nackMsg{blockID: b.id, attempt: b.attempt, rxu: rxu, rec: rec, send: true})
 								// Update per-block debounce state.
 								if b.firstSeen.IsZero() {
 									b.unseenNackSent = true
@@ -696,6 +698,7 @@ func (m *rxManager) start(rx RXOptions) {
 								if srtt > 0 {
 									wait += srtt + srtt/2
 								}
+								nacks = append(nacks, nackMsg{blockID: b.id, attempt: b.attempt, rxu: rxu, rec: rec, tau: softDDL, srtt: srtt, wait: wait, send: true})
 								nextDDL = now.Add(wait)
 								b.nackWaitUntil = nextDDL
 							}
@@ -768,7 +771,8 @@ func (m *rxManager) start(rx RXOptions) {
 				if m.met != nil {
 					m.met.OnCtrlTx(len(payload), "nack", dropped)
 				}
-				fmt.Fprintf(os.Stderr, "[arq] nack block=%d rx_unique=%d rec_extra=%d attempt=%d\n", n.blockID, n.rxu, n.rec, n.attempt)
+				fmt.Fprintf(os.Stderr, "[arq] nack block=%d rx_unique=%d rec_extra=%d attempt=%d tau_ms=%d srtt_ms=%d wait_ms=%d\n",
+					n.blockID, n.rxu, n.rec, n.attempt, n.tau.Milliseconds(), n.srtt.Milliseconds(), n.wait.Milliseconds())
 			}
 			for _, b := range toDecode {
 				// during shutdown, avoid blocking or panicking on closed decodeQ
