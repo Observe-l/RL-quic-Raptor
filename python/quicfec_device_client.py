@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
 	)
 	ap.add_argument("--insecure", action=argparse.BooleanOptionalAction, default=True)
 
-	ap.add_argument("--K", type=int, default=26, help="source symbols K")
+	ap.add_argument("--K", type=int, default=60, help="source symbols K")
 	ap.add_argument("--R0", type=int, default=6, help="initial repair symbols R0")
 	ap.add_argument("--Rstep", type=int, default=4, help="minimum repairs appended per NACK")
 	ap.add_argument("--ddl-ms", type=int, default=25, help="receiver soft deadline in milliseconds")

@@ -53,6 +53,35 @@ func doneFlushGrace() time.Duration {
 	return grace
 }
 
+func sendDoneOnFreshStream(conn interface{ OpenUniStream() (*quic.SendStream, error) }, d DoneFile) error {
+	var buf bytes.Buffer
+	if err := writeDone(&buf, d); err != nil {
+		return err
+	}
+	us, err := conn.OpenUniStream()
+	if err != nil {
+		return err
+	}
+	type deadlineWriter interface{ SetWriteDeadline(time.Time) error }
+	if dw, ok := any(us).(deadlineWriter); ok {
+		_ = dw.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
+	}
+	payload := buf.Bytes()
+	for off := 0; off < len(payload); {
+		n, err := us.Write(payload[off:])
+		if err != nil {
+			_ = us.Close()
+			return err
+		}
+		if n <= 0 {
+			_ = us.Close()
+			return io.ErrShortWrite
+		}
+		off += n
+	}
+	return us.Close()
+}
+
 // SendOptions control ClientSendFile behavior.
 type SendOptions struct {
 	K, N, L     int
@@ -1148,20 +1177,26 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 	fmt.Fprintf(os.Stderr, "[server-e2e] e2e_ms=%d ok=%d written=%d/%d\n", e2eDur.Milliseconds(), e2eOk, writtenNow, hdr.FileSize)
 	// Server->client DONE ACK: best-effort notify sender that receive/decode finished.
 	// Use the same buffered control stream writer to avoid interleaving with ACK/NACK.
+	queuedSharedDone := false
 	if rxm != nil && rxm.ctrlOut != nil {
 		var b bytes.Buffer
 		_ = writeDone(&b, DoneFile{FileID: 0, Written: writtenNow, Ok: uint8(e2eOk)})
 		payload := b.Bytes()
 		select {
 		case rxm.ctrlOut <- payload:
+			queuedSharedDone = true
 			// ok
 		default:
 			// avoid blocking; we only need best-effort delivery
 			select {
 			case rxm.ctrlOut <- payload:
+				queuedSharedDone = true
 			case <-time.After(200 * time.Millisecond):
 			}
 		}
+	}
+	if !queuedSharedDone {
+		fmt.Fprintln(os.Stderr, "[server-done] shared_ctrl enqueue missed")
 	}
 	// Wait briefly for the client to report sender-side tx symbol counts (used for fec_overhead).
 	// Without this grace period, the stats stream can arrive just after completion and be missed.
@@ -1175,15 +1210,8 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 	close(progStop)
 	finalPath, err := rxm.closeAndFinalize(hdr.SHA256)
 	if err != nil {
-		// Best-effort DONE ACK with ok=0 on failure.
-		if rxm != nil && rxm.ctrlOut != nil {
-			var b bytes.Buffer
-			_ = writeDone(&b, DoneFile{FileID: 0, Written: writtenNow, Ok: 0})
-			payload := b.Bytes()
-			select {
-			case rxm.ctrlOut <- payload:
-			default:
-			}
+		if doneErr := sendDoneOnFreshStream(conn, DoneFile{FileID: 0, Written: writtenNow, Ok: 0}); doneErr != nil {
+			fmt.Fprintf(os.Stderr, "[server-done] fresh_stream ok=0 send failed: %v\n", doneErr)
 		}
 		// On failure (e.g., SHA mismatch / residual erasures), still emit a best-effort observation
 		// so external harnesses don't stall waiting for metrics.
@@ -1212,6 +1240,9 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 		}
 	} else {
 		fmt.Fprintf(os.Stderr, "[server-stats] dgrams=%d dur_s=%.3f mbps=%.2f -> %s\n", rcvDgrams, rdur, mbps2, finalPath)
+	}
+	if doneErr := sendDoneOnFreshStream(conn, DoneFile{FileID: 0, Written: writtenNow, Ok: 1}); doneErr != nil {
+		fmt.Fprintf(os.Stderr, "[server-done] fresh_stream ok=1 send failed: %v\n", doneErr)
 	}
 	if grace := doneFlushGrace(); grace > 0 {
 		time.Sleep(grace)
