@@ -34,6 +34,7 @@ func main() {
 		alpn      = flag.String("alpn", "quic-fec", "ALPN protocol")
 		outPath   = flag.String("out", "data/receive.bin", "output file path")
 		timeout   = flag.String("timeout", "0", "server timeout; bare numbers mean seconds, 0 means no timeout")
+		rttMS     = flag.Int("rtt-ms", 0, "manual RTT override in ms for ARQ waiting (0=use measured SRTT)")
 		rxBudget  = flag.Int("rx-budget-bytes", 64*1024*1024, "receiver buffer budget in bytes")
 		decodeDDL = flag.String("decode-ddl", "25ms", "receiver decode/check pacing; bare numbers mean seconds")
 		rxWorkers = flag.Int("rx-workers", 2, "receiver decode workers")
@@ -61,6 +62,9 @@ func main() {
 	if *quicStats {
 		_ = os.Setenv("QUIC_FEC_STATS", "1")
 	}
+	if *rttMS > 0 {
+		_ = os.Setenv("QUIC_FEC_SERVER_RTT_MS", strconv.Itoa(*rttMS))
+	}
 	if os.Getenv("QUIC_FEC_CC_ALGO") == "" {
 		_ = os.Setenv("QUIC_FEC_CC_ALGO", "bbrv2")
 	}
@@ -71,6 +75,10 @@ func main() {
 	}
 	if *outPath == "" {
 		fmt.Fprintln(os.Stderr, "bad -out: empty")
+		os.Exit(2)
+	}
+	if *rttMS < 0 {
+		fmt.Fprintln(os.Stderr, "bad -rtt-ms")
 		os.Exit(2)
 	}
 

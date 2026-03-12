@@ -27,6 +27,7 @@ def parse_args() -> argparse.Namespace:
 	ap.add_argument("--alpn", default="quic-fec", help="ALPN protocol")
 	ap.add_argument("--out", dest="out_path", default="data/receive.bin", help="output file path")
 	ap.add_argument("--timeout", default="0", help="server timeout, 0 means no timeout")
+	ap.add_argument("--rtt-ms", type=int, default=350, help="manual RTT override in ms for ARQ waiting (0=use measured SRTT)")
 	ap.add_argument("--rx-budget-bytes", type=int, default=64 * 1024 * 1024)
 	ap.add_argument("--decode-ddl", default="25ms", help="receiver decode/check pacing")
 	ap.add_argument("--rx-workers", type=int, default=2, help="receiver decode workers")
@@ -62,6 +63,8 @@ def build_cmd(args: argparse.Namespace) -> list[str]:
 		args.out_path,
 		"-timeout",
 		args.timeout,
+		"-rtt-ms",
+		str(args.rtt_ms),
 		"-rx-budget-bytes",
 		str(args.rx_budget_bytes),
 		"-decode-ddl",
@@ -78,6 +81,8 @@ def main() -> int:
 	args = parse_args()
 	if args.rx_budget_bytes <= 0 or args.rx_workers <= 0:
 		return fail("bad receiver arguments: require rx-budget-bytes>0 and rx-workers>0")
+	if args.rtt_ms < 0:
+		return fail("bad --rtt-ms: must be >= 0")
 	if not args.out_path:
 		return fail("bad --out: empty path")
 	if args.build:

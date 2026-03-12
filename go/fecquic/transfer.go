@@ -34,8 +34,8 @@ const (
 
 func doneFlushGrace() time.Duration {
 	grace := 500 * time.Millisecond
-	if srtt := latestServerSRTT(); srtt > 0 {
-		if cand := 4 * srtt; cand > grace {
+	if rtt := effectiveServerRTT(); rtt > 0 {
+		if cand := 4 * rtt; cand > grace {
 			grace = cand
 		}
 	}

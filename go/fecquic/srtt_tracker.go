@@ -1,6 +1,8 @@
 package fecquic
 
 import (
+	"os"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -14,6 +16,30 @@ import (
 // value is sufficient. If you later serve multiple concurrent connections, prefer tracking
 // SRTT per-connection.
 var serverSRTTNanos atomic.Int64
+
+func configuredServerRTT() time.Duration {
+	if v := os.Getenv("QUIC_FEC_SERVER_RTT_MS"); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+	return 0
+}
+
+func effectiveServerRTT() time.Duration {
+	if rtt := configuredServerRTT(); rtt > 0 {
+		return rtt
+	}
+	if srtt := latestServerSRTT(); srtt > 0 {
+		return srtt
+	}
+	if v := os.Getenv("RTT_MS"); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+	return 0
+}
 
 func latestServerSRTT() time.Duration {
 	ns := serverSRTTNanos.Load()

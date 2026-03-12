@@ -684,16 +684,8 @@ func (m *rxManager) start(rx RXOptions) {
 								b.lastNackAt = now
 								b.lastNackRxUnique = rxu
 								// After sending a NACK, wait for repairs to arrive.
-								// The wait is softDDL + 1.5*SRTT (using quic-go's smoothed RTT when available).
-								srtt := latestServerSRTT()
-								if srtt <= 0 {
-									// Fallback to configured RTT when SRTT is not yet available.
-									if rttStr := os.Getenv("RTT_MS"); rttStr != "" {
-										if ms, err := strconv.Atoi(rttStr); err == nil && ms > 0 {
-											srtt = time.Duration(ms) * time.Millisecond
-										}
-									}
-								}
+								// The wait is softDDL + 1.5*RTT, where RTT can be manually overridden.
+								srtt := effectiveServerRTT()
 								wait := softDDL
 								if srtt > 0 {
 									wait += srtt + srtt/2
