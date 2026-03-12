@@ -53,7 +53,9 @@ func doneFlushGrace() time.Duration {
 	return grace
 }
 
-func sendDoneOnFreshStream(conn interface{ OpenUniStream() (*quic.SendStream, error) }, d DoneFile) error {
+func sendDoneOnFreshStream(conn interface {
+	OpenUniStream() (*quic.SendStream, error)
+}, d DoneFile) error {
 	var buf bytes.Buffer
 	if err := writeDone(&buf, d); err != nil {
 		return err
