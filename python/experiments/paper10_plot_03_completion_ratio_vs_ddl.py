@@ -134,7 +134,7 @@ def main() -> None:
     plt.xlabel("DDL (ms)")
     plt.ylabel("Completion ratio")
     # plt.title(f"Completion ratio vs DDL ({args.scenario}, task={task})")
-    plt.legend()
+    plt.legend(loc="upper left")
 
     ax = plt.gca()
     xmin0, xmax0 = ax.get_xlim()
