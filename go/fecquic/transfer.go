@@ -382,8 +382,11 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	// DONE ACK (server->client) via control uni-stream.
 	// Enabled by default; disable with QUIC_FEC_WAIT_DONE=0.
 	waitDone := os.Getenv("QUIC_FEC_WAIT_DONE") != "0"
-	doneMsgCh := make(chan DoneFile, 1)
+	doneReadyCh := make(chan struct{})
 	var doneSeen sync.Once
+	var doneResultMu sync.Mutex
+	var doneResult DoneFile
+	haveDoneResult := false
 	connDoneCh := conn.Context().Done()
 
 	// Control reader: accept server control uni stream(s) and react to NACK/ACK/DONE.
@@ -408,10 +411,11 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 						}
 						d := msg.(DoneFile)
 						doneSeen.Do(func() {
-							select {
-							case doneMsgCh <- d:
-							default:
-							}
+							doneResultMu.Lock()
+							doneResult = d
+							haveDoneResult = true
+							doneResultMu.Unlock()
+							close(doneReadyCh)
 						})
 						return
 					case arqMsgNACK:
@@ -786,6 +790,13 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 			if err := ctx.Err(); err != nil {
 				return err
 			}
+			select {
+			case <-doneReadyCh:
+				goto afterArqDrain
+			case <-connDoneCh:
+				goto afterArqDrain
+			default:
+			}
 			txMu.Lock()
 			n := len(active)
 			txMu.Unlock()
@@ -827,7 +838,14 @@ afterArqDrain:
 	if waitDone {
 		t0 = time.Now()
 		select {
-		case d := <-doneMsgCh:
+		case <-doneReadyCh:
+			doneResultMu.Lock()
+			d := doneResult
+			hasDone := haveDoneResult
+			doneResultMu.Unlock()
+			if !hasDone {
+				return errors.New("receiver signaled DONE without cached result")
+			}
 			fmt.Fprintf(os.Stderr, "[fec-client-done] wait_ms=%d ok=%d written=%d\n", time.Since(t0).Milliseconds(), d.Ok, d.Written)
 			if d.Ok == 0 {
 				return fmt.Errorf("receiver reported not-ok (ok=0) written=%d", d.Written)
