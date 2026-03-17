@@ -28,6 +28,7 @@ from paper10_plot_common import (  # noqa: E402
     load_all_trials,
     method_color,
     method_label,
+    method_marker,
     parse_iid_loss_pct,
     parse_methods_csv,
     save_current_figure,
@@ -43,7 +44,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="(Paper10 #9) IID: mean overhead vs loss rate (line chart)")
 
     ap.add_argument("--file-bytes", type=int, default=128 * 1024)
-    ap.add_argument("--methods", type=str, default="bandit,fec_k60_r0_2_rstep_2,fec_k40_r0_10_rstep_8,quic_bbrv2,flec")
+    ap.add_argument("--methods", type=str, default="bandit,fec_k40_r0_0_rstep_4,fec_k40_r0_4_rstep_0,quic_bbrv2,flec")
 
     ap.add_argument("--flec-jsonl", type=str, default="python/results/flec_data/*.jsonl")
     ap.add_argument("--baseline-glob", type=str, default="python/results/*-baseline-data/results.csv")
@@ -115,7 +116,7 @@ def main() -> None:
         plt.plot(
             losses,
             ys,
-            marker="o",
+            marker=(method_marker(m) or "o"),
             linewidth=1.8,
             markersize=4,
             label=method_label(m),

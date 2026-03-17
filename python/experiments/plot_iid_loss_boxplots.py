@@ -21,8 +21,8 @@ import matplotlib.pyplot as plt  # noqa: E402
 _METHOD_ORDER_DEFAULT = [
     # ours first
     "bandit",
-    "fec_k60_r0_2_rstep_2",
-    "fec_k40_r0_10_rstep_8",
+    "fec_k40_r0_0_rstep_4",
+    "fec_k40_r0_4_rstep_0",
     # baselines
     "quic_bbrv2",
     "flec",
@@ -31,16 +31,16 @@ _METHOD_ORDER_DEFAULT = [
 _METHOD_LABELS = {
     "bandit": "BCIR",
     "quic_bbrv2": "QUIC",
-    "fec_k60_r0_2_rstep_2": "IR-FEC1",
-    "fec_k40_r0_10_rstep_8": "IR-FEC2",
+    "fec_k40_r0_0_rstep_4": "DIR-FEC1",
+    "fec_k40_r0_4_rstep_0": "DIR-FEC2",
     "flec": "FLEC",
 }
 
 _METHOD_COLORS = {
     "bandit": "#1f77b4",
     "quic_bbrv2": "#ff7f0e",
-    "fec_k60_r0_2_rstep_2": "#2ca02c",
-    "fec_k40_r0_10_rstep_8": "#d62728",
+    "fec_k40_r0_0_rstep_4": "#2ca02c",
+    "fec_k40_r0_4_rstep_0": "#d62728",
     "flec": "#9467bd",
 }
 
@@ -48,9 +48,9 @@ _METHOD_COLORS = {
 _METHOD_MARKERS = {
     # Use thin/small marker glyphs so they don't occlude the CI error bars.
     "bandit": "+",
-    "fec_k60_r0_2_rstep_2": "x",
+    "fec_k40_r0_0_rstep_4": "x",
     # Keep consistent with plot_overhead_and_delay_from_bandit_evallog.py
-    "fec_k40_r0_10_rstep_8": "1",
+    "fec_k40_r0_4_rstep_0": "1",
     "quic_bbrv2": "2",
     "flec": ".",
 }
@@ -58,8 +58,8 @@ _METHOD_MARKERS = {
 _METHOD_HATCHES = {
     # Requested: fill with dot/pipe/dash-like patterns.
     "bandit": "..",
-    "fec_k60_r0_2_rstep_2": "||",
-    "fec_k40_r0_10_rstep_8": "--",
+    "fec_k40_r0_0_rstep_4": "||",
+    "fec_k40_r0_4_rstep_0": "--",
     "quic_bbrv2": "xx",
     "flec": "++",
 }
@@ -405,7 +405,7 @@ def _lineplot_with_ci(
             continue
 
         # If two methods overlap, make IR-FEC1 thicker so it is still visible underneath BCIR.
-        is_ir_fec1 = method == "fec_k60_r0_2_rstep_2"
+        is_ir_fec1 = method == "fec_k40_r0_0_rstep_4"
         is_bcir = method == "bandit"
         markersize = 3.2 if is_ir_fec1 else 2.0
         markeredgewidth = 1.0 if is_ir_fec1 else 0.6
@@ -507,7 +507,7 @@ def _tradeoff_scatter(
         if not xs:
             continue
 
-        is_ir_fec1 = method == "fec_k60_r0_2_rstep_2"
+        is_ir_fec1 = method == "fec_k40_r0_0_rstep_4"
         ax.scatter(
             xs,
             ys,

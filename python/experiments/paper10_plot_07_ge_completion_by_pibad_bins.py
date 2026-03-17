@@ -34,12 +34,31 @@ from paper10_plot_common import (  # noqa: E402
 )
 
 
-def _bin_index(x: float, bins: List[float]) -> int:
-    # bins: edges, right-open intervals [bins[i], bins[i+1])
-    for i in range(len(bins) - 1):
-        if float(bins[i]) <= x < float(bins[i + 1]):
-            return i
-    return len(bins) - 2
+def _parse_bin_ranges(spec: str) -> List[Tuple[float, float]]:
+    out: List[Tuple[float, float]] = []
+    for part in str(spec or "").split(","):
+        p = str(part).strip()
+        if not p:
+            continue
+        if "-" not in p:
+            raise SystemExit(f"invalid bin range: {p}")
+        lo_s, hi_s = p.split("-", 1)
+        lo = float(lo_s.strip())
+        hi = float(hi_s.strip())
+        if hi < lo:
+            lo, hi = hi, lo
+        out.append((float(lo), float(hi)))
+    if not out:
+        raise SystemExit("bin-ranges must contain at least one range")
+    return out
+
+
+def _in_bin(x: float, lo: float, hi: float) -> bool:
+    if float(x) < float(lo):
+        return False
+    if math.isclose(float(x), float(hi)):
+        return True
+    return float(x) < float(hi)
 
 
 def _completion_ratio(trials, ddl_ms: float) -> float:
@@ -65,12 +84,13 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="(Paper10 #7) GE completion ratio by pi_bad bins")
 
     ap.add_argument("--file-bytes", type=int, default=128 * 1024)
-    ap.add_argument("--methods", type=str, default="bandit,fec_k60_r0_2_rstep_2,fec_k40_r0_10_rstep_8,quic_bbrv2,flec")
+    ap.add_argument("--methods", type=str, default="bandit,fec_k40_r0_0_rstep_4,fec_k40_r0_4_rstep_0,quic_bbrv2,flec")
 
     ap.add_argument("--ge-ddl-ms", type=float, default=500.0)
 
-    ap.add_argument("--bins", type=str, default="0,1,3,6,100")
-    ap.add_argument("--bin-labels", type=str, default="<1%,1-3%,3-6%,>6%")
+    ap.add_argument("--bin-ranges", type=str, default="0-10,1-30,2-50,3-100")
+    ap.add_argument("--bin-labels", type=str, default="300,600,900,1200")
+    ap.add_argument("--xlabel", type=str, default="Density")
 
     ap.add_argument("--flec-jsonl", type=str, default="python/results/flec_data/*.jsonl")
     ap.add_argument("--baseline-glob", type=str, default="python/results/*-baseline-data/results.csv")
@@ -99,14 +119,11 @@ def main() -> None:
 
     configure_matplotlib_like_paper()
 
-    bins: List[float] = [float(x.strip()) for x in str(args.bins).split(",") if str(x).strip()]
-    if len(bins) < 2:
-        raise SystemExit("bins must have at least 2 edges")
+    bin_ranges = _parse_bin_ranges(args.bin_ranges)
 
     labels = [x.strip() for x in str(args.bin_labels).split(",") if str(x).strip()]
-    if len(labels) != (len(bins) - 1):
-        # fallback to auto labels
-        labels = [f"[{bins[i]}, {bins[i+1]})" for i in range(len(bins) - 1)]
+    if len(labels) != len(bin_ranges):
+        labels = [f"{lo:g}-{hi:g}" for (lo, hi) in bin_ranges]
 
     set_flec_offset_env(args.flec_e2e_offset_ms)
 
@@ -125,13 +142,12 @@ def main() -> None:
     trials = filter_trials(trials_all, scenario="ge", task=task)
 
     # Attach pi_bad.
-    trials_w: List[Tuple[int, float, object]] = []
+    trials_w: List[Tuple[float, object]] = []
     for t in trials:
         p = parse_ge_pibad_pct(t.loss_mode)
         if p is None or not math.isfinite(float(p)):
             continue
-        bi = _bin_index(float(p), bins)
-        trials_w.append((bi, float(p), t))
+        trials_w.append((float(p), t))
 
     methods = parse_methods_csv(args.methods)
     if not methods:
@@ -139,23 +155,25 @@ def main() -> None:
 
     # For each bin and method, compute completion ratio.
     ratios: Dict[Tuple[int, str], float] = {}
-    for bi in range(len(bins) - 1):
+    for bi, (lo, hi) in enumerate(bin_ranges):
         for m in methods:
-            dm = [t for (_bi, _p, t) in trials_w if _bi == bi and t.method == m]
+            dm = [t for (p, t) in trials_w if _in_bin(p, lo, hi) and t.method == m]
             ratios[(bi, m)] = _completion_ratio(dm, ddl_ms=float(args.ge_ddl_ms))
 
     x = np.arange(len(labels), dtype=float)
-    w = 0.8 / max(1, len(methods))
+    group_span = 0.72
+    slot_w = group_span / max(1, len(methods))
+    w = slot_w * 0.82
 
     plt.figure()
     for i, m in enumerate(methods):
         ys = [ratios.get((bi, m), float("nan")) for bi in range(len(labels))]
-        offsets = (i - (len(methods) - 1) / 2.0) * w
+        offsets = (i - (len(methods) - 1) / 2.0) * slot_w
         plt.bar(x + offsets, ys, width=w, label=method_label(m), color=(method_color(m) or "C0"))
 
     plt.ylim(0.0, 1.02)
     plt.xticks(x, labels)
-    plt.xlabel("Average loss rate")
+    plt.xlabel(str(args.xlabel))
     plt.ylabel(f"Completion ratio (DDL={float(args.ge_ddl_ms):g}ms)")
     # plt.title("GE completion ratio by pi_bad bins")
     plt.grid(True, axis="y")

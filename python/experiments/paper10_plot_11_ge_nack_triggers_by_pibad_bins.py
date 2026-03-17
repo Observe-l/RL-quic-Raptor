@@ -45,11 +45,31 @@ _RAW_QUIC_METRIC_RETX_PKTS = "retx_1rtt_pkts"
 _RAW_QUIC_METRIC_TRIGGERS = "triggers"  # loss_detection_events + pto_events
 
 
-def _bin_index(x: float, bins: List[float]) -> int:
-    for i in range(len(bins) - 1):
-        if float(bins[i]) <= x < float(bins[i + 1]):
-            return i
-    return len(bins) - 2
+def _parse_bin_ranges(spec: str) -> List[Tuple[float, float]]:
+    out: List[Tuple[float, float]] = []
+    for part in str(spec or "").split(","):
+        p = str(part).strip()
+        if not p:
+            continue
+        if "-" not in p:
+            raise SystemExit(f"invalid bin range: {p}")
+        lo_s, hi_s = p.split("-", 1)
+        lo = float(lo_s.strip())
+        hi = float(hi_s.strip())
+        if hi < lo:
+            lo, hi = hi, lo
+        out.append((float(lo), float(hi)))
+    if not out:
+        raise SystemExit("bin-ranges must contain at least one range")
+    return out
+
+
+def _in_bin(x: float, lo: float, hi: float) -> bool:
+    if float(x) < float(lo):
+        return False
+    if math.isclose(float(x), float(hi)):
+        return True
+    return float(x) < float(hi)
 
 
 def _to_int(v: object, default: int = 0) -> int:
@@ -185,7 +205,7 @@ def _load_flec_points(*, flec_jsonl: Path, tasks_ok: Tuple[str, ...]) -> List[_P
                 # Not expected for this plot.
                 continue
 
-            if "flec_repair_count" not in d:
+            if "retransmission_event_count_total" not in d:
                 continue
 
             out.append(
@@ -193,7 +213,7 @@ def _load_flec_points(*, flec_jsonl: Path, tasks_ok: Tuple[str, ...]) -> List[_P
                     method="flec",
                     loss_mode=str(loss_mode),
                     success=int(ok),
-                    nack_triggers=float(_to_int(d.get("flec_repair_count", 0), 0)),
+                    nack_triggers=float(_to_int(d.get("retransmission_event_count_total", 0), 0)),
                 )
             )
 
@@ -277,10 +297,11 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="(Paper10 extra) GE NACK triggers by pi_bad bins")
 
     ap.add_argument("--file-bytes", type=int, default=128 * 1024)
-    ap.add_argument("--methods", type=str, default="fec_k60_r0_2_rstep_2,fec_k40_r0_10_rstep_8,quic_bbrv2,flec")
+    ap.add_argument("--methods", type=str, default="fec_k40_r0_0_rstep_4,fec_k40_r0_4_rstep_0,quic_bbrv2,flec")
 
-    ap.add_argument("--bins", type=str, default="0,1,3,6,100")
-    ap.add_argument("--bin-labels", type=str, default="<1%,1-3%,3-6%,>6%")
+    ap.add_argument("--bin-ranges", type=str, default="0-10,1-30,2-50,3-100")
+    ap.add_argument("--bin-labels", type=str, default="300,600,900,1200")
+    ap.add_argument("--xlabel", type=str, default="Traffic Intensity")
 
     ap.add_argument("--flec-jsonl", type=str, default="python/results/flec_data/*.jsonl")
 
@@ -294,7 +315,6 @@ def main() -> None:
         default=None,
         help="Alias for --fec-jsonl-glob (backwards compatibility).",
     )
-    ap.add_argument("--raw-jsonl-glob", type=str, default="python/results/*-baseline-raw-data/results.jsonl")
 
     ap.add_argument(
         "--raw-quic-metric",
@@ -304,7 +324,7 @@ def main() -> None:
         help="Metric for quic-raw: retx_1rtt_pkts (default) or triggers (loss_detection_events+pto_events).",
     )
 
-    ap.add_argument("--fec-in-dir", action="append", default=[], help="Explicit QUIC-FEC baseline input dir (expects results.jsonl). Repeatable.")
+    ap.add_argument("--fec-in-dir", action="append", default=[], help="Explicit baseline input dir (expects results.jsonl). Repeatable.")
     ap.add_argument(
         "--baseline-in-dir",
         action="append",
@@ -312,7 +332,7 @@ def main() -> None:
         default=argparse.SUPPRESS,
         help="Alias for --fec-in-dir (backwards compatibility).",
     )
-    ap.add_argument("--fec-results-jsonl", action="append", default=[], help="Explicit QUIC-FEC baseline results.jsonl path. Repeatable.")
+    ap.add_argument("--fec-results-jsonl", action="append", default=[], help="Explicit baseline results.jsonl path. Repeatable.")
     ap.add_argument(
         "--baseline-results-jsonl",
         action="append",
@@ -320,9 +340,6 @@ def main() -> None:
         default=argparse.SUPPRESS,
         help="Alias for --fec-results-jsonl (backwards compatibility).",
     )
-
-    ap.add_argument("--raw-in-dir", action="append", default=[], help="Explicit raw-quic input dir (expects results.jsonl). Repeatable.")
-    ap.add_argument("--raw-results-jsonl", action="append", default=[], help="Explicit raw-quic results.jsonl path. Repeatable.")
 
     ap.add_argument(
         "--only-inputs-specified",
@@ -346,13 +363,11 @@ def main() -> None:
 
     configure_matplotlib_like_paper()
 
-    bins: List[float] = [float(x.strip()) for x in str(args.bins).split(",") if str(x).strip()]
-    if len(bins) < 2:
-        raise SystemExit("bins must have at least 2 edges")
+    bin_ranges = _parse_bin_ranges(args.bin_ranges)
 
     labels = [x.strip() for x in str(args.bin_labels).split(",") if str(x).strip()]
-    if len(labels) != (len(bins) - 1):
-        labels = [f"[{bins[i]}, {bins[i+1]})" for i in range(len(bins) - 1)]
+    if len(labels) != len(bin_ranges):
+        labels = [f"{lo:g}-{hi:g}" for (lo, hi) in bin_ranges]
 
     set_flec_offset_env(args.flec_e2e_offset_ms)
 
@@ -367,23 +382,16 @@ def main() -> None:
 
     # Inputs.
     fec_jsonls: List[Path] = []
-    raw_jsonls: List[Path] = []
     bandit_jsonls: List[Path] = []
 
     if not bool(args.only_inputs_specified):
         fec_jsonls.extend(sorted(Path().glob(str(args.fec_jsonl_glob))))
-        raw_jsonls.extend(sorted(Path().glob(str(args.raw_jsonl_glob))))
         bandit_jsonls.extend(sorted(Path().glob(str(args.bandit_jsonl_glob))))
 
     for d in args.fec_in_dir:
         fec_jsonls.append(Path(str(d)) / "results.jsonl")
     for p in args.fec_results_jsonl:
         fec_jsonls.append(Path(str(p)))
-
-    for d in args.raw_in_dir:
-        raw_jsonls.append(Path(str(d)) / "results.jsonl")
-    for p in args.raw_results_jsonl:
-        raw_jsonls.append(Path(str(p)))
 
     for p_s in args.bandit_eval_log:
         bandit_jsonls.append(Path(str(p_s)).expanduser())
@@ -398,23 +406,13 @@ def main() -> None:
 
     # Load points.
     pts: List[_Point] = []
-    # Important: QUIC-raw is re-run and lives in a separate data source (e.g., ge-128k-baseline-raw-data).
-    # Load QUIC-FEC metrics only from the FEC baseline JSONLs, and QUIC raw metrics only from the raw JSONLs.
+    # Baseline results.jsonl now contains both QUIC-FEC and QUIC-raw results.
     for p in fec_jsonls:
         pts.extend(
             _load_jsonl_points_from_results(
                 results_jsonl=p,
                 tasks_ok=tasks_ok,
-                allow_methods_prefixes=("fec_", "ir_fec"),
-                raw_quic_metric=str(args.raw_quic_metric),
-            )
-        )
-    for p in raw_jsonls:
-        pts.extend(
-            _load_jsonl_points_from_results(
-                results_jsonl=p,
-                tasks_ok=tasks_ok,
-                allow_methods_prefixes=("quic_",),
+                allow_methods_prefixes=("fec_", "ir_fec", "quic_"),
                 raw_quic_metric=str(args.raw_quic_metric),
             )
         )
@@ -424,37 +422,38 @@ def main() -> None:
         pts.extend(_load_flec_points(flec_jsonl=p, tasks_ok=tasks_ok))
 
     # GE only.
-    pts_ge: List[Tuple[int, float, _Point]] = []
+    pts_ge: List[Tuple[float, _Point]] = []
     for t in pts:
         p = parse_ge_pibad_pct(t.loss_mode)
         if p is None or not math.isfinite(float(p)):
             continue
-        bi = _bin_index(float(p), bins)
-        pts_ge.append((bi, float(p), t))
+        pts_ge.append((float(p), t))
 
     methods = parse_methods_csv(args.methods)
     if not methods:
-        methods = sorted({t.method for (_bi, _p, t) in pts_ge})
+        methods = sorted({t.method for (_p, t) in pts_ge})
 
     means: Dict[Tuple[int, str], float] = {}
-    for bi in range(len(bins) - 1):
+    for bi, (lo, hi) in enumerate(bin_ranges):
         for m in methods:
-            xs = [t.nack_triggers for (_bi, _p, t) in pts_ge if _bi == bi and t.method == m and t.success == 1]
+            xs = [t.nack_triggers for (p, t) in pts_ge if _in_bin(p, lo, hi) and t.method == m and t.success == 1]
             means[(bi, m)] = _mean_or_nan(xs)
 
     x = np.arange(len(labels), dtype=float)
-    w = 0.8 / max(1, len(methods))
+    group_span = 0.72
+    slot_w = group_span / max(1, len(methods))
+    w = slot_w * 0.82
 
     plt.figure()
     for i, m in enumerate(methods):
         ys = [means.get((bi, m), float("nan")) for bi in range(len(labels))]
-        offsets = (i - (len(methods) - 1) / 2.0) * w
+        offsets = (i - (len(methods) - 1) / 2.0) * slot_w
         plt.bar(x + offsets, ys, width=w, label=method_label(m), color=(method_color(m) or f"C{i}"))
 
     plt.xticks(x, labels)
-    plt.xlabel("Average loss rate")
+    plt.xlabel(str(args.xlabel))
     if str(args.raw_quic_metric) == _RAW_QUIC_METRIC_TRIGGERS:
-        plt.ylabel("Retransmission triggers (mean)")
+        plt.ylabel("Average Recovery Rounds")
     else:
         plt.ylabel("Retransmissions (pkts, mean)")
     plt.grid(True, axis="y")

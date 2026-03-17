@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 
@@ -27,20 +28,51 @@ from paper10_plot_common import (  # noqa: E402
     load_all_trials,
     method_color,
     method_label,
+    parse_ge_pibad_pct,
     parse_methods_csv,
     save_current_figure,
     set_flec_offset_env,
 )
 
 
+def _parse_bin_ranges(spec: str) -> List[Tuple[float, float]]:
+    out: List[Tuple[float, float]] = []
+    for part in str(spec or "").split(","):
+        p = str(part).strip()
+        if not p:
+            continue
+        if "-" not in p:
+            raise SystemExit(f"invalid bin range: {p}")
+        lo_s, hi_s = p.split("-", 1)
+        lo = float(lo_s.strip())
+        hi = float(hi_s.strip())
+        if hi < lo:
+            lo, hi = hi, lo
+        out.append((float(lo), float(hi)))
+    if not out:
+        raise SystemExit("bin-ranges must contain at least one range")
+    return out
+
+
+def _in_bin(x: float, lo: float, hi: float) -> bool:
+    if float(x) < float(lo):
+        return False
+    if math.isclose(float(x), float(hi)):
+        return True
+    return float(x) < float(hi)
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description="(Paper10 #5) Delay percentile bar chart (p50, p99)")
+    ap = argparse.ArgumentParser(description="(Paper10 #5) p95 delay by pi_bad bins")
 
     ap.add_argument("--scenario", choices=["ge", "iid"], default="ge")
     ap.add_argument("--file-bytes", type=int, default=128 * 1024)
-    ap.add_argument("--methods", type=str, default="bandit,fec_k60_r0_2_rstep_2,fec_k40_r0_10_rstep_8,quic_bbrv2,flec")
+    ap.add_argument("--methods", type=str, default="bandit,fec_k40_r0_0_rstep_4,fec_k40_r0_4_rstep_0,quic_bbrv2,flec")
 
-    ap.add_argument("--pcts", type=str, default="95,99")
+    ap.add_argument("--pct", type=float, default=95.0)
+    ap.add_argument("--bin-ranges", type=str, default="0-10,1-30,2-50,3-100")
+    ap.add_argument("--bin-labels", type=str, default="300,600,900,1200")
+    ap.add_argument("--xlabel", type=str, default="Traffic Intensity")
 
     ap.add_argument("--flec-jsonl", type=str, default="python/results/flec_data/*.jsonl")
     ap.add_argument("--baseline-glob", type=str, default="python/results/*-baseline-data/results.csv")
@@ -68,15 +100,10 @@ def main() -> None:
     args = ap.parse_args()
 
     configure_matplotlib_like_paper()
-
-    pcts: List[float] = []
-    for part in str(args.pcts or "").split(","):
-        p = str(part).strip()
-        if not p:
-            continue
-        pcts.append(float(p))
-    if not pcts:
-        pcts = [50.0, 99.0]
+    bin_ranges = _parse_bin_ranges(args.bin_ranges)
+    labels = [x.strip() for x in str(args.bin_labels).split(",") if str(x).strip()]
+    if len(labels) != len(bin_ranges):
+        labels = [f"{lo:g}-{hi:g}" for (lo, hi) in bin_ranges]
 
     set_flec_offset_env(args.flec_e2e_offset_ms)
 
@@ -98,33 +125,44 @@ def main() -> None:
     if not methods:
         methods = auto_methods_in_trials(trials)
 
-    by_method: List[Tuple[str, List[float]]] = []
-    for m in methods:
-        xs = np.asarray(
-            [float(t.e2e_delay_ms) for t in trials if t.method == m and is_finite_pos(float(t.e2e_delay_ms))],
-            dtype=float,
-        )
-        xs = xs[np.isfinite(xs)]
-        if xs.size == 0:
+    trials_ge: List[Tuple[float, object]] = []
+    for t in trials:
+        p = parse_ge_pibad_pct(t.loss_mode)
+        if p is None or not math.isfinite(float(p)):
             continue
-        by_method.append((m, [float(np.percentile(xs, pct)) for pct in pcts]))
+        if not is_finite_pos(float(t.e2e_delay_ms)):
+            continue
+        trials_ge.append((float(p), t))
 
-    if not by_method:
+    vals_by_bin_method: Dict[Tuple[int, str], float] = {}
+    for bi, (lo, hi) in enumerate(bin_ranges):
+        for m in methods:
+            xs = np.asarray(
+                [float(t.e2e_delay_ms) for (p, t) in trials_ge if _in_bin(p, lo, hi) and t.method == m],
+                dtype=float,
+            )
+            xs = xs[np.isfinite(xs)]
+            vals_by_bin_method[(bi, m)] = float(np.percentile(xs, float(args.pct))) if xs.size else float("nan")
+
+    if not trials_ge:
         plt.figure()
-        plt.title(f"Delay percentiles ({args.scenario}, task={task})")
+        # plt.title(f"p95 delay by pi_bad bins ({args.scenario}, task={task})")
     else:
         plt.figure()
-        x = np.arange(len(pcts), dtype=float)
-        w = 0.8 / max(1, len(by_method))
+        x = np.arange(len(labels), dtype=float)
+        group_span = 0.72
+        slot_w = group_span / max(1, len(methods))
+        w = slot_w * 0.82
 
-        for i, (m, vals) in enumerate(by_method):
-            offsets = (i - (len(by_method) - 1) / 2.0) * w
-            plt.bar(x + offsets, vals, width=w, label=method_label(m), color=(method_color(m) or "C0"))
+        for i, m in enumerate(methods):
+            ys = [vals_by_bin_method.get((bi, m), float("nan")) for bi in range(len(labels))]
+            offsets = (i - (len(methods) - 1) / 2.0) * slot_w
+            plt.bar(x + offsets, ys, width=w, label=method_label(m), color=(method_color(m) or "C0"))
 
-        plt.xticks(x, [str(int(p)) if float(p).is_integer() else str(p) for p in pcts])
-        plt.xlabel("Percentile (%)")
+        plt.xticks(x, labels)
+        plt.xlabel(str(args.xlabel))
         plt.ylabel("E2E delay (ms)")
-        # plt.title(f"Delay vs percentile ({args.scenario}, task={task})")
+        # plt.title(f"p95 delay by pi_bad bins ({args.scenario}, task={task})")
         plt.legend()
 
         ax = plt.gca()

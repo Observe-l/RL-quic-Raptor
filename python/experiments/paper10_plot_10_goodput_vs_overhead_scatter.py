@@ -80,7 +80,7 @@ def main() -> None:
     ap.add_argument("--task", type=str, default="")
     ap.add_argument("--task-preferred", type=str, default="file_1048576B")
 
-    ap.add_argument("--methods", type=str, default="bandit,fec_k60_r0_2_rstep_2,fec_k40_r0_10_rstep_8,quic_bbrv2,flec")
+    ap.add_argument("--methods", type=str, default="bandit,fec_k40_r0_0_rstep_4,fec_k40_r0_4_rstep_0,quic_bbrv2,flec")
 
     ap.add_argument("--agg", choices=["per_trial", "sender_loss_method_mean"], default="sender_loss_method_mean")
 

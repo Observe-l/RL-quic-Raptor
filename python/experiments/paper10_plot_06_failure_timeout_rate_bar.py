@@ -44,7 +44,7 @@ def main() -> None:
 
     ap.add_argument("--scenario", choices=["ge", "iid"], default="ge")
     ap.add_argument("--file-bytes", type=int, default=128 * 1024)
-    ap.add_argument("--methods", type=str, default="bandit,fec_k60_r0_2_rstep_2,fec_k40_r0_10_rstep_8,quic_bbrv2,flec")
+    ap.add_argument("--methods", type=str, default="bandit,fec_k40_r0_0_rstep_4,fec_k40_r0_4_rstep_0,quic_bbrv2,flec")
 
     ap.add_argument("--timeout-s", type=float, default=1.0)
 
@@ -108,9 +108,11 @@ def main() -> None:
     labels = [method_label(m) for (m, _r) in rows]
     ys = [r for (_m, r) in rows]
     cols = [(method_color(m) or "C0") for (m, _r) in rows]
+    x = list(range(len(labels)))
 
     plt.figure()
-    plt.bar(labels, ys, color=cols)
+    plt.bar(x, ys, width=0.68, color=cols)
+    plt.xticks(x, labels)
     plt.ylim(0.0, 1.0)
     plt.ylabel("Failure/timeout rate")
     # plt.title(f"Failure/timeout rate (timeout={args.timeout_s}s, {args.scenario}, task={task})")

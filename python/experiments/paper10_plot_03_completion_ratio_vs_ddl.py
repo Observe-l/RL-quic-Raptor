@@ -24,6 +24,7 @@ from paper10_plot_common import (  # noqa: E402
     configure_matplotlib_like_paper,
     desired_task_from_file_bytes,
     filter_trials,
+    in_ge_pibad_range,
     is_finite_pos,
     load_all_trials,
     method_color,
@@ -58,7 +59,7 @@ def main() -> None:
 
     ap.add_argument("--scenario", choices=["ge", "iid"], default="ge")
     ap.add_argument("--file-bytes", type=int, default=128 * 1024)
-    ap.add_argument("--methods", type=str, default="bandit,fec_k60_r0_2_rstep_2,fec_k40_r0_10_rstep_8,quic_bbrv2,flec")
+    ap.add_argument("--methods", type=str, default="bandit,fec_k40_r0_0_rstep_4,fec_k40_r0_4_rstep_0,quic_bbrv2,flec")
 
     ap.add_argument("--ddl-ms-list", type=str, default="200,300,400,500")
 
@@ -77,6 +78,8 @@ def main() -> None:
     )
 
     ap.add_argument("--flec-e2e-offset-ms", type=float, default=0.0)
+    ap.add_argument("--pibad-min", type=float, default=0, help="Optional GE pi_bad lower bound in percent")
+    ap.add_argument("--pibad-max", type=float, default=100, help="Optional GE pi_bad upper bound in percent")
 
     ap.add_argument("--xmin", type=float, default=None, help="Optional x-axis min")
     ap.add_argument("--xmax", type=float, default=None, help="Optional x-axis max")
@@ -88,6 +91,10 @@ def main() -> None:
     args = ap.parse_args()
 
     configure_matplotlib_like_paper()
+    label_fontsize = 10
+    legend_fontsize = 10
+    title_fontsize = 10
+    tick_fontsize = 10
 
     ddl_ms_list: List[float] = []
     for part in str(args.ddl_ms_list or "").split(","):
@@ -111,30 +118,44 @@ def main() -> None:
 
     task = desired_task_from_file_bytes(args.file_bytes)
     trials = filter_trials(trials_all, scenario=args.scenario, task=task)
+    if args.scenario == "ge" and (args.pibad_min is not None or args.pibad_max is not None):
+        trials = [
+            t
+            for t in trials
+            if in_ge_pibad_range(
+                t.loss_mode,
+                pibad_min_pct=args.pibad_min,
+                pibad_max_pct=args.pibad_max,
+            )
+        ]
 
     methods = parse_methods_csv(args.methods)
     if not methods:
         methods = auto_methods_in_trials(trials)
 
-    plt.figure()
+    plt.figure(figsize=(3.5, 3.0))
 
-    x = np.arange(len(ddl_ms_list), dtype=float)
-    w = 0.8 / max(1, len(methods))
+    x = np.arange(len(ddl_ms_list), dtype=float) * 0.72
+    group_span = 0.56
+    slot_w = group_span / max(1, len(methods))
+    w = slot_w * 0.72
 
     for i, m in enumerate(methods):
         dm = [t for t in trials if t.method == m]
         if not dm:
             continue
         ys = [_completion_ratio(dm, ddl) for ddl in ddl_ms_list]
-        offsets = (i - (len(methods) - 1) / 2.0) * w
+        offsets = (i - (len(methods) - 1) / 2.0) * slot_w
         plt.bar(x + offsets, ys, width=w, label=method_label(m), color=(method_color(m) or "C0"))
 
     plt.ylim(0.0, 1.02)
     plt.xticks(x, [str(int(d)) if float(d).is_integer() else str(d) for d in ddl_ms_list])
-    plt.xlabel("DDL (ms)")
-    plt.ylabel("Completion ratio")
-    # plt.title(f"Completion ratio vs DDL ({args.scenario}, task={task})")
-    plt.legend(loc="upper left")
+    plt.xticks(fontsize=tick_fontsize)
+    plt.yticks(fontsize=tick_fontsize)
+    plt.xlabel("Transmission Deadline (ms)", fontsize=label_fontsize)
+    plt.ylabel("Completion ratio", fontsize=label_fontsize)
+    # plt.title(f"Completion ratio vs DDL ({args.scenario}, task={task})", fontsize=title_fontsize)
+    plt.legend(loc="upper left", fontsize=legend_fontsize)
 
     ax = plt.gca()
     xmin0, xmax0 = ax.get_xlim()

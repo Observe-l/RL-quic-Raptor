@@ -15,10 +15,14 @@ _METHOD_LABELS_DEFAULT: Dict[str, str] = {
     "bandit": "BC-DIR",
     "quic_bbrv2": "QUIC",
     "flec": "FLEC",
-    # Common baselines in this repo (used by existing GE plot scripts).
+    # Current DIR-FEC baselines.
+    "fec_k40_r0_0_rstep_4": "DIR-only",
+    "fec_k40_r0_4_rstep_0": "FEC-only",
+    "fec_k40_r0_0_rstep_10": "DIR-only",
+    "fec_k40_r0_10_rstep_0": "FEC-only",
+    # Old aliases kept for backward-compatible plotting of existing results.
     "fec_k60_r0_2_rstep_2": "DIR-FEC1",
     "fec_k40_r0_10_rstep_8": "DIR-FEC2",
-    # Another common naming used by some paper scripts.
     "fec_k30_r0_2_rstep_6": "DIR-FEC1",
     "fec_k30_r0_10_rstep_6": "DIR-FEC2",
 }
@@ -26,17 +30,28 @@ _METHOD_LABELS_DEFAULT: Dict[str, str] = {
 
 # Keep colors consistent with plot_overhead_and_delay_from_trainlog.py.
 _METHOD_COLORS_DEFAULT: Dict[str, str] = {
-    "bandit": "#1f77b4",
-    "quic_bbrv2": "#ff7f0e",
-    "fec_k60_r0_2_rstep_2": "#2ca02c",
-    "fec_k40_r0_10_rstep_8": "#d62728",
-    "flec": "#9467bd",
+    # Opaque paper-style colors close to the reference screenshot.
+    "bandit": "#E7B05D",
+    "quic_bbrv2": "#D1B98C",
+    "fec_k40_r0_0_rstep_4": "#A6C97A",
+    "fec_k40_r0_4_rstep_0": "#B8A3C7",
+    "fec_k40_r0_0_rstep_10": "#A6C97A",
+    "fec_k40_r0_10_rstep_0": "#B8A3C7",
+    "fec_k60_r0_2_rstep_2": "#A6C97A",
+    "fec_k40_r0_10_rstep_8": "#B8A3C7",
+    "fec_k30_r0_2_rstep_6": "#A6C97A",
+    "fec_k30_r0_10_rstep_6": "#B8A3C7",
+    "flec": "#86AFC1",
 }
 
 
 _METHOD_MARKERS_DEFAULT: Dict[str, str] = {
     # Filled, distinct shapes for scatter plots.
     "bandit": "^",  # triangle
+    "fec_k40_r0_0_rstep_4": "o",  # circle
+    "fec_k40_r0_4_rstep_0": "s",  # square
+    "fec_k40_r0_0_rstep_10": "o",  # circle
+    "fec_k40_r0_10_rstep_0": "s",  # square
     "fec_k60_r0_2_rstep_2": "o",  # circle
     "fec_k40_r0_10_rstep_8": "s",  # square
     "quic_bbrv2": "D",  # diamond
@@ -81,15 +96,24 @@ def configure_matplotlib_like_paper() -> None:
             "axes.spines.top": True,
             "axes.spines.right": True,
             "axes.grid": True,
-            "grid.color": "#d0d0d0",
-            "grid.alpha": 0.55,
-            "grid.linewidth": 0.4,
-            "grid.linestyle": "-",
+            "axes.linewidth": 0.55,
+            "grid.color": "#8F8F8F",
+            "grid.alpha": 1.0,
+            "grid.linewidth": 0.5,
+            "grid.linestyle": (0, (1.5, 2.5)),
             "lines.linewidth": 0.9,
+            "patch.edgecolor": "black",
+            "patch.force_edgecolor": True,
+            "patch.linewidth": 0.45,
             "xtick.direction": "in",
             "ytick.direction": "in",
             "xtick.major.size": 3.0,
             "ytick.major.size": 3.0,
+            "legend.frameon": True,
+            "legend.framealpha": 1.0,
+            "legend.fancybox": False,
+            "legend.facecolor": "white",
+            "legend.edgecolor": "#A8A8A8",
             "savefig.dpi": 400,
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
@@ -172,6 +196,19 @@ def parse_ge_pibad_pct(loss_mode: str) -> Optional[float]:
         return float(p_s)
     except Exception:
         return None
+
+
+def in_ge_pibad_range(loss_mode: str, *, pibad_min_pct: Optional[float], pibad_max_pct: Optional[float]) -> bool:
+    if pibad_min_pct is None and pibad_max_pct is None:
+        return True
+    p = parse_ge_pibad_pct(loss_mode)
+    if p is None or not math.isfinite(float(p)):
+        return False
+    if pibad_min_pct is not None and float(p) < float(pibad_min_pct):
+        return False
+    if pibad_max_pct is not None and float(p) > float(pibad_max_pct):
+        return False
+    return True
 
 
 def format_ge_loss_mode(*, p_pct: float, r_pct: float, rtt_ms: float) -> str:
@@ -529,6 +566,10 @@ def auto_methods_in_trials(trials: Sequence[TrialRow]) -> List[str]:
 
     default_order = [
         "bandit",
+        "fec_k40_r0_0_rstep_4",
+        "fec_k40_r0_4_rstep_0",
+        "fec_k40_r0_0_rstep_10",
+        "fec_k40_r0_10_rstep_0",
         "fec_k60_r0_2_rstep_2",
         "fec_k40_r0_10_rstep_8",
         "fec_k30_r0_2_rstep_6",

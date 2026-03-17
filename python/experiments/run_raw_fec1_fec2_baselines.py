@@ -369,7 +369,7 @@ def main() -> int:
 	ap.add_argument("--sender-ids", type=str, default="all", help="Comma list / ranges, or 'all'")
 
 	ap.add_argument("--bitrate-mbps", type=int, default=10)
-	ap.add_argument("--timeout-transfer-s", type=int, default=10)
+	ap.add_argument("--timeout-transfer-s", type=int, default=5)
 	ap.add_argument("--timeout-s", type=int, default=60, help="Python-side subprocess timeout")
 	ap.add_argument("--reps", type=int, default=30)
 	ap.add_argument(
@@ -605,8 +605,8 @@ def main() -> int:
 			)
 
 			for method, k, r0, rstep in (
-				("fec_k60_r0_2_rstep_2", 60, 2, 2),
-				("fec_k40_r0_10_rstep_8", 40, 10, 8),
+				("fec_k40_r0_0_rstep_4", 40, 0, 4),
+				("fec_k40_r0_4_rstep_0", 40, 4, 0),
 			):
 				env_fec = {
 					**common_env,

@@ -43,7 +43,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="(Paper10 #8) IID: mean E2E delay vs loss rate (line chart)")
 
     ap.add_argument("--file-bytes", type=int, default=128 * 1024)
-    ap.add_argument("--methods", type=str, default="bandit,fec_k60_r0_2_rstep_2,fec_k40_r0_10_rstep_8,quic_bbrv2,flec")
+    ap.add_argument("--methods", type=str, default="bandit,fec_k40_r0_0_rstep_4,fec_k40_r0_4_rstep_0,quic_bbrv2,flec")
 
     ap.add_argument("--flec-jsonl", type=str, default="python/results/flec_data/*.jsonl")
     ap.add_argument("--baseline-glob", type=str, default="python/results/*-baseline-data/results.csv")

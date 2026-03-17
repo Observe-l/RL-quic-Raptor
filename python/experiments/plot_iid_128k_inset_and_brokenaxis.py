@@ -23,8 +23,8 @@ from mpl_toolkits.axes_grid1.inset_locator import BboxConnector, BboxPatch, inse
 
 _METHOD_ORDER_DEFAULT = [
     "bandit",
-    "fec_k60_r0_2_rstep_2",
-    "fec_k40_r0_10_rstep_8",
+    "fec_k40_r0_0_rstep_4",
+    "fec_k40_r0_4_rstep_0",
     "quic_bbrv2",
     "flec",
 ]
@@ -32,8 +32,8 @@ _METHOD_ORDER_DEFAULT = [
 _METHOD_LABELS = {
     "bandit": "BCIR",
     "quic_bbrv2": "QUIC",
-    "fec_k60_r0_2_rstep_2": "IR-FEC1",
-    "fec_k40_r0_10_rstep_8": "IR-FEC2",
+    "fec_k40_r0_0_rstep_4": "DIR-FEC1",
+    "fec_k40_r0_4_rstep_0": "DIR-FEC2",
     "flec": "FLEC",
 }
 
@@ -41,16 +41,16 @@ _METHOD_LABELS = {
 _METHOD_COLORS = {
     "bandit": "#1f77b4",  # deep-ish blue
     "quic_bbrv2": "#ff7f0e",  # orange
-    "fec_k60_r0_2_rstep_2": "#2ca02c",  # green
-    "fec_k40_r0_10_rstep_8": "#d62728",  # red
+    "fec_k40_r0_0_rstep_4": "#2ca02c",  # green
+    "fec_k40_r0_4_rstep_0": "#d62728",  # red
     "flec": "#9467bd",  # purple
 }
 
 # Marker mapping consistent with plot_overhead_and_delay_from_bandit_evallog.py
 _METHOD_MARKERS = {
     "bandit": "+",
-    "fec_k60_r0_2_rstep_2": "x",
-    "fec_k40_r0_10_rstep_8": "1",
+    "fec_k40_r0_0_rstep_4": "x",
+    "fec_k40_r0_4_rstep_0": "1",
     "quic_bbrv2": "2",
     "flec": ".",
 }
@@ -462,7 +462,7 @@ def _draw_series_errorbar(
         if not xs:
             continue
 
-        is_ir_fec1 = method == "fec_k60_r0_2_rstep_2"
+        is_ir_fec1 = method == "fec_k40_r0_0_rstep_4"
         is_bcir = method == "bandit"
         markersize = 3.2 if is_ir_fec1 else 2.0
         markeredgewidth = 1.0 if is_ir_fec1 else 0.6
@@ -660,7 +660,7 @@ def _plot_tradeoff_with_inset(
         xs, ys = series.get(method, ([], []))
         if not xs:
             continue
-        is_ir_fec1 = method == "fec_k60_r0_2_rstep_2"
+        is_ir_fec1 = method == "fec_k40_r0_0_rstep_4"
         marker = _METHOD_MARKERS.get(method, ".")
         ax.scatter(
             xs,
@@ -700,7 +700,7 @@ def _plot_tradeoff_with_inset(
         xs, ys = series.get(method, ([], []))
         if not xs:
             continue
-        is_ir_fec1 = method == "fec_k60_r0_2_rstep_2"
+        is_ir_fec1 = method == "fec_k40_r0_0_rstep_4"
         inset.scatter(
             xs,
             ys,

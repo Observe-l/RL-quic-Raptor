@@ -64,7 +64,7 @@ def main() -> int:
     ap.add_argument(
         "--methods",
         type=str,
-        default="bandit,quic_bbrv2,fec_k60_r0_2_rstep_2,fec_k40_r0_10_rstep_8",
+        default="bandit,quic_bbrv2,fec_k40_r0_0_rstep_4,fec_k40_r0_4_rstep_0",
     )
 
     ap.add_argument("--aggregate", type=str, default="none", choices=["none", "sender_method_mean"])

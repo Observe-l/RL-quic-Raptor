@@ -21,8 +21,8 @@ import matplotlib.pyplot as plt  # noqa: E402
 _METHOD_ORDER = [
     # Ours first (legend order requirement)
     "bandit",
-    "fec_k60_r0_2_rstep_2",
-    "fec_k40_r0_10_rstep_8",
+    "fec_k40_r0_0_rstep_4",
+    "fec_k40_r0_4_rstep_0",
     # Baselines
     "quic_bbrv2",
     "flec",
@@ -31,24 +31,24 @@ _METHOD_ORDER = [
 _METHOD_LABELS = {
     "bandit": "BCIR",
     "quic_bbrv2": "QUIC",
-    "fec_k60_r0_2_rstep_2": "IR-FEC1",
-    "fec_k40_r0_10_rstep_8": "IR-FEC2",
+    "fec_k40_r0_0_rstep_4": "DIR-FEC1",
+    "fec_k40_r0_4_rstep_0": "DIR-FEC2",
     "flec": "FLEC",
 }
 
 _METHOD_COLORS = {
     "bandit": "#1f77b4",
     "quic_bbrv2": "#ff7f0e",
-    "fec_k60_r0_2_rstep_2": "#2ca02c",
-    "fec_k40_r0_10_rstep_8": "#d62728",
+    "fec_k40_r0_0_rstep_4": "#2ca02c",
+    "fec_k40_r0_4_rstep_0": "#d62728",
     "flec": "#9467bd",
 }
 
 _METHOD_MARKERS = {
     # Prefer small, line-constructed markers for dense IEEE plots.
     "bandit": "+",
-    "fec_k60_r0_2_rstep_2": "x",
-    "fec_k40_r0_10_rstep_8": "1",
+    "fec_k40_r0_0_rstep_4": "x",
+    "fec_k40_r0_4_rstep_0": "1",
     "quic_bbrv2": "2",
     "flec": ".",
 }
@@ -727,7 +727,7 @@ def main() -> int:
     ap.add_argument(
         "--methods",
         type=str,
-        default="bandit,quic_bbrv2,fec_k60_r0_2_rstep_2,fec_k40_r0_10_rstep_8",
+        default="bandit,quic_bbrv2,fec_k40_r0_0_rstep_4,fec_k40_r0_4_rstep_0",
         help="Comma list of methods to include",
     )
 
