@@ -62,7 +62,7 @@ def dir_client(
 	port: int = 25569,
 	alpn: str = "quic-fec",
 	in_path: str = "data/send.bin",
-	connect_timeout: str = "3s",
+	connect_timeout: str = "60s",
 	insecure: bool = True,
 	K: int = 60,
 	R0: int = 6,

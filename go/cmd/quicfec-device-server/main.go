@@ -32,7 +32,7 @@ func main() {
 	var (
 		addr      = flag.String("addr", "0.0.0.0:25569", "listen address")
 		alpn      = flag.String("alpn", "quic-fec", "ALPN protocol")
-		outPath   = flag.String("out", "data/receive.bin", "output file path")
+		outPath   = flag.String("out", "data/receive.bin", "output file path or base path; concurrent sessions get unique per-connection suffixes")
 		timeout   = flag.String("timeout", "0", "server timeout; bare numbers mean seconds, 0 means no timeout")
 		rttMS     = flag.Int("rtt-ms", 0, "manual RTT override in ms for ARQ waiting (0=use measured SRTT)")
 		rxBudget  = flag.Int("rx-budget-bytes", 64*1024*1024, "receiver buffer budget in bytes")
@@ -96,7 +96,7 @@ func main() {
 	defer cancel()
 
 	absOut, _ := filepath.Abs(*outPath)
-	fmt.Fprintln(os.Stderr, "[device-server] listen=", *addr, "out=", absOut)
+	fmt.Fprintln(os.Stderr, "[device-server] listen=", *addr, "out_base=", absOut)
 
 	rx := fecquic.RXOptions{
 		BudgetBytes:        *rxBudget,

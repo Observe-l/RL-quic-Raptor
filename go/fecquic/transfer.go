@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,6 +32,10 @@ const (
 	txStatsMagic   = "QFST" // QFEC sender stats
 	txStatsVersion = 1
 )
+
+func senderTxStatsEnabled() bool {
+	return os.Getenv("QUIC_FEC_TX_STATS") == "1"
+}
 
 func doneFlushGrace() time.Duration {
 	grace := 500 * time.Millisecond
@@ -51,6 +56,64 @@ func doneFlushGrace() time.Duration {
 		grace = 2 * time.Second
 	}
 	return grace
+}
+
+func sanitizeSessionToken(s string) string {
+	if s == "" {
+		return "unknown"
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	lastUnderscore := false
+	for _, r := range s {
+		ok := (r >= 'a' && r <= 'z') ||
+			(r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') ||
+			r == '.' || r == '-' || r == '_'
+		if ok {
+			b.WriteRune(r)
+			lastUnderscore = false
+			continue
+		}
+		if !lastUnderscore {
+			b.WriteByte('_')
+			lastUnderscore = true
+		}
+	}
+	out := strings.Trim(b.String(), "._-")
+	if out == "" {
+		return "unknown"
+	}
+	return out
+}
+
+func connectionSessionLabel(conn interface{ RemoteAddr() net.Addr }) string {
+	remote := "unknown"
+	if conn != nil && conn.RemoteAddr() != nil {
+		remote = sanitizeSessionToken(conn.RemoteAddr().String())
+	}
+	ts := time.Now().UTC().Format("20060102T150405.000000000Z")
+	return remote + "_" + ts
+}
+
+func scopeRXForConnection(outDir string, rx RXOptions, conn interface{ RemoteAddr() net.Addr }) (string, RXOptions, string) {
+	sessionLabel := connectionSessionLabel(conn)
+	scoped := rx
+	if scoped.OutPath != "" {
+		dir := filepath.Dir(scoped.OutPath)
+		if dir == "" || dir == "." {
+			dir = "."
+		}
+		base := filepath.Base(scoped.OutPath)
+		ext := filepath.Ext(base)
+		stem := strings.TrimSuffix(base, ext)
+		if stem == "" {
+			stem = "receive"
+		}
+		scoped.OutPath = filepath.Join(dir, stem+"."+sessionLabel+ext)
+		return outDir, scoped, sessionLabel
+	}
+	return filepath.Join(outDir, sessionLabel), scoped, sessionLabel
 }
 
 func sendDoneOnFreshStream(conn interface {
@@ -176,6 +239,10 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	var sum [32]byte // zero => receiver will skip SHA verification
 
 	tlsConf := &tls.Config{InsecureSkipVerify: opts.InsecureTLS, NextProtos: []string{alpn}}
+	quicDialTimeout := 6 * time.Second
+	if opts.DialTimeout > 0 {
+		quicDialTimeout = opts.DialTimeout
+	}
 	qconf := &quic.Config{
 		// attach our ECN tracer to observe CE/ECT counts
 		Tracer: func(ctx context.Context, p logging.Perspective, cid logging.ConnectionID) *logging.ConnectionTracer {
@@ -189,9 +256,12 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 			return devWrapConnTracer(logging.NewMultiplexedConnectionTracer(base, newQuicConnStatsTracer(quicStats)))
 		},
 		EnableDatagrams: true,
-		// Prevent idle timeouts; keep small to avoid tail delays on shutdown.
+		// Keep QUIC's pre-handshake / idle timers aligned with the caller's dial timeout.
+		// Otherwise DialAddr can fail early with an internal idle timeout before the outer
+		// connect-timeout context expires.
 		KeepAlivePeriod:                20 * time.Millisecond,
-		MaxIdleTimeout:                 6 * time.Second,
+		HandshakeIdleTimeout:           quicDialTimeout,
+		MaxIdleTimeout:                 quicDialTimeout,
 		InitialStreamReceiveWindow:     8 * 1024 * 1024,
 		InitialConnectionReceiveWindow: 16 * 1024 * 1024,
 	}
@@ -811,9 +881,9 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	}
 
 afterArqDrain:
-	// Send sender-side symbol counters to the server so it can compute fec_overhead.
-	// This is done after ARQ drain so counts reflect all appended repairs.
-	{
+	// Optionally send sender-side symbol counters to the server so it can compute fec_overhead.
+	// This is disabled by default to avoid perturbing transport timing in performance-focused runs.
+	if senderTxStatsEnabled() {
 		tStatsStart := time.Now()
 		txSourceSymbols := totalSymbols - totalRepairs
 		if txSourceSymbols < 0 {
@@ -920,11 +990,14 @@ func ServerRecvFile(ctx context.Context, ln *quic.Listener, outDir string) (stri
 
 // ServerRecvFileWithRX is like ServerRecvFile but allows configuring the receiver buffer.
 func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string, rx RXOptions) (string, error) {
-	// Accept one connection
 	conn, err := ln.Accept(ctx)
 	if err != nil {
 		return "", err
 	}
+	return serverRecvFileOnConn(ctx, conn, outDir, rx)
+}
+
+func serverRecvFileOnConn(ctx context.Context, conn *quic.Conn, outDir string, rx RXOptions) (string, error) {
 	defer conn.CloseWithError(0, "done")
 	recvStart := time.Now()
 
@@ -1132,7 +1205,7 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 					if _, err := io.ReadFull(us, prefix); err != nil {
 						return
 					}
-					// Sender stats stream: {magic(4)}{ver(1)}{tx_source(u64)}{tx_repair(u64)}
+					// Optional sender stats stream: {magic(4)}{ver(1)}{tx_source(u64)}{tx_repair(u64)}
 					if string(prefix) == txStatsMagic {
 						st := make([]byte, 1+8+8)
 						if _, err := io.ReadFull(us, st); err != nil {
@@ -1218,9 +1291,9 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 	if !queuedSharedDone {
 		fmt.Fprintln(os.Stderr, "[server-done] shared_ctrl enqueue missed")
 	}
-	// Wait briefly for the client to report sender-side tx symbol counts (used for fec_overhead).
-	// Without this grace period, the stats stream can arrive just after completion and be missed.
-	if rxm != nil && rxm.met != nil {
+	// Optionally wait briefly for sender-side tx symbol counts used for fec_overhead.
+	// Disabled by default to avoid inflating completion time with non-essential stats exchange.
+	if senderTxStatsEnabled() && rxm != nil && rxm.met != nil {
 		select {
 		case <-rxm.met.TxStatsDone():
 		case <-time.After(500 * time.Millisecond):
@@ -1473,26 +1546,42 @@ func ListenAndServeLoopWithRX(ctx context.Context, addr, alpn, outDir string, tl
 		return err
 	}
 	defer ln.Close()
+	var wg sync.WaitGroup
+	defer wg.Wait()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-		path, err := ServerRecvFileWithRX(ctx, ln, outDir, rx)
+		conn, err := ln.Accept(ctx)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return nil
 			}
 			continue
 		}
-		if onStored != nil {
-			onStored(path)
-		}
-		if ecnStats != nil {
-			tx0, tx1, rx0, rx1, rxce, _ := ecnStats.Snapshot()
-			fmt.Fprintf(os.Stderr, "[server-ecn] rx: CE=%d ECT0=%d ECT1=%d, tx: ECT0=%d ECT1=%d\n", rxce, rx0, rx1, tx0, tx1)
-		}
+		sessionOutDir, sessionRX, sessionLabel := scopeRXForConnection(outDir, rx, conn)
+		fmt.Fprintf(os.Stderr, "[server-accept] remote=%s session=%s out=%s\n", conn.RemoteAddr(), sessionLabel, sessionOutDir)
+		wg.Add(1)
+		go func(conn *quic.Conn, sessionOutDir string, sessionRX RXOptions, sessionLabel string) {
+			defer wg.Done()
+			path, err := serverRecvFileOnConn(ctx, conn, sessionOutDir, sessionRX)
+			if err != nil {
+				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+					fmt.Fprintf(os.Stderr, "[server-session] session=%s remote=%s err=%v\n", sessionLabel, conn.RemoteAddr(), err)
+				}
+				return
+			}
+			fmt.Fprintf(os.Stderr, "[server-session] session=%s remote=%s stored=%s\n", sessionLabel, conn.RemoteAddr(), path)
+			if onStored != nil {
+				onStored(path)
+			}
+			if ecnStats != nil {
+				tx0, tx1, rx0, rx1, rxce, _ := ecnStats.Snapshot()
+				fmt.Fprintf(os.Stderr, "[server-ecn] rx: CE=%d ECT0=%d ECT1=%d, tx: ECT0=%d ECT1=%d\n", rxce, rx0, rx1, tx0, tx1)
+			}
+		}(conn, sessionOutDir, sessionRX, sessionLabel)
 	}
 }
 

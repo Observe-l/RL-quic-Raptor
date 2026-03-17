@@ -26,11 +26,11 @@ def parse_args() -> argparse.Namespace:
 	ap.add_argument("--server", default="127.0.0.1", help="server IP or hostname")
 	ap.add_argument("--port", type=int, default=25569, help="server UDP port")
 	ap.add_argument("--alpn", default="quic-fec", help="ALPN protocol")
-	ap.add_argument("--in", dest="in_path", default="data/send.bin", help="input file path")
+	ap.add_argument("--in", dest="in_path", default="data/random_1mb.bin", help="input file path")
 	ap.add_argument("--timeout", default="60s", help="overall client timeout")
 	ap.add_argument(
 		"--connect-timeout",
-		default="3s",
+		default="60s",
 		help="timeout for dialing and QUIC handshake",
 	)
 	ap.add_argument("--insecure", action=argparse.BooleanOptionalAction, default=True)

@@ -25,7 +25,12 @@ def parse_args() -> argparse.Namespace:
 
 	ap.add_argument("--addr", default="0.0.0.0:25569", help="listen address")
 	ap.add_argument("--alpn", default="quic-fec", help="ALPN protocol")
-	ap.add_argument("--out", dest="out_path", default="data/receive.bin", help="output file path")
+	ap.add_argument(
+		"--out",
+		dest="out_path",
+		default="data/receive.bin",
+		help="output file path or base path; concurrent sessions get unique per-connection suffixes",
+	)
 	ap.add_argument("--timeout", default="0", help="server timeout, 0 means no timeout")
 	ap.add_argument("--rtt-ms", type=int, default=350, help="manual RTT override in ms for ARQ waiting (0=use measured SRTT)")
 	ap.add_argument("--rx-budget-bytes", type=int, default=64 * 1024 * 1024)
