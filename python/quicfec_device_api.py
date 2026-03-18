@@ -132,7 +132,7 @@ def dir_server(
 	addr: str = "0.0.0.0:25569",
 	alpn: str = "quic-fec",
 	out_path: str = "data/receive.bin",
-	rtt_ms: int = 350,
+	rtt_ms: int = 0,
 	rx_budget_bytes: int = 64 * 1024 * 1024,
 	decode_ddl: str = "25ms",
 	rx_workers: int = 2,

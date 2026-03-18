@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
 		help="output file path or base path; concurrent sessions get unique per-connection suffixes",
 	)
 	ap.add_argument("--timeout", default="0", help="server timeout, 0 means no timeout")
-	ap.add_argument("--rtt-ms", type=int, default=350, help="manual RTT override in ms for ARQ waiting (0=use measured SRTT)")
+	ap.add_argument("--rtt-ms", type=int, default=0, help="manual RTT override in ms for ARQ waiting (0=use measured SRTT)")
 	ap.add_argument("--rx-budget-bytes", type=int, default=64 * 1024 * 1024)
 	ap.add_argument("--decode-ddl", default="25ms", help="receiver decode/check pacing")
 	ap.add_argument("--rx-workers", type=int, default=2, help="receiver decode workers")
