@@ -684,11 +684,15 @@ func (m *rxManager) start(rx RXOptions) {
 								b.lastNackAt = now
 								b.lastNackRxUnique = rxu
 								// After sending a NACK, wait for repairs to arrive.
-								// The wait is softDDL + 1.5*RTT, where RTT can be manually overridden.
+								// The wait is softDDL + max(1.5*RTT, 150ms), where RTT can be manually overridden.
 								srtt := effectiveServerRTT()
 								wait := softDDL
 								if srtt > 0 {
-									wait += srtt + srtt/2
+									rttWait := srtt + srtt/2
+									if rttWait < 150*time.Millisecond {
+										rttWait = 150 * time.Millisecond
+									}
+									wait += rttWait
 								}
 								nacks = append(nacks, nackMsg{blockID: b.id, attempt: b.attempt, rxu: rxu, rec: rec, tau: softDDL, srtt: srtt, wait: wait, send: true})
 								nextDDL = now.Add(wait)

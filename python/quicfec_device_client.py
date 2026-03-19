@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
 	ap.add_argument("--K", type=int, default=60, help="source symbols K")
 	ap.add_argument("--R0", type=int, default=6, help="initial repair symbols R0")
 	ap.add_argument("--Rstep", type=int, default=4, help="minimum repairs appended per NACK")
-	ap.add_argument("--ddl-ms", type=int, default=25, help="receiver soft deadline in milliseconds")
+	ap.add_argument("--ddl-ms", type=int, default=70, help="receiver soft deadline in milliseconds")
 	ap.add_argument("--L", type=int, default=1200, help="symbol bytes L")
 	ap.add_argument("--W", type=int, default=8, help="ARQ unfinished-cluster window")
 	ap.add_argument("--max-attempts", type=int, default=0, help="ARQ max attempts per cluster (0=unlimited)")
