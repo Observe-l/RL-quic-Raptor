@@ -465,15 +465,75 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	}
 	// ARQ: map of active block transmitters
 	type blockTx struct {
-		K, L       int
-		enc        *fec.RaptorQEncoder
-		nextESI    int // next repair ESI to send (>=K)
-		repairsOut int // how many repairs sent so far
-		attempt    int // last processed attempt idx
+		K, L          int
+		enc           *fec.RaptorQEncoder
+		nextESI       int // next repair ESI to send (>=K)
+		repairsOut    int // how many repairs sent so far
+		queuedAttempt int // last queued NACK attempt idx
+		sentAttempt   int // last repair batch started for attempt idx
+	}
+	type repairReq struct {
+		nack    NackNeedMore
+		cand    int
+		deficit int
 	}
 	txMu := &sync.Mutex{}
 	active := make(map[uint16]*blockTx)
+	pendingRepairs := make(map[uint16]repairReq)
 	cond := sync.NewCond(txMu)
+	repairWake := make(chan struct{}, 1)
+	wakeRepairWorker := func() {
+		select {
+		case repairWake <- struct{}{}:
+		default:
+		}
+	}
+	computeRepairCount := func(bt *blockTx, n NackNeedMore) (cand int, deficit int) {
+		toSend := int(n.RecommendExtra)
+		if toSend < 0 {
+			toSend = 0
+		}
+		if bt.K-int(n.RxUnique) > 0 {
+			deficit = bt.K - int(n.RxUnique)
+		}
+		rstep := opts.RStep
+		// Semantics: Rstep=0 means "no extra". Negative values fall back to default.
+		if rstep < 0 {
+			rstep = 4
+		}
+		// Policy: append repairs on every NACK, but avoid many small ARQ rounds.
+		// Ensure we send at least enough to cover the current deficit, capped.
+		cand = toSend + rstep
+		maxBurst := 24
+		if v := os.Getenv("QUIC_FEC_ARQ_MAX_REPAIR_BURST"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				maxBurst = n
+			}
+		}
+		if deficit > 0 {
+			need := deficit
+			if need > maxBurst {
+				need = maxBurst
+			}
+			if need > cand {
+				cand = need
+			}
+		}
+		// Wire format uses uint8 SymID. Do not allow ESI to exceed 255, otherwise
+		// SymID wraps and we start re-sending duplicate IDs (wasting bandwidth and
+		// preventing decoding from ever finishing).
+		if bt.nextESI >= 256 {
+			return 0, deficit
+		}
+		remain := 256 - bt.nextESI
+		if cand > remain {
+			cand = remain
+		}
+		if cand < 0 {
+			cand = 0
+		}
+		return cand, deficit
+	}
 
 	// DONE ACK (server->client) via control uni-stream.
 	// Enabled by default; disable with QUIC_FEC_WAIT_DONE=0.
@@ -484,6 +544,108 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	var doneResult DoneFile
 	haveDoneResult := false
 	connDoneCh := conn.Context().Done()
+
+	// Repair worker: asynchronously send only the latest queued NACK per block.
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-repairWake:
+			}
+			for {
+				var (
+					bid uint16
+					req repairReq
+					bt  *blockTx
+					ok  bool
+				)
+				txMu.Lock()
+				for id, pending := range pendingRepairs {
+					bid = id
+					req = pending
+					bt = active[id]
+					delete(pendingRepairs, id)
+					ok = true
+					break
+				}
+				if ok && bt != nil {
+					if int(req.nack.AttemptIdx) > bt.sentAttempt {
+						bt.sentAttempt = int(req.nack.AttemptIdx)
+					}
+				}
+				txMu.Unlock()
+				if !ok {
+					break
+				}
+				if bt == nil {
+					continue
+				}
+				devARQOnClientNack(req.nack, req.deficit, req.cand, bt.K, bt.nextESI, bt.repairsOut)
+				totalAttempts++
+				for i := 0; i < req.cand; i++ {
+					if ctx.Err() != nil {
+						return
+					}
+					txMu.Lock()
+					bt = active[bid]
+					if bt == nil {
+						txMu.Unlock()
+						break
+					}
+					if newer, exists := pendingRepairs[bid]; exists && int(newer.nack.AttemptIdx) > int(req.nack.AttemptIdx) {
+						txMu.Unlock()
+						break
+					}
+					if bt.nextESI >= 256 {
+						txMu.Unlock()
+						break
+					}
+					esi := bt.nextESI
+					advN := minInt(255, bt.K+bt.repairsOut+1)
+					k := bt.K
+					l := bt.L
+					enc := bt.enc
+					bt.nextESI++
+					bt.repairsOut++
+					txMu.Unlock()
+
+					payload := enc.GenSymbol(uint32(esi))
+					b := make([]byte, fecwire.HeaderLen+l)
+					pay := b[fecwire.HeaderLen:]
+					if len(payload) == l {
+						copy(pay, payload)
+					} else {
+						clear(pay)
+						copy(pay, payload)
+					}
+					h := fecwire.FECHeader{
+						Version:    1,
+						Scheme:     fecwire.SchemeRaptorQ,
+						BlockID:    bid,
+						N:          uint8(advN),
+						K:          uint8(k),
+						SymID:      uint8(esi),
+						PayloadLen: uint32(l),
+					}
+					h.MarshalBinary(b[:fecwire.HeaderLen])
+					if err := sendSymbol(b); err == nil {
+						sentDgrams++
+						sentBytes += int64(len(b))
+						totalSymbols++
+						totalRepairs++
+						devARQOnClientRepairSent(bid, esi)
+					} else {
+						sendErrs++
+						logSendErr("repair", int(bid), esi, len(b), err)
+					}
+					if pc != nil {
+						pc.AfterSend()
+					}
+				}
+			}
+		}
+	}()
 
 	// Control reader: accept server control uni stream(s) and react to NACK/ACK/DONE.
 	go func() {
@@ -522,116 +684,33 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 						bid := uint16(n.ClusterID)
 						txMu.Lock()
 						bt := active[bid]
-						txMu.Unlock()
 						if bt == nil {
+							txMu.Unlock()
 							continue
 						}
-						// ignore stale attempts (process each attempt index once)
-						if int(n.AttemptIdx) <= bt.attempt {
+						// Ignore stale / duplicate requests once a newer attempt has already been queued.
+						if int(n.AttemptIdx) <= bt.queuedAttempt {
+							txMu.Unlock()
 							continue
 						}
 						// If we've reached the maximum number of ARQ attempts for this block, give up and free a window slot.
 						if opts.MaxAttempts > 0 && int(n.AttemptIdx) >= opts.MaxAttempts {
-							txMu.Lock()
 							delete(active, bid)
+							delete(pendingRepairs, bid)
 							txMu.Unlock()
 							cond.Broadcast()
 							fmt.Fprintf(os.Stderr, "[arq] giveup block=%d at attempt=%d (max=%d)\n", bid, n.AttemptIdx, opts.MaxAttempts)
 							continue
 						}
-						toSend := int(n.RecommendExtra)
-						if toSend < 0 {
-							toSend = 0
-						}
-						// Policy: append exactly (rec_extra + R_step) repair symbols on every NACK.
-						deficit := 0
-						if bt.K-int(n.RxUnique) > 0 {
-							deficit = bt.K - int(n.RxUnique)
-						}
-						rstep := opts.RStep
-						// Semantics: Rstep=0 means "no extra". Negative values fall back to default.
-						if rstep < 0 {
-							rstep = 4
-						}
-						// Policy: append repairs on every NACK, but avoid many small ARQ rounds.
-						// Ensure we send at least enough to cover the current deficit, capped.
-						cand := toSend + rstep
-						maxBurst := 24
-						if v := os.Getenv("QUIC_FEC_ARQ_MAX_REPAIR_BURST"); v != "" {
-							if n, err := strconv.Atoi(v); err == nil && n > 0 {
-								maxBurst = n
-							}
-						}
-						if deficit > 0 {
-							need := deficit
-							if need > maxBurst {
-								need = maxBurst
-							}
-							if need > cand {
-								cand = need
-							}
-						}
-						// Wire format uses uint8 SymID. Do not allow ESI to exceed 255, otherwise
-						// SymID wraps and we start re-sending duplicate IDs (wasting bandwidth and
-						// preventing decoding from ever finishing).
-						if bt.nextESI >= 256 {
-							continue
-						}
-						remain := 256 - bt.nextESI
-						if cand > remain {
-							cand = remain
-						}
+						cand, deficit := computeRepairCount(bt, n)
 						if cand <= 0 {
+							txMu.Unlock()
 							continue
 						}
-						devARQOnClientNack(n, deficit, cand, bt.K, bt.nextESI, bt.repairsOut)
-						// send cand fresh repairs
-						for i := 0; i < cand; i++ {
-							if ctx.Err() != nil {
-								return
-							}
-							esi := bt.nextESI
-							payload := bt.enc.GenSymbol(uint32(esi))
-							// Avoid per-packet allocation: reuse a fixed-size buffer.
-							// SendDatagram copies the slice before returning, so reuse is safe.
-							b := make([]byte, fecwire.HeaderLen+bt.L)
-							pay := b[fecwire.HeaderLen:]
-							if len(payload) == bt.L {
-								copy(pay, payload)
-							} else {
-								clear(pay)
-								copy(pay, payload)
-							}
-							// Guard N to avoid overflow and unrealistic growth
-							advN := minInt(255, bt.K+bt.repairsOut+1)
-							h := fecwire.FECHeader{
-								Version:    1,
-								Scheme:     fecwire.SchemeRaptorQ,
-								BlockID:    bid,
-								N:          uint8(advN),
-								K:          uint8(bt.K),
-								SymID:      uint8(esi),
-								PayloadLen: uint32(bt.L),
-							}
-							h.MarshalBinary(b[:fecwire.HeaderLen])
-							if err := sendSymbol(b); err == nil {
-								sentDgrams++
-								sentBytes += int64(len(b))
-								totalSymbols++
-								totalRepairs++
-								devARQOnClientRepairSent(bid, esi)
-							} else {
-								sendErrs++
-								logSendErr("repair", int(bid), esi, len(b), err)
-							}
-							bt.nextESI++
-							bt.repairsOut++
-							if pc != nil {
-								pc.AfterSend()
-							}
-						}
-						bt.attempt = int(n.AttemptIdx)
-						totalAttempts++
+						bt.queuedAttempt = int(n.AttemptIdx)
+						pendingRepairs[bid] = repairReq{nack: n, cand: cand, deficit: deficit}
+						txMu.Unlock()
+						wakeRepairWorker()
 					case arqMsgACK:
 						if !opts.UseARQ {
 							continue
@@ -641,6 +720,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 						bid := uint16(a.ClusterID)
 						txMu.Lock()
 						delete(active, bid)
+						delete(pendingRepairs, bid)
 						txMu.Unlock()
 						cond.Broadcast()
 					}
@@ -725,8 +805,8 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		if initN > 256 {
 			initN = 256
 		}
-		// Initialize attempt to -1 so the first NACK with attempt_idx=0 is processed once.
-		bt := &blockTx{K: curK, L: L, enc: enc, nextESI: curK, repairsOut: 0, attempt: -1}
+		// Initialize attempts to -1 so the first NACK with attempt_idx=0 is processed once.
+		bt := &blockTx{K: curK, L: L, enc: enc, nextESI: curK, repairsOut: 0, queuedAttempt: -1, sentAttempt: -1}
 		txMu.Lock()
 		active[uint16(blockID)] = bt
 		txMu.Unlock()
