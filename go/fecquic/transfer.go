@@ -476,10 +476,12 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		nack    NackNeedMore
 		cand    int
 		deficit int
+		order   int64
 	}
 	txMu := &sync.Mutex{}
 	active := make(map[uint16]*blockTx)
 	pendingRepairs := make(map[uint16]repairReq)
+	var repairOrder int64
 	cond := sync.NewCond(txMu)
 	repairWake := make(chan struct{}, 1)
 	wakeRepairWorker := func() {
@@ -534,6 +536,23 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		}
 		return cand, deficit
 	}
+	betterRepairReq := func(a repairReq, aID uint16, b repairReq, bID uint16) bool {
+		aZero := a.nack.RxUnique == 0
+		bZero := b.nack.RxUnique == 0
+		if aZero != bZero {
+			return aZero
+		}
+		if a.deficit != b.deficit {
+			return a.deficit > b.deficit
+		}
+		if a.nack.RxUnique != b.nack.RxUnique {
+			return a.nack.RxUnique < b.nack.RxUnique
+		}
+		if a.order != b.order {
+			return a.order < b.order
+		}
+		return aID < bID
+	}
 
 	// DONE ACK (server->client) via control uni-stream.
 	// Enabled by default; disable with QUIC_FEC_WAIT_DONE=0.
@@ -562,12 +581,15 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 				)
 				txMu.Lock()
 				for id, pending := range pendingRepairs {
-					bid = id
-					req = pending
-					bt = active[id]
-					delete(pendingRepairs, id)
-					ok = true
-					break
+					if !ok || betterRepairReq(pending, id, req, bid) {
+						bid = id
+						req = pending
+						ok = true
+					}
+				}
+				if ok {
+					bt = active[bid]
+					delete(pendingRepairs, bid)
 				}
 				if ok && bt != nil {
 					if int(req.nack.AttemptIdx) > bt.sentAttempt {
@@ -708,7 +730,13 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 							continue
 						}
 						bt.queuedAttempt = int(n.AttemptIdx)
-						pendingRepairs[bid] = repairReq{nack: n, cand: cand, deficit: deficit}
+						repairOrder++
+						pendingRepairs[bid] = repairReq{
+							nack:    n,
+							cand:    cand,
+							deficit: deficit,
+							order:   repairOrder,
+						}
 						txMu.Unlock()
 						wakeRepairWorker()
 					case arqMsgACK:
