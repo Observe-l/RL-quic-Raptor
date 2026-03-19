@@ -362,6 +362,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	// Metrics counters
 	start := time.Now()
 	var sentDgrams, sentBytes, sendErrs, dtleCount int64
+	var sendErrLogs, sendRetryErrLogs, arqSendErrLogs int64
 	var dgramsSinceAck int
 	var encTime time.Duration
 	var sendTime time.Duration
@@ -399,6 +400,29 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 			return err
 		}
 		return nil
+	}
+	logSendErr := func(phase string, blockID, esi, payloadLen int, err error) {
+		if err == nil {
+			return
+		}
+		var counter *int64
+		switch phase {
+		case "initial":
+			counter = &sendErrLogs
+		case "retry":
+			counter = &sendRetryErrLogs
+		default:
+			counter = &arqSendErrLogs
+		}
+		*counter++
+		n := *counter
+		if n <= 10 || n%100 == 0 {
+			fmt.Fprintf(
+				os.Stderr,
+				"[send-error] phase=%s block=%d esi=%d payload=%d err=%v conn_cause=%v count=%d\n",
+				phase, blockID, esi, payloadLen, err, context.Cause(conn.Context()), n,
+			)
+		}
 	}
 
 	// Live goodput printer
@@ -598,6 +622,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 								devARQOnClientRepairSent(bid, esi)
 							} else {
 								sendErrs++
+								logSendErr("repair", int(bid), esi, len(b), err)
 							}
 							bt.nextESI++
 							bt.repairsOut++
@@ -766,6 +791,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 				tSend := time.Now()
 				if err := sendSymbol(b); err != nil {
 					sendErrs++
+					logSendErr("initial", blockID, esi, len(b), err)
 					if opts.Transport == "stream" {
 						return err
 					}
@@ -773,6 +799,10 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 					if err2 := sendSymbol(b); err2 == nil {
 						sentDgrams++
 						sentBytes += int64(len(b))
+						fmt.Fprintf(os.Stderr, "[send-error] phase=retry_recovered block=%d esi=%d payload=%d\n", blockID, esi, len(b))
+					} else {
+						sendErrs++
+						logSendErr("retry", blockID, esi, len(b), err2)
 					}
 				} else {
 					sentDgrams++
