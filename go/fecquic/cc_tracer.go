@@ -12,11 +12,14 @@ import (
 // NewCCDebugConnTracer emits a sender-side bandwidth estimate to stderr.
 //
 // The estimate is computed from transport-observable signals:
-//   bw ~= cwnd / srtt
+//
+//	bw ~= cwnd / srtt
+//
 // For BBRv2 we divide cwnd by the cwnd gain (~2) to approximate BDP bandwidth.
 //
 // Output format (one line):
-//   [cc-estimate] {"algo":"bbrv2","method":"cwnd_srtt","bw_mbps":...,"srtt_ms":...,"cwnd_bytes":...}
+//
+//	[cc-estimate] {"algo":"bbrv2","method":"cwnd_srtt","bw_mbps":...,"srtt_ms":...,"cwnd_bytes":...}
 func NewCCDebugConnTracer() *logging.ConnectionTracer {
 	algo := os.Getenv("QUIC_FEC_CC_ALGO")
 	bypass := os.Getenv("QUIC_FEC_CC_BYPASS")
@@ -26,9 +29,18 @@ func NewCCDebugConnTracer() *logging.ConnectionTracer {
 	var lastBw float64
 
 	return &logging.ConnectionTracer{
+		Debug: func(name, msg string) {
+			if bypass == "1" || name != "cc-estimate" {
+				return
+			}
+			// BBRv2 emits its actual model bandwidth and pacing rate here.
+			if algo == "bbr" || algo == "bbrv2" {
+				fmt.Fprintf(os.Stderr, "[cc-estimate] %s\n", msg)
+			}
+		},
 		UpdatedMetrics: func(rttStats *logging.RTTStats, cwnd, _ logging.ByteCount, _ int) {
 			// Only emit when CC is enabled.
-			if bypass == "1" {
+			if bypass == "1" || algo == "bbr" || algo == "bbrv2" {
 				return
 			}
 			if rttStats == nil {

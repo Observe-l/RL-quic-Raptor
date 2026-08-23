@@ -44,6 +44,7 @@ type ecnTracker struct {
 
 	numSentECT0, numSentECT1                  int64
 	numAckedECT0, numAckedECT1, numAckedECNCE int64
+	lastNewECNCE                              int64
 
 	tracer *logging.ConnectionTracer
 	logger utils.Logger
@@ -145,6 +146,7 @@ func (e *ecnTracker) LostPacket(pn protocol.PacketNumber) {
 // It must only be called for ACK frames that increase the largest acknowledged packet number,
 // see section 13.4.2.1 of RFC 9000.
 func (e *ecnTracker) HandleNewlyAcked(packets []*packet, ect0, ect1, ecnce int64) (congested bool) {
+	e.lastNewECNCE = 0
 	if e.state == ecnStateFailed {
 		return false
 	}
@@ -258,7 +260,19 @@ func (e *ecnTracker) HandleNewlyAcked(packets []*packet, ect0, ect1, ecnce int64
 
 	// Don't trust CE marks before having confirmed ECN capability of the path.
 	// Otherwise, mangling would be misinterpreted as actual congestion.
-	return e.state == ecnStateCapable && newECNCE > 0
+	if e.state == ecnStateCapable && newECNCE > 0 {
+		e.lastNewECNCE = newECNCE
+		return true
+	}
+	return false
+}
+
+// NewlyMarkedCE returns the number of newly reported CE marks from the most
+// recent successfully validated ECN ACK. It is intentionally separate from
+// ecnHandler so existing test doubles and non-BBR congestion controllers do
+// not need to change their interface.
+func (e *ecnTracker) NewlyMarkedCE() int64 {
+	return e.lastNewECNCE
 }
 
 // failIfMangled fails ECN validation if all testing packets are lost or CE-marked.

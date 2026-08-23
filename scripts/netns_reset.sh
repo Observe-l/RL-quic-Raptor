@@ -11,6 +11,10 @@ set -euo pipefail
 
 NS=${1:-qns}
 
+# Optional root-owned dispatcher. If unset, retain the original sudo-based
+# implementation byte-for-byte below so existing experiments are unaffected.
+PRIV_HELPER=${QUIC_FEC_PRIV_HELPER:-}
+
 VETH_HOST=${VETH_HOST:-veth0}
 VETH_NS=${VETH_NS:-veth1}
 
@@ -20,6 +24,10 @@ NS_IP=${NS_IP:-10.10.0.2/24}
 # Raw IPs (without CIDR) for neigh / iptables.
 HOST_IP_RAW=${HOST_IP%%/*}
 NS_IP_RAW=${NS_IP%%/*}
+
+if [[ -n "$PRIV_HELPER" ]]; then
+  exec sudo -n -- "$PRIV_HELPER" reset "$NS" "$VETH_HOST" "$VETH_NS" "$HOST_IP" "$NS_IP"
+fi
 
 if sudo ip netns list | awk '{print $1}' | grep -qx "$NS"; then
   # Kill any lingering processes in the ns to allow delete

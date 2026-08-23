@@ -100,6 +100,18 @@ SKIP_BUILD=${SKIP_BUILD:-0}
 # sufficient and we don't want to pay (or jitter on) post-transfer file flush.
 SKIP_MD5=${SKIP_MD5:-0}
 
+# Optional root-owned dispatcher. This is deliberately opt-in: when unset,
+# the existing sudo-based experiment path below remains unchanged.
+PRIV_HELPER=${QUIC_FEC_PRIV_HELPER:-}
+PRIV_MODE=0
+if [[ -n "$PRIV_HELPER" ]]; then
+  PRIV_MODE=1
+fi
+
+helper_call() {
+  sudo -n -- "$PRIV_HELPER" "$@"
+}
+
 T_SCRIPT_START=$(date +%s%N)
 
 # DDL_MS already defaulted above; kept here historically but now intentionally a no-op.
@@ -111,28 +123,42 @@ if [[ ! -f "$FILE" ]]; then
   head -c $((3*1024*1024)) </dev/urandom >"$FILE"
 fi
 
-# Require cached sudo privileges to avoid interactive prompts under RL.
-if ! sudo -n true 2>/dev/null; then
-  echo "[error] sudo privileges are required. Run 'sudo -v' once (or set SUDO_ASKPASS/SUDO_PASSWORD) and rerun." >&2
-  exit 1
+# Require cached sudo privileges, or validate the opt-in helper.
+if [[ "$PRIV_MODE" == "1" ]]; then
+  if ! helper_call self-test >/dev/null 2>&1; then
+    echo "[error] QUIC_FEC_PRIV_HELPER failed self-test: $PRIV_HELPER" >&2
+    exit 1
+  fi
+else
+  if ! sudo -n true 2>/dev/null; then
+    echo "[error] sudo privileges are required. Run 'sudo -v' once (or set SUDO_ASKPASS/SUDO_PASSWORD) and rerun." >&2
+    exit 1
+  fi
 fi
 
 # Reset netns (unless explicitly reusing an existing one)
 if [[ "$SKIP_NETNS_RESET" != "1" ]]; then
-  VETH_HOST="$VETH_HOST" VETH_NS="$VETH_NS" HOST_IP="$HOST_IP" NS_IP="$NS_IP" "$ROOT/scripts/netns_reset.sh" "$NS"
+  QUIC_FEC_PRIV_HELPER="$PRIV_HELPER" VETH_HOST="$VETH_HOST" VETH_NS="$VETH_NS" HOST_IP="$HOST_IP" NS_IP="$NS_IP" "$ROOT/scripts/netns_reset.sh" "$NS"
 else
   # Validate the expected topology exists.
-  if ! sudo ip netns list | awk '{print $1}' | grep -qx "$NS"; then
-    echo "[error] netns '$NS' not found but SKIP_NETNS_RESET=1" >&2
-    exit 2
-  fi
-  if ! ip link show "$VETH_HOST" &>/dev/null; then
-    echo "[error] host $VETH_HOST not found but SKIP_NETNS_RESET=1" >&2
-    exit 2
-  fi
-  if ! sudo ip netns exec "$NS" ip link show "$VETH_NS" &>/dev/null; then
-    echo "[error] ns $VETH_NS not found but SKIP_NETNS_RESET=1" >&2
-    exit 2
+  if [[ "$PRIV_MODE" == "1" ]]; then
+    if ! helper_call check "$NS" "$VETH_HOST" "$VETH_NS"; then
+      echo "[error] expected namespace topology is missing" >&2
+      exit 2
+    fi
+  else
+    if ! sudo ip netns list | awk '{print $1}' | grep -qx "$NS"; then
+      echo "[error] netns '$NS' not found but SKIP_NETNS_RESET=1" >&2
+      exit 2
+    fi
+    if ! ip link show "$VETH_HOST" &>/dev/null; then
+      echo "[error] host $VETH_HOST not found but SKIP_NETNS_RESET=1" >&2
+      exit 2
+    fi
+    if ! sudo ip netns exec "$NS" ip link show "$VETH_NS" &>/dev/null; then
+      echo "[error] ns $VETH_NS not found but SKIP_NETNS_RESET=1" >&2
+      exit 2
+    fi
   fi
 fi
 
@@ -142,8 +168,12 @@ fi
 TUNE_UDP_BUFFERS=${TUNE_UDP_BUFFERS:-1}
 if [[ "${TUNE_UDP_BUFFERS}" == "1" && "$SKIP_SYSCTL" != "1" ]]; then
   # Best-effort: keep silent and don't fail the run if sysctl is restricted.
-  sudo sysctl -w net.core.rmem_max=33554432 net.core.wmem_max=33554432 >/dev/null 2>&1 || true
-  sudo sysctl -w net.core.rmem_default=33554432 net.core.wmem_default=33554432 >/dev/null 2>&1 || true
+  if [[ "$PRIV_MODE" == "1" ]]; then
+    helper_call buffers >/dev/null 2>&1 || true
+  else
+    sudo sysctl -w net.core.rmem_max=33554432 net.core.wmem_max=33554432 >/dev/null 2>&1 || true
+    sudo sysctl -w net.core.rmem_default=33554432 net.core.wmem_default=33554432 >/dev/null 2>&1 || true
+  fi
 fi
 # Rebuild if forced, binaries missing, or any Go source is newer than the binaries
 NEED_BUILD=0
@@ -172,36 +202,40 @@ FILE_SIZE=$(stat -c%s "$FILE")
 half=$(( RTT_MS / 2 ))
 T_TC_START=$(date +%s%N)
 if [[ "$SKIP_TC_CONFIG" != "1" ]]; then
-  sudo tc qdisc del dev "$VETH_HOST" root 2>/dev/null || true
-
-  # Build NETEM args for loss model
   LOSS_MODE=${LOSS_MODE:-}
-  NETEM_ARGS=(delay ${half}ms)
-  case "$LOSS_MODE" in
-    none)
-      NETEM_ARGS+=(loss 0%) ;;
-    iid:*)
-      pct=${LOSS_MODE#iid:}
-      NETEM_ARGS+=(loss ${pct}%) ;;
-    gemodel:*)
-      params=${LOSS_MODE#gemodel:}
-      IFS=',' read -r p r h k <<<"$params"
-      # IMPORTANT: `tc netem loss gemodel` expects parameters as:
-      #   p r 1-h 1-k
-      # where 1-h is the BAD-state loss probability and 1-k is the GOOD-state
-      # loss probability (see `man tc-netem`).
-      # Our LOSS_MODE=gemodel:p,r,h,k uses h=GOOD loss probability, k=BAD loss
-      # probability, so we pass (1-h)=k and (1-k)=h.
-      NETEM_ARGS+=(loss gemodel ${p}% ${r}% ${k}% ${h}%) ;;
-    ""|*)
-      NETEM_ARGS+=(loss ${LOSS_PCT}%) ;;
-  esac
+  if [[ "$PRIV_MODE" == "1" ]]; then
+    helper_call tc-config "$VETH_HOST" "$VETH_NS" "$NS" "$BITRATE_MBPS" "$RTT_MS" "$LOSS_MODE" "$LOSS_PCT"
+  else
+    sudo tc qdisc del dev "$VETH_HOST" root 2>/dev/null || true
 
-  # Apply TBF at root to enforce rate, then NETEM as child for delay/loss
-  sudo tc qdisc replace dev "$VETH_HOST" root handle 1: tbf rate ${RATE} burst 32kb latency 400ms
-  sudo tc qdisc replace dev "$VETH_HOST" parent 1:1 handle 10: netem "${NETEM_ARGS[@]}"
-  sudo ip netns exec "$NS" tc qdisc del dev "$VETH_NS" root 2>/dev/null || true
-  sudo ip netns exec "$NS" tc qdisc replace dev "$VETH_NS" root netem delay ${half}ms
+    # Build NETEM args for loss model
+    NETEM_ARGS=(delay ${half}ms)
+    case "$LOSS_MODE" in
+      none)
+        NETEM_ARGS+=(loss 0%) ;;
+      iid:*)
+        pct=${LOSS_MODE#iid:}
+        NETEM_ARGS+=(loss ${pct}%) ;;
+      gemodel:*)
+        params=${LOSS_MODE#gemodel:}
+        IFS=',' read -r p r h k <<<"$params"
+        # IMPORTANT: `tc netem loss gemodel` expects parameters as:
+        #   p r 1-h 1-k
+        # where 1-h is the BAD-state loss probability and 1-k is the GOOD-state
+        # loss probability (see `man tc-netem`).
+        # Our LOSS_MODE=gemodel:p,r,h,k uses h=GOOD loss probability, k=BAD loss
+        # probability, so we pass (1-h)=k and (1-k)=h.
+        NETEM_ARGS+=(loss gemodel ${p}% ${r}% ${k}% ${h}%) ;;
+      ""|*)
+        NETEM_ARGS+=(loss ${LOSS_PCT}%) ;;
+    esac
+
+    # Apply TBF at root to enforce rate, then NETEM as child for delay/loss
+    sudo tc qdisc replace dev "$VETH_HOST" root handle 1: tbf rate ${RATE} burst 32kb latency 400ms
+    sudo tc qdisc replace dev "$VETH_HOST" parent 1:1 handle 10: netem "${NETEM_ARGS[@]}"
+    sudo ip netns exec "$NS" tc qdisc del dev "$VETH_NS" root 2>/dev/null || true
+    sudo ip netns exec "$NS" tc qdisc replace dev "$VETH_NS" root netem delay ${half}ms
+  fi
 fi
 T_TC_END=$(date +%s%N)
 
@@ -219,13 +253,42 @@ SRV_LOG=$(mktemp -t quic_fec_srv.XXXXXX.log)
 # if this run fails before producing a new file.
 rm -f "$OUT_DIR/$(basename "$FILE").recv" "$OUT_DIR/$(basename "$FILE").recv.part" 2>/dev/null || true
 T_SRV_START=$(date +%s%N)
-sudo ip netns exec "$NS" bash -lc "ulimit -n 1048576; '$BIN_DIR/quicfec-server' -addr ${SRV_IP}:$PORT -out '$OUT_DIR' -timeout ${SRV_TIMEOUT} -decode-ddl ${DECODE_DDL_MS}ms" >"$SRV_LOG" 2>&1 & SP=$!
+
+start_server() {
+  if [[ "$PRIV_MODE" == "1" ]]; then
+    helper_call server-start "$NS" "$BIN_DIR/quicfec-server" "${SRV_IP}:$PORT" "$OUT_DIR" "$SRV_TIMEOUT" "$DECODE_DDL_MS"
+  else
+    sudo ip netns exec "$NS" bash -lc "ulimit -n 1048576; '$BIN_DIR/quicfec-server' -addr ${SRV_IP}:$PORT -out '$OUT_DIR' -timeout ${SRV_TIMEOUT} -decode-ddl ${DECODE_DDL_MS}ms"
+  fi
+}
+
+stop_server() {
+  if [[ -z "${SP:-}" ]]; then
+    return 0
+  fi
+  if [[ "$PRIV_MODE" == "1" ]]; then
+    helper_call server-stop "$SP" >/dev/null 2>&1 || true
+    # The namespace-scoped fallback handles the short race where the sudo
+    # launcher exits before its state file becomes visible.
+    helper_call server-stop-ns "$NS" >/dev/null 2>&1 || true
+  else
+    kill "$SP" 2>/dev/null || true
+    sleep 0.05
+    kill -9 "$SP" 2>/dev/null || true
+  fi
+}
+
+start_server >"$SRV_LOG" 2>&1 & SP=$!
 
 # Wait for server UDP socket to be ready (best-effort). A fixed sleep can be flaky under load.
 ready=0
 if command -v ss >/dev/null 2>&1; then
   # Keep this fast: client already has dial/handshake retries.
-  if sudo ip netns exec "$NS" bash -lc "for _ in \$(seq 1 8); do if ss -lunH 2>/dev/null | awk '{print \$5}' | grep -q ':$PORT$'; then exit 0; fi; sleep 0.01; done; exit 1"; then
+  if [[ "$PRIV_MODE" == "1" ]]; then
+    if helper_call wait-port "$NS" "$PORT"; then
+      ready=1
+    fi
+  elif sudo ip netns exec "$NS" bash -lc "for _ in \$(seq 1 8); do if ss -lunH 2>/dev/null | awk '{print \$5}' | grep -q ':$PORT$'; then exit 0; fi; sleep 0.01; done; exit 1"; then
     ready=1
   fi
 fi
@@ -281,9 +344,8 @@ if command -v timeout >/dev/null 2>&1; then
     if [[ "$RC" != "0" ]]; then
       if grep -qE "^error: .*context deadline exceeded|^error:.*timeout|context deadline exceeded" "$CLI_LOG" 2>/dev/null; then
         if [[ "$CONNECT_RETRIES" -gt 0 && "$CONNECT_ATTEMPTS" -lt "$CONNECT_RETRIES" ]]; then
-          kill $SP 2>/dev/null || true
-          kill -9 $SP 2>/dev/null || true
-          sudo ip netns exec "$NS" bash -lc "ulimit -n 1048576; '$BIN_DIR/quicfec-server' -addr ${SRV_IP}:$PORT -out '$OUT_DIR' -timeout ${SRV_TIMEOUT} -decode-ddl ${DECODE_DDL_MS}ms" >"$SRV_LOG" 2>&1 & SP=$!
+          stop_server
+          start_server >"$SRV_LOG" 2>&1 & SP=$!
           sleep 0.05
           continue
         fi
@@ -305,9 +367,8 @@ else
     if [[ "$RC" != "0" ]]; then
       if grep -qE "^error: .*context deadline exceeded|^error:.*timeout|context deadline exceeded" "$CLI_LOG" 2>/dev/null; then
         if [[ "$CONNECT_RETRIES" -gt 0 && "$CONNECT_ATTEMPTS" -lt "$CONNECT_RETRIES" ]]; then
-          kill $SP 2>/dev/null || true
-          kill -9 $SP 2>/dev/null || true
-          sudo ip netns exec "$NS" bash -lc "ulimit -n 1048576; '$BIN_DIR/quicfec-server' -addr ${SRV_IP}:$PORT -out '$OUT_DIR' -timeout ${SRV_TIMEOUT} -decode-ddl ${DECODE_DDL_MS}ms" >"$SRV_LOG" 2>&1 & SP=$!
+          stop_server
+          start_server >"$SRV_LOG" 2>&1 & SP=$!
           sleep 0.05
           continue
         fi
@@ -348,7 +409,12 @@ NETEM_SENT_PKTS=0
 NETEM_DROPPED_PKTS=0
 NETEM_SENT_BYTES=0
 if command -v tc >/dev/null 2>&1; then
-  netem_sent_line=$(tc -s qdisc show dev "$VETH_HOST" 2>/dev/null | awk '/qdisc netem 10:/{f=1} f && /Sent [0-9]+ bytes/{print; exit}')
+  if [[ "$PRIV_MODE" == "1" ]]; then
+    tc_stats_output=$(helper_call tc-stats "$VETH_HOST" 2>/dev/null || true)
+    netem_sent_line=$(printf '%s\n' "$tc_stats_output" | awk '/qdisc netem 10:/{f=1} f && /Sent [0-9]+ bytes/{print; exit}')
+  else
+    netem_sent_line=$(tc -s qdisc show dev "$VETH_HOST" 2>/dev/null | awk '/qdisc netem 10:/{f=1} f && /Sent [0-9]+ bytes/{print; exit}')
+  fi
   if [[ -n "$netem_sent_line" ]]; then
     NETEM_SENT_BYTES=$(echo "$netem_sent_line" | sed -n 's/.*Sent \([0-9]\+\) bytes.*/\1/p')
     NETEM_SENT_PKTS=$(echo "$netem_sent_line" | sed -n 's/.* bytes \([0-9]\+\) pkt.*/\1/p')
@@ -393,8 +459,8 @@ else
   done
 fi
 T_WAIT_OBS_END=$(date +%s%N)
-sleep 0.05; kill $SP 2>/dev/null || true
-sleep 0.05; kill -9 $SP 2>/dev/null || true
+sleep 0.05
+stop_server
 
 # Basic metrics
 T_MD5_START=$(date +%s%N)
