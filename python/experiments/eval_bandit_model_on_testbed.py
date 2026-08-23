@@ -395,13 +395,11 @@ def main() -> int:
     # Freeze posterior: never call agent.update(). Override RNG for reproducible evaluation.
     base_seed = int(args.seed)
 
-    # Precompute action onehots and mapping from a_idx to concrete (K,R0,RSTEP,ddl_ms).
+    # Precompute action onehots and mapping from a_idx to concrete (K,R0,RSTEP).
     k_values = list(action_set.k_values)
     r0_values = list(getattr(action_set, "r0_values", []))
     rstep_values = list(action_set.rstep_values)
-    ddl_ms_values = list(action_set.ddl_ms_values)
-
-    if not k_values or not r0_values or not rstep_values or not ddl_ms_values:
+    if not k_values or not r0_values or not rstep_values:
         raise SystemExit("checkpoint action_set missing factor values")
 
     action_onehots = np.asarray([action_set.get_onehot(i) for i in range(len(action_set))], dtype=np.float32)
@@ -527,7 +525,6 @@ def main() -> int:
                     K = int(k_values[int(a_spec.k_idx)])
                     R0 = int(r0_values[int(a_spec.r0_idx)])
                     RSTEP = int(rstep_values[int(a_spec.rstep_idx)])
-                    ddl_ms = int(ddl_ms_values[int(a_spec.ddl_idx)])
 
                     # Ensure OBS file doesn't carry stale observation.
                     try:
@@ -543,7 +540,6 @@ def main() -> int:
                         "K": str(int(K)),
                         "R0": str(int(R0)),
                         "RSTEP": str(int(RSTEP)),
-                        "DDL_MS": str(int(ddl_ms)),
                         "DECODE_DDL_MS": str(int(args.decode_ddl_ms)),
                         "SYMBOL_BYTES": str(int(args.symbol_bytes)),
                         "USE_ARQ": "1",
@@ -577,13 +573,13 @@ def main() -> int:
                     raw_obs.setdefault("ctrl_tx_nack_msgs", float(raw_obs.get("ctrl_tx_nack_msgs", 0.0) or 0.0))
 
                     # done_flag: treat success+on-time as 1.
-                    on_time_flag = 1 if (step_valid == 1 and dur_ms > 0 and dur_ms <= float(ddl_ms)) else 0
+                    auto_ddl_ms = int(float(raw_obs.get("auto_ddl_ms", 0.0) or 0.0))
+                    on_time_flag = 1 if (step_valid == 1 and dur_ms > 0 and auto_ddl_ms > 0 and dur_ms <= float(auto_ddl_ms)) else 0
                     raw_obs.setdefault("done_flag", float(on_time_flag))
 
                     # fec_rate: best-effort from action.
                     fec_rate = float(R0) / float(max(1, K))
                     raw_obs.setdefault("fec_rate", float(fec_rate))
-                    raw_obs.setdefault("ddl_ms", float(ddl_ms))
 
                     obs_vec = np.asarray(
                         [
@@ -592,11 +588,10 @@ def main() -> int:
                             float(raw_obs.get("ctrl_tx_nack_msgs", 0.0) or 0.0),
                             float(raw_obs.get("done_flag", 0.0) or 0.0),
                             float(raw_obs.get("fec_rate", 0.0) or 0.0),
-                            float(raw_obs.get("ddl_ms", ddl_ms) or ddl_ms),
                         ],
                         dtype=np.float64,
                     )
-                    ctx.update_from_obs(obs=obs_vec, ddl_ms=int(ddl_ms))
+                    ctx.update_from_obs(obs=obs_vec)
 
                     env_info: Dict[str, Any] = {
                         "step_valid": int(step_valid),
@@ -618,7 +613,6 @@ def main() -> int:
                             "K": int(K),
                             "R0": int(R0),
                             "RSTEP": int(RSTEP),
-                            "DDL_MS": int(ddl_ms),
                             "DECODE_DDL_MS": int(args.decode_ddl_ms),
                             "SYMBOL_BYTES": int(args.symbol_bytes),
                         },
@@ -628,7 +622,7 @@ def main() -> int:
                             "ctrl_tx_nack_msgs": float(raw_obs.get("ctrl_tx_nack_msgs", 0.0) or 0.0),
                             "done_flag": float(raw_obs.get("done_flag", 0.0) or 0.0),
                             "fec_rate": float(raw_obs.get("fec_rate", 0.0) or 0.0),
-                            "ddl_ms": float(raw_obs.get("ddl_ms", ddl_ms) or ddl_ms),
+                            "auto_ddl_ms": float(auto_ddl_ms),
                         },
                         "extra": {"run": kv},
                     }
@@ -647,13 +641,12 @@ def main() -> int:
                             "k_idx": int(a_spec.k_idx),
                             "r0_idx": int(a_spec.r0_idx),
                             "rstep_idx": int(a_spec.rstep_idx),
-                            "ddl_idx": int(a_spec.ddl_idx),
                             "K": int(K),
                             "R0": int(R0),
                             "RSTEP": int(RSTEP),
-                            "ddl_ms": int(ddl_ms),
+                            "auto_ddl_ms": int(auto_ddl_ms),
                         },
-                        ddl_ms=int(ddl_ms),
+                        ddl_ms=int(auto_ddl_ms),
                         context=[float(v) for v in list(np.asarray(x, dtype=np.float64).reshape(-1))],
                         env_info=env_info,
                     )
@@ -676,7 +669,7 @@ def main() -> int:
                             "K": int(K),
                             "R0": int(R0),
                             "RSTEP": int(RSTEP),
-                            "ddl_ms": int(ddl_ms),
+                            "ddl_ms": int(auto_ddl_ms),
                         }
                     )
 
@@ -685,7 +678,7 @@ def main() -> int:
                     # Short progress line.
                     print(
                         f"t={t_global:05d} rep={rep:02d} policy_rep={policy_rep} sender={sender_id} "
-                        f"loss={loss_mode} a={a_idx} K={K} R0={R0} RSTEP={RSTEP} ddl={ddl_ms} "
+                        f"loss={loss_mode} a={a_idx} K={K} R0={R0} RSTEP={RSTEP} auto_ddl={auto_ddl_ms} "
                         f"ok={step_valid} dur_ms={int(dur_ms)} ov={overhead_ratio:.3f}"
                     )
 
@@ -714,7 +707,6 @@ def main() -> int:
             "k_values": list(k_values),
             "r0_values": list(r0_values),
             "rstep_values": list(rstep_values),
-            "ddl_ms_values": list(ddl_ms_values),
             "n_actions": int(len(action_set)),
         },
     }

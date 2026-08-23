@@ -43,6 +43,13 @@ type SendAlgorithmEx interface {
 	OnAppLimited(bytesInFlight ByteCount)
 }
 
+// PacingRateProvider exposes the current sender pacing rate in bits per
+// second. It is intentionally optional: QUIC can continue to use congestion
+// controllers that don't expose a directly readable pacing rate.
+type PacingRateProvider interface {
+	PacingRateBps() uint64
+}
+
 // CongestionControlEx is kept as an alias for the terminology used by the
 // imported implementation.
 type CongestionControlEx = SendAlgorithmEx

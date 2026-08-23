@@ -979,6 +979,18 @@ func (h *sentPacketHandler) SetMaxDatagramSize(s protocol.ByteCount) {
 	h.congestion.SetMaxDatagramSize(s)
 }
 
+// PacingRateBps returns the latest congestion-controller pacing rate when
+// the selected controller exposes one. A zero return means unavailable.
+// This optional observation API is deliberately not part of SentPacketHandler
+// so existing test doubles and integrations remain valid.
+func (h *sentPacketHandler) PacingRateBps() uint64 {
+	p, ok := h.congestion.(congestion.PacingRateProvider)
+	if !ok {
+		return 0
+	}
+	return p.PacingRateBps()
+}
+
 func (h *sentPacketHandler) isAmplificationLimited() bool {
 	if h.peerAddressValidated {
 		return false

@@ -106,7 +106,6 @@ class ContextBuilder:
                     2: ctrl_tx_nack_msgs
                     3: done_flag
                     4: fec_rate
-                    5: ddl_ms
         """
 
         cfg = self.cfg
@@ -127,9 +126,6 @@ class ContextBuilder:
         nack = _get(2)
         done_flag = float(np.clip(_get(3), 0.0, 1.0))
         fec_rate = float(np.clip(_get(4), 0.0, 1.0))
-        # ddl_ms is included in the observation for logging/analysis; context does not
-        # depend on delay.
-        _ = int(max(1.0, _get(5))) if ddl_ms is None else int(ddl_ms)
         # Failure/late history: 1 - done_flag.
         fail_flag = 1.0 - float(done_flag)
 
@@ -143,7 +139,7 @@ class ContextBuilder:
 
         self._t += 1
 
-    def update(self, *, info: Dict[str, Any], ddl_ms: int) -> None:
+    def update(self, *, info: Dict[str, Any], ddl_ms: Optional[int] = None) -> None:
         """Backward-compatible update path.
 
         New training/evaluation should call `update_from_obs()`.
@@ -154,7 +150,7 @@ class ContextBuilder:
         raw_obs = info.get("raw_obs") if isinstance(info, dict) else None
         if isinstance(raw_obs, dict):
             # Expected obs layout (new):
-            #   0 goodput, 1 overhead, 2 nack, 3 done_flag, 4 fec_rate, 5 ddl_ms
+            #   0 goodput, 1 overhead, 2 nack, 3 done_flag, 4 fec_rate
             # If done_flag is missing (older logs), fall back to (1 - timeout_flag).
             goodput = float(
                 raw_obs.get(
@@ -169,8 +165,6 @@ class ContextBuilder:
                 timeout_flag = float(raw_obs.get("timeout_flag", 0.0))
                 done_flag = 1.0 - float(np.clip(timeout_flag, 0.0, 1.0))
             fec_rate = float(raw_obs.get("fec_rate", 0.0))
-            ddl_ms_raw = float(raw_obs.get("ddl_ms", ddl_ms))
-
             obs_vec = np.asarray(
                 [
                     goodput,
@@ -178,15 +172,14 @@ class ContextBuilder:
                     nack,
                     float(done_flag),
                     fec_rate,
-                    ddl_ms_raw,
                 ],
                 dtype=np.float64,
             )
-            self.update_from_obs(obs=obs_vec, ddl_ms=ddl_ms)
+            self.update_from_obs(obs=obs_vec)
             return
 
         # Fall back to the minimal safe behavior.
-        self.update_from_obs(obs=np.zeros((7,), dtype=np.float64), ddl_ms=ddl_ms)
+        self.update_from_obs(obs=np.zeros((5,), dtype=np.float64))
 
     def _push(self, xs: list, v: float) -> None:
         xs.append(float(v))

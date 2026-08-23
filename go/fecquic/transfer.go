@@ -34,17 +34,13 @@ const (
 
 // SendOptions control ClientSendFile behavior.
 type SendOptions struct {
-	K, N, L     int
-	InsecureTLS bool
-	DropProb    float64
-	Seed        int64
-	DialTimeout time.Duration // bounds dialing + QUIC handshake; 0 means "use ctx"
-	PaceEach    time.Duration
-	BlockPause  time.Duration
-	// RxDDL is the receiver ARQ soft deadline (DDL_MS), sent once in the FileHeader.
-	// The server applies it to schedule NACKs for seen blocks (idle-from-lastSymAt).
-	// 0 means "not specified".
-	RxDDL         time.Duration
+	K, N, L       int
+	InsecureTLS   bool
+	DropProb      float64
+	Seed          int64
+	DialTimeout   time.Duration // bounds dialing + QUIC handshake; 0 means "use ctx"
+	PaceEach      time.Duration
+	BlockPause    time.Duration
 	WarnDgramSize int           // bytes; 0 disables
 	PostWait      time.Duration // linger before closing
 	AckEvery      int           // write 1B on a stream every N datagrams (ack-eliciting); <=0 uses default
@@ -55,6 +51,28 @@ type SendOptions struct {
 	WindowW        int  // max unfinished clusters in flight (0=unlimited)
 	RStep          int  // minimum repairs per NACK
 	MaxAttempts    int  // max ARQ attempts per cluster (0=no cap)
+}
+
+// autoSoftDDL computes the receiver soft deadline from the sender-side QUIC
+// pacing estimate. rho is fixed to 1, so DDL = N * Delta.
+func autoSoftDDL(conn *quic.Conn, n, symbolBytes int) (uint32, time.Duration, uint64, error) {
+	if conn == nil || n <= 0 || symbolBytes <= 0 {
+		return 0, 0, 0, errors.New("invalid inputs for automatic soft DDL")
+	}
+	rate := conn.PacingRateBps()
+	delta := conn.PacingInterval(symbolBytes)
+	if rate == 0 || delta <= 0 {
+		return 0, 0, rate, errors.New("QUIC congestion controller has no usable pacing rate")
+	}
+	nominal := time.Duration(n) * delta
+	ddlMS := uint64((nominal + time.Millisecond - 1) / time.Millisecond)
+	if ddlMS == 0 {
+		ddlMS = 1
+	}
+	if ddlMS > uint64(^uint32(0)) {
+		ddlMS = uint64(^uint32(0))
+	}
+	return uint32(ddlMS), delta, rate, nil
 }
 
 // ClientSendFile connects and sends a file using QFEC header + RaptorQ symbols over datagrams.
@@ -157,6 +175,13 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	dialDur = time.Since(t0)
 	defer conn.CloseWithError(0, "done")
 
+	ddlMS, pacingDelta, pacingRate, err := autoSoftDDL(conn, N, L)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "[fec-auto-ddl] rho=1 n=%d symbol_bytes=%d pacing_bps=%d delta_us=%.3f ddl_ms=%d\n",
+		N, L, pacingRate, float64(pacingDelta)/float64(time.Microsecond), ddlMS)
+
 	// Send header on a stream
 	t0 = time.Now()
 	str, err := conn.OpenStreamSync(ctx)
@@ -164,9 +189,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		return err
 	}
 	hdr := FileHeader{Version: 1, FileSize: uint64(size), SHA256: sum, ChunkL: uint32(L)}
-	if opts.RxDDL > 0 {
-		hdr.RxDDLMS = uint32(opts.RxDDL.Milliseconds())
-	}
+	hdr.RxDDLMS = ddlMS
 	if _, err := str.Write(hdr.MarshalBinary()); err != nil {
 		return err
 	}

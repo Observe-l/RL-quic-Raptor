@@ -504,28 +504,22 @@ def _action_to_env_vars(
 ) -> Dict[str, str]:
     spec = action_set.get_action(a_idx)
     env_action = spec.to_env_action()
-    k_idx, r0_idx, rstep_idx, ddl_idx = (
+    k_idx, r0_idx, rstep_idx = (
         int(env_action[0]),
         int(env_action[1]),
         int(env_action[2]),
-        int(env_action[3]),
     )
 
     # New ActionSet semantics: indices are factor-level indices.
     K = int(action_set.k_values[int(k_idx)])
     R0 = int(action_set.r0_values[int(r0_idx)])
     RSTEP = int(action_set.rstep_values[int(rstep_idx)])
-    ddl_ms = int(action_set.ddl_ms_values[int(ddl_idx)])
-    if int(ddl_ms_override) > 0:
-        ddl_ms = int(ddl_ms_override)
-
     return {
         "K": str(int(K)),
         "SYMBOL_BYTES": str(int(symbol_bytes)),
         "R0": str(int(R0)),
         "W": os.environ.get("W", "8"),
         "RSTEP": str(int(RSTEP)),
-        "DDL_MS": str(int(ddl_ms)),
         "MAX_ATTEMPTS": os.environ.get("MAX_ATTEMPTS", "5"),
         "USE_ARQ": os.environ.get("USE_ARQ", "1"),
         "QUIC_FEC_CC_BYPASS": "0",
@@ -788,7 +782,6 @@ def main() -> int:
             symbol_bytes=int(args.symbol_bytes),
             ddl_ms_override=int(proto_ddl_ms),
         )
-        warmup_ddl_ms = int(warmup_env.get("DDL_MS", "150"))
         m_w, stderr_w = _run_one(
             method="bandit",
             loss_mode=loss_mode,
@@ -801,8 +794,8 @@ def main() -> int:
         )
         rl_obs = _extract_last_rl_observation(stderr_w)
         failed = bool(int(m_w["timed_out"]) or int(m_w["md5_ok"]) != 1)
-        obs_vec = _aligned_obs_vec_from_rl_observation(rl_obs=rl_obs, ddl_ms=int(warmup_ddl_ms), failed=failed)
-        ctx.update_from_obs(obs=obs_vec, ddl_ms=int(warmup_ddl_ms))
+        obs_vec = _aligned_obs_vec_from_rl_observation(rl_obs=rl_obs, ddl_ms=0, failed=failed)
+        ctx.update_from_obs(obs=obs_vec)
 
         for rep in range(int(args.reps)):
             # Bandit
@@ -813,7 +806,6 @@ def main() -> int:
                 symbol_bytes=int(args.symbol_bytes),
                 ddl_ms_override=int(proto_ddl_ms),
             )
-            ddl_ms_used = int(bandit_env.get("DDL_MS", "150"))
             m, stderr = _run_one(
                 method="bandit",
                 loss_mode=loss_mode,
@@ -826,8 +818,9 @@ def main() -> int:
             )
             rl_obs2 = _extract_last_rl_observation(stderr)
             failed2 = bool(int(m["timed_out"]) or int(m["md5_ok"]) != 1)
+            ddl_ms_used = int(float((rl_obs2 or {}).get("auto_ddl_ms", 0.0) or 0.0))
             obs_vec2 = _aligned_obs_vec_from_rl_observation(rl_obs=rl_obs2, ddl_ms=int(ddl_ms_used), failed=failed2)
-            ctx.update_from_obs(obs=obs_vec2, ddl_ms=int(ddl_ms_used))
+            ctx.update_from_obs(obs=obs_vec2)
             rows.append(
                 RunRow(
                     sender_id=int(sender_id),

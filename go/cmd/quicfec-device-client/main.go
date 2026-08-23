@@ -25,7 +25,6 @@ func main() {
 		K      = flag.Int("K", 26, "source symbols K")
 		R0     = flag.Int("R0", 6, "initial repair symbols R0 (N=K+R0)")
 		Rstep  = flag.Int("Rstep", 4, "ARQ minimum append per NACK")
-		ddlMS  = flag.Int("ddl-ms", 25, "receiver ARQ soft deadline (sent to server via header)")
 		L      = flag.Int("L", 1200, "symbol bytes L")
 		W      = flag.Int("W", 8, "ARQ window W (unfinished clusters)")
 		maxAtt = flag.Int("max-attempts", 5, "ARQ max attempts per cluster")
@@ -61,11 +60,6 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bad -L")
 		os.Exit(2)
 	}
-	if *ddlMS < 0 {
-		fmt.Fprintln(os.Stderr, "bad -ddl-ms")
-		os.Exit(2)
-	}
-
 	addr := net.JoinHostPort(*serverIP, strconv.Itoa(*serverPort))
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
@@ -85,7 +79,6 @@ func main() {
 		WindowW:        *W,
 		RStep:          *Rstep,
 		MaxAttempts:    *maxAtt,
-		RxDDL:          time.Duration(*ddlMS) * time.Millisecond,
 		DialTimeout:    *connectTO,
 		Transport:      "dgram",
 	}

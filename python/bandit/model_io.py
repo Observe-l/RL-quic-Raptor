@@ -75,7 +75,6 @@ def save_checkpoint(
         # Backward-compat: keep the old field name too.
         "r0_pct_values": getattr(action_set, "r0_pct_values", None),
         "rstep_values": action_set.rstep_values,
-        "ddl_ms_values": action_set.ddl_ms_values,
     }
 
     # ContextBuilder internal state (kept as JSON-friendly types).
@@ -137,11 +136,14 @@ def load_checkpoint(
         r0_values=action_set_meta.get("r0_values"),
         r0_pct_values=action_set_meta.get("r0_pct_values"),
         rstep_values=action_set_meta.get("rstep_values"),
-        ddl_ms_values=action_set_meta.get("ddl_ms_values"),
     )
 
     arr = np.load(npz_path)
     dim = int(np.asarray(arr["dim"]).reshape(-1)[0])
+    expected_dim = 1 + int(ContextBuilder(ctx_cfg).get_context().size) + int(action_set.onehot_dim)
+    expected_dim += int(ContextBuilder(ctx_cfg).get_context().size) * int(action_set.onehot_dim)
+    if dim != expected_dim:
+        raise ValueError(f"checkpoint feature dimension {dim} does not match current 3-factor action map dimension {expected_dim}")
     agent = LinTS(dim=dim, cfg=agent_cfg)
     agent.A = np.asarray(arr["A"], dtype=np.float64)
     agent.b = np.asarray(arr["b"], dtype=np.float64)

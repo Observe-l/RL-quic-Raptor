@@ -29,20 +29,22 @@ func main() {
 		ackEvery  = flag.Int("ack-every", 8, "write 1B on a stream every N datagrams (0=auto)")
 		transport = flag.String("transport", "dgram", "symbol transport: dgram|stream")
 		arq       = flag.Bool("arq", false, "enable ARQ control plane (NACK/ACK)")
-		rxDDL     = flag.Duration("rx-ddl", 0, "receiver ARQ soft deadline (DDL_MS) in ms (sent to server via header; 0=unspecified)")
 		R0        = flag.Int("R0", -1, "initial extra repairs (>=0 exact; -1=auto: N-K)")
 		W         = flag.Int("W", 8, "ARQ window W (unfinished clusters)")
 		Rstep     = flag.Int("Rstep", 4, "ARQ minimum append per NACK")
 		maxAtt    = flag.Int("max-attempts", 5, "ARQ max attempts per cluster")
 	)
 	flag.Parse()
+	if os.Getenv("QUIC_FEC_CC_ALGO") == "" {
+		_ = os.Setenv("QUIC_FEC_CC_ALGO", "bbrv2")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 	if *connectTO > 0 && *connectTO > *timeout {
 		// Avoid making connect-timeout the effective total timeout.
 		*connectTO = *timeout
 	}
-	opts := fecquic.SendOptions{K: *K, N: *N, L: *L, InsecureTLS: *insecure, DropProb: *loss, PaceEach: *pace, BlockPause: *blkPause, RxDDL: *rxDDL, WarnDgramSize: *warn, PostWait: *postWait, AckEvery: *ackEvery, Transport: *transport, UseARQ: *arq, InitialRepairs: *R0, WindowW: *W, RStep: *Rstep, MaxAttempts: *maxAtt, DialTimeout: *connectTO}
+	opts := fecquic.SendOptions{K: *K, N: *N, L: *L, InsecureTLS: *insecure, DropProb: *loss, PaceEach: *pace, BlockPause: *blkPause, WarnDgramSize: *warn, PostWait: *postWait, AckEvery: *ackEvery, Transport: *transport, UseARQ: *arq, InitialRepairs: *R0, WindowW: *W, RStep: *Rstep, MaxAttempts: *maxAtt, DialTimeout: *connectTO}
 	if err := fecquic.ClientSendFile(ctx, *addr, *alpn, *filePath, opts); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)

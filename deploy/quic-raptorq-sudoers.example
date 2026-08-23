@@ -1,6 +1,0 @@
-# Replace YOUR_USER with the normal Linux username before installing.
-# The helper must be installed root-owned at exactly this path.
-#
-# The helper validates its subcommands and never accepts an arbitrary shell
-# command. Do not replace it with a writable repository script.
-YOUR_USER ALL=(root) NOPASSWD: /usr/local/libexec/quicfec-net-helper *

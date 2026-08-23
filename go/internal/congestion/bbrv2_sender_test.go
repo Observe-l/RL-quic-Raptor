@@ -71,6 +71,7 @@ func TestBBRv2BatchEventProducesBandwidthAndPacingRate(t *testing.T) {
 
 	require.Positive(t, uint64(sender.BandwidthEstimate()))
 	require.Positive(t, uint64(sender.PacingRate()))
+	require.Equal(t, uint64(sender.PacingRate()), sender.PacingRateBps())
 	require.NotZero(t, sender.model.MinRtt())
 
 	for i := protocol.PacketNumber(20); i < 30; i++ {
@@ -87,4 +88,5 @@ func TestBBRv2BatchEventProducesBandwidthAndPacingRate(t *testing.T) {
 
 	require.Equal(t, ByteCount(packetSize), sender.model.TotalBytesLost())
 	require.Positive(t, uint64(sender.PacingRate()))
+	require.Equal(t, uint64(sender.PacingRate()), sender.PacingRateBps())
 }

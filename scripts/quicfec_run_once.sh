@@ -21,7 +21,7 @@ set -euo pipefail
 #               #   iid:5           (5% i.i.d. loss)
 #               #   gemodel:p,r,h,k (Gilbert-Elliott model, percents)
 #   FILE=$ROOT/go/test_data/train_FD001.txt
-#   K=40, SYMBOL_BYTES=1200, R0=6, W=8, DDL_MS=150, DECODE_DDL_MS=25, RSTEP=4, ACK_EVERY=8, MAX_ATTEMPTS=8
+#   K=40, SYMBOL_BYTES=1200, R0=6, W=8, DECODE_DDL_MS=25, RSTEP=4, ACK_EVERY=8, MAX_ATTEMPTS=8
 #   OBS_JSON=/tmp/quicfec_rl_${NS}.json
 #   POST_WAIT=0s (linger after client send; keep at 0s for fastest runs)
 #   SRV_TIMEOUT=10s (server max lifetime; lower keeps runs bounded)
@@ -54,7 +54,6 @@ K=${K:-30}
 SYMBOL_BYTES=${SYMBOL_BYTES:-1032}
 R0=${R0:-6}
 W=${W:-8}
-DDL_MS=${DDL_MS:-40}
 DECODE_DDL_MS=${DECODE_DDL_MS:-25}
 RSTEP=${RSTEP:-4}
 ALPHA=${ALPHA:-0.6}
@@ -113,8 +112,6 @@ helper_call() {
 }
 
 T_SCRIPT_START=$(date +%s%N)
-
-# DDL_MS already defaulted above; kept here historically but now intentionally a no-op.
 
 chmod +x "$ROOT/scripts"/*.sh || true
 mkdir -p "$ROOT/go/test_data" "$OUT_DIR"
@@ -299,7 +296,8 @@ T_SRV_READY=$(date +%s%N)
 
 # Run client (logs in /tmp/quic_fec_cli.*)
 CLI_LOG=$(mktemp -t quic_fec_cli.XXXXXX.log)
-export QUIC_FEC_CC_BYPASS=${QUIC_FEC_CC_BYPASS:-1}
+export QUIC_FEC_CC_BYPASS=${QUIC_FEC_CC_BYPASS:-0}
+export QUIC_FEC_CC_ALGO=${QUIC_FEC_CC_ALGO:-bbrv2}
 
 # Optional QUIC-layer stats (disabled by default to avoid affecting performance).
 # When enabled, fecquic.ClientSendFile prints one line: [fec-client-quic-stats] key=value...
@@ -338,7 +336,7 @@ if command -v timeout >/dev/null 2>&1; then
     timeout --signal=KILL ${TIMEOUT_S}s \
       "$BIN_DIR/quicfec-client" -addr ${SRV_IP}:$PORT -file "$FILE" -timeout ${TIMEOUT_S}s -connect-timeout ${CONNECT_TIMEOUT_S}s \
         -N $((K+R0)) -K "$K" -L "$SYMBOL_BYTES" \
-        -post-wait "$POST_WAIT" -ack-every "$ACK_EVERY" -dgram-warn 1400 -transport "$TRANSPORT" $arq_flag -rx-ddl ${DDL_MS}ms -R0 "$R0" -W "$W" -Rstep "$RSTEP" -max-attempts "$MAX_ATTEMPTS" -loss 0 $pace_arg \
+        -post-wait "$POST_WAIT" -ack-every "$ACK_EVERY" -dgram-warn 1400 -transport "$TRANSPORT" $arq_flag -R0 "$R0" -W "$W" -Rstep "$RSTEP" -max-attempts "$MAX_ATTEMPTS" -loss 0 $pace_arg \
         >"$CLI_LOG" 2>&1 || RC=$?
     RC=${RC:-0}
     if [[ "$RC" != "0" ]]; then
@@ -361,7 +359,7 @@ else
     unset RC || true
     "$BIN_DIR/quicfec-client" -addr ${SRV_IP}:$PORT -file "$FILE" -timeout ${TIMEOUT_S}s -connect-timeout ${CONNECT_TIMEOUT_S}s \
       -N $((K+R0)) -K "$K" -L "$SYMBOL_BYTES" \
-      -post-wait "$POST_WAIT" -ack-every "$ACK_EVERY" -dgram-warn 1400 -transport "$TRANSPORT" $arq_flag -rx-ddl ${DDL_MS}ms -R0 "$R0" -W "$W" -Rstep "$RSTEP" -max-attempts "$MAX_ATTEMPTS" -loss 0 $pace_arg \
+      -post-wait "$POST_WAIT" -ack-every "$ACK_EVERY" -dgram-warn 1400 -transport "$TRANSPORT" $arq_flag -R0 "$R0" -W "$W" -Rstep "$RSTEP" -max-attempts "$MAX_ATTEMPTS" -loss 0 $pace_arg \
       >"$CLI_LOG" 2>&1 || RC=$?
     RC=${RC:-0}
     if [[ "$RC" != "0" ]]; then
@@ -505,15 +503,17 @@ fi
 # except residual_erasures are sourced from the sender (client) logs.
 KEEP_LOGS=0
 CC_EST=$(grep -E '^\[cc-estimate\] ' "$CLI_LOG" | tail -n1 || true)
+AUTO_DDL=$(grep -E '^\[fec-auto-ddl\] ' "$CLI_LOG" | tail -n1 || true)
 ARQ_STATS=$(grep -E '^\[arq-stats\] ' "$CLI_LOG" | tail -n1 || true)
 CLI_STAGES=$(grep -E '^\[fec-client-stages\] ' "$CLI_LOG" | tail -n1 || true)
-MERGED_LINE=$(RL_OBS_LINE="$RL_OBS" CC_EST_LINE="$CC_EST" ARQ_STATS_LINE="$ARQ_STATS" CLI_STAGES_LINE="$CLI_STAGES" FILE_SIZE="$FILE_SIZE" K_VAL="$K" R0_VAL="$R0" DDL_MS_VAL="$DDL_MS" MD5_OK_VAL="$MD5_OK" TIMED_OUT_VAL="$TIMED_OUT" python3 - <<'PY'
+MERGED_LINE=$(RL_OBS_LINE="$RL_OBS" CC_EST_LINE="$CC_EST" AUTO_DDL_LINE="$AUTO_DDL" ARQ_STATS_LINE="$ARQ_STATS" CLI_STAGES_LINE="$CLI_STAGES" FILE_SIZE="$FILE_SIZE" K_VAL="$K" R0_VAL="$R0" MD5_OK_VAL="$MD5_OK" TIMED_OUT_VAL="$TIMED_OUT" python3 - <<'PY'
 import json
 import os
 import sys
 
 line = os.environ.get('RL_OBS_LINE', '')
 cc = os.environ.get('CC_EST_LINE', '')
+auto_ddl = os.environ.get('AUTO_DDL_LINE', '')
 arq = os.environ.get('ARQ_STATS_LINE', '')
 stg = os.environ.get('CLI_STAGES_LINE', '')
 
@@ -531,11 +531,6 @@ try:
   R0 = int(os.environ.get('R0_VAL', '0') or '0')
 except Exception:
   R0 = 0
-
-try:
-  ddl_ms = int(os.environ.get('DDL_MS_VAL', '0') or '0')
-except Exception:
-  ddl_ms = 0
 
 try:
   md5_ok = int(os.environ.get('MD5_OK_VAL', '1') or '1')
@@ -564,7 +559,6 @@ payload = {
   'arq_attempts_mean': 0.0,
   'residual_erasures': int(residual_erasures),
   'fec_rate': float(R0) / float(max(1, K)),
-  'ddl_ms': float(max(0, ddl_ms)),
   # Validity markers (not used by the policy; env uses them to ignore invalid runs).
   'md5_ok': int(md5_ok),
   'timed_out': int(timed_out),
@@ -630,6 +624,15 @@ if isinstance(ccj, dict):
   mode = ccj.get('mode', None)
   if mode is not None:
     payload['cc_mode'] = mode
+
+autoj = parse_kv_line('[fec-auto-ddl]', auto_ddl)
+if isinstance(autoj, dict):
+  if 'ddl_ms' in autoj:
+    payload['auto_ddl_ms'] = float(autoj['ddl_ms'])
+  if 'delta_us' in autoj:
+    payload['pacing_delta_us'] = float(autoj['delta_us'])
+  if 'pacing_bps' in autoj:
+    payload['pacing_rate_bps'] = float(autoj['pacing_bps'])
 
 # Merge sender-side FEC tx counters / overhead from the client.
 arqj = parse_kv_line('[arq-stats]', arq)

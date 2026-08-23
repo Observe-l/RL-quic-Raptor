@@ -7,6 +7,7 @@ package congestion
 import (
 	"fmt"
 	"math"
+	"sync/atomic"
 	"time"
 
 	"github.com/quic-go/quic-go/logging"
@@ -48,6 +49,9 @@ type BBR2Sender struct {
 
 	// Current pacing rate.
 	pacingRate Bandwidth
+	// Atomic snapshot for application-level readers (e.g. FEC deadline
+	// calculation). The congestion-control loop still uses pacingRate directly.
+	pacingRateSnapshot atomic.Uint64
 
 	// Cwnd limits.
 	cwndLimits Limits
@@ -143,6 +147,7 @@ func newBBR2SenderWithInitialRTT(
 		params:      params,
 		clock:       clock,
 	}
+	s.pacingRateSnapshot.Store(uint64(s.pacingRate))
 
 	// Initialize pacer with a callback to get the current pacing rate
 	s.pacer = newBBRv2Pacer(func() Bandwidth {
@@ -150,6 +155,11 @@ func newBBR2SenderWithInitialRTT(
 	}, maxDatagramSize)
 
 	return s
+}
+
+func (s *BBR2Sender) setPacingRate(rate Bandwidth) {
+	s.pacingRate = rate
+	s.pacingRateSnapshot.Store(uint64(rate))
 }
 
 // initialPacingRate calculates the initial pacing rate.
@@ -382,7 +392,7 @@ func (s *BBR2Sender) SetMaxDatagramSize(size ByteCount) {
 	s.initialCwnd = ByteCount(float64(s.initialCwnd) * factor)
 
 	if s.params.ScalePacingRateByMss {
-		s.pacingRate = s.pacingRate.Mul(factor)
+		s.setPacingRate(s.pacingRate.Mul(factor))
 	}
 
 	s.maxDatagramSize = size
@@ -405,6 +415,13 @@ func (s *BBR2Sender) InRecovery() bool {
 // PacingRate returns the current pacing rate.
 func (s *BBR2Sender) PacingRate() Bandwidth {
 	return s.pacingRate
+}
+
+// PacingRateBps returns the latest pacing rate in bits per second. The
+// snapshot is safe to read from the application/FEC sender goroutine while
+// the QUIC event loop updates the congestion controller.
+func (s *BBR2Sender) PacingRateBps() uint64 {
+	return s.pacingRateSnapshot.Load()
 }
 
 // BandwidthEstimate returns the current bandwidth estimate.
@@ -499,14 +516,14 @@ func (s *BBR2Sender) updatePacingRate(bytesAcked ByteCount) {
 
 	if s.model.TotalBytesAcked() == bytesAcked {
 		// After the first ACK, cwnd is still the initial congestion window.
-		s.pacingRate = BandwidthFromBytesAndTimeDelta(s.cwnd, s.model.MinRtt())
+		s.setPacingRate(BandwidthFromBytesAndTimeDelta(s.cwnd, s.model.MinRtt()))
 
 		if s.params.InitialPacingRateBytesPerSecond != nil {
 			// Do not allow the pacing rate calculated from the first RTT
 			// measurement to be higher than the configured initial pacing rate.
 			initialRate := BandwidthFromBytesPerSecond(*s.params.InitialPacingRateBytesPerSecond)
 			if s.pacingRate > initialRate {
-				s.pacingRate = initialRate
+				s.setPacingRate(initialRate)
 			}
 		}
 		return
@@ -514,25 +531,25 @@ func (s *BBR2Sender) updatePacingRate(bytesAcked ByteCount) {
 
 	targetRate := bandwidthEstimate.Mul(s.model.PacingGain())
 	if s.model.FullBandwidthReached() {
-		s.pacingRate = targetRate
+		s.setPacingRate(targetRate)
 		return
 	}
 
 	if s.params.DecreaseStartupPacingAtEndOfRound &&
 		s.model.PacingGain() < s.params.StartupPacingGain {
-		s.pacingRate = targetRate
+		s.setPacingRate(targetRate)
 		return
 	}
 
 	if s.params.BwLoMode != BwLoModeDefault &&
 		s.model.LossEventsInRound() > 0 {
-		s.pacingRate = targetRate
+		s.setPacingRate(targetRate)
 		return
 	}
 
 	// By default, the pacing rate never decreases in STARTUP.
 	if targetRate > s.pacingRate {
-		s.pacingRate = targetRate
+		s.setPacingRate(targetRate)
 	}
 }
 

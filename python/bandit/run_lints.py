@@ -269,7 +269,7 @@ def main() -> int:
     ap.add_argument("--lints-lam", type=float, default=1.0)
     ap.add_argument("--lints-sigma", type=float, default=0.2)
     ap.add_argument("--lints-rho", type=float, default=0.99)
-    ap.add_argument("--lints-recompute", type=int, default=20)
+    ap.add_argument("--lints-recompute", type=int, default=100)
     ap.add_argument("--seed", type=int, default=0)
 
     ap.add_argument("--result-dir", type=str, default=None, help="directory to write bandit_metrics.json")
@@ -334,7 +334,6 @@ def main() -> int:
         "bitrate_mbps": int(args.bitrate_mbps),
         "timeout_sec": int(args.timeout_sec),
         "train_file_bytes": int(args.train_file_bytes),
-        "ddl_ms_values": [25, 40, 55, 70],
         "k_values": list(range(20, 61, 2)),
         "r0_values": list(range(0, 21, 2)),
         "rstep_values": list(range(0, 21, 2)),
@@ -373,8 +372,7 @@ def main() -> int:
             loaded_from = str(load_prefix)
 
     if loaded_from is None:
-        ddl_ms_values = [25, 40, 55, 70]
-        action_set = ActionSet(ddl_ms_values=ddl_ms_values)
+        action_set = ActionSet()
         ctx_cfg = ContextConfig(ewma_alpha=float(args.ctx_alpha), window=int(args.ctx_window))
         ctx = ContextBuilder(ctx_cfg)
 
@@ -400,16 +398,22 @@ def main() -> int:
         k_n = int(len(action_set.k_values))
         r0_n = int(len(getattr(action_set, "r0_values", [])))
         rs_n = int(len(action_set.rstep_values))
-        ddl_n = int(len(action_set.ddl_ms_values))
         print(
-            f"[bandit] action_set: n={n_actions} = K({k_n})*R0({r0_n})*RSTEP({rs_n})*DDL({ddl_n}); "
-            f"ddl_ms_values={list(action_set.ddl_ms_values)}"
+            f"[bandit] action_set: n={n_actions} = K({k_n})*R0({r0_n})*RSTEP({rs_n})"
         )
     except Exception:
         pass
 
     print(
         "note: reward overhead term uses fec_overhead = quic_overhead_ratio = max(0,(quic_sent_bytes-file_bytes)/file_bytes)"
+    )
+
+    # Action features are independent of the context. Cache only the compact
+    # [num_actions, action_feature_dim] matrix; the full [num_actions, dim]
+    # Phi matrix is reconstructed implicitly inside LinTS selection.
+    action_features = np.asarray(
+        [action_set.get_onehot(i) for i in range(len(action_set))],
+        dtype=np.float64,
     )
 
     # Breakpoint semantics: --steps is treated as the target total step index.
@@ -542,11 +546,10 @@ def main() -> int:
                 a_idx = int(np.random.RandomState(int(args.seed) + t).randint(0, len(action_set)))
                 theta = None
             else:
-                # Build Phi for all candidate actions.
-                Phi = np.zeros((len(action_set), agent.dim), dtype=np.float32)
-                for i, _a in action_set.iter_actions():
-                    Phi[i, :] = phi_fn(x=x, a_onehot=action_set.get_onehot(i))
-                a_idx, theta = agent.select(Phi)
+                a_idx, theta = agent.select_action_features(
+                    x=x,
+                    action_features=action_features,
+                )
 
             a = action_set.get_action(a_idx)
             env_action = a.to_env_action()
@@ -568,10 +571,7 @@ def main() -> int:
                 continue
             invalid_skips = 0
 
-            # Convert ddl_idx back to ddl_ms for context update
-            ddl_ms_values = list(action_set.ddl_ms_values)
-            ddl_ms = int(ddl_ms_values[int(a.ddl_idx)])
-            ctx.update_from_obs(obs=obs, ddl_ms=int(ddl_ms))
+            ctx.update_from_obs(obs=obs)
 
             if int(t) >= warmup:
                 ph = phi_fn(x=x, a_onehot=action_set.get_onehot(a_idx))
@@ -585,9 +585,7 @@ def main() -> int:
                     "k_idx": int(a.k_idx),
                     "r0_idx": int(a.r0_idx),
                     "rstep_idx": int(a.rstep_idx),
-                    "ddl_idx": int(a.ddl_idx),
                 },
-                "ddl_ms": int(ddl_ms),
                 "context": [float(v) for v in x.tolist()],
                 "env_info": info,
                 "active_loss_mode": str(active_loss_mode),

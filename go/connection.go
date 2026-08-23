@@ -2627,6 +2627,30 @@ func (c *Conn) SendDatagram(p []byte) error {
 	return c.datagramQueue.Add(f)
 }
 
+// PacingRateBps returns the current sender-side congestion-control pacing rate
+// in bits per second. A zero value means that no usable estimate is available.
+func (c *Conn) PacingRateBps() uint64 {
+	if p, ok := c.sentPacketHandler.(interface{ PacingRateBps() uint64 }); ok {
+		return p.PacingRateBps()
+	}
+	return 0
+}
+
+// PacingInterval returns the nominal pacing interval for a payload of bytes
+// bytes, based on the current congestion-control pacing rate.
+func (c *Conn) PacingInterval(bytes int) time.Duration {
+	if bytes <= 0 {
+		return 0
+	}
+	rate := c.PacingRateBps()
+	if rate == 0 {
+		return 0
+	}
+	bits := uint64(bytes) * 8
+	nanos := uint64(time.Second)
+	return time.Duration((bits*nanos + rate - 1) / rate)
+}
+
 // ReceiveDatagram gets a message received in a QUIC datagram, as specified in RFC 9221.
 func (c *Conn) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 	if !c.config.EnableDatagrams {
