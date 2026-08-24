@@ -24,7 +24,8 @@ class ActionSet:
     Notes on discretization:
     - This project uses a discrete MultiDiscrete action space.
     - Indices are factor level indices (0..n-1), mapped by `FecEnv` using the
-      exact K/R0/RSTEP factor level arrays.
+      exact K/R0/RSTEP factor level arrays. RSTEP is the extra repair margin
+      appended to the deficit computed from each NACK.
     """
 
     def __init__(

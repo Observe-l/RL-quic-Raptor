@@ -2,7 +2,6 @@ package fecquic
 
 import (
 	bytespkg "bytes"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -55,7 +54,7 @@ type writeTask struct {
 
 // rxBlock holds per-block state.
 type rxBlock struct {
-	id       uint16
+	id       uint32
 	t0       time.Time
 	K, N, L  int
 	dataSize int // exact bytes for this block (last block may be partial)
@@ -117,10 +116,10 @@ type rxManager struct {
 	// blockSpan is the base block size in bytes for file offsets: baseK*L.
 	// It is set when the first symbol arrives (when m.K becomes known).
 	blockSpan atomic.Int64
-	blocks    map[uint16]*rxBlock
+	blocks    map[uint32]*rxBlock
 	// completed remembers blocks that have already been fully decoded and written,
 	// so late-arriving symbols for those blocks are ignored instead of recreating state.
-	completed map[uint16]struct{}
+	completed map[uint32]struct{}
 
 	// queues
 	decodeQ chan *rxBlock
@@ -189,8 +188,8 @@ func newRXManager(fileSize uint64, K, L int, outDir, baseName string, rx RXOptio
 		L:         L,
 		outDir:    outDir,
 		baseName:  baseName,
-		blocks:    make(map[uint16]*rxBlock),
-		completed: make(map[uint16]struct{}),
+		blocks:    make(map[uint32]*rxBlock),
+		completed: make(map[uint32]struct{}),
 		decodeQ:   make(chan *rxBlock, 1024),
 		writeQ:    make(chan writeTask, 8192),
 		stopCh:    make(chan struct{}),
@@ -403,14 +402,7 @@ func (m *rxManager) start(rx RXOptions) {
 					// ACK success to sender if ctrl available
 					if m.ctrlOut != nil {
 						var buf bytespkg.Buffer
-						_ = writeAck(&buf, AckSuccess{
-							FileID:          0,
-							ClusterID:       uint32(b.id),
-							AttemptIdx:      uint16(attemptIdx),
-							RxUnique:        uint16(rxUnique),
-							UsedRepairs:     uint16(usedRep),
-							DecodeLatencyMs: uint32(time.Since(t0).Milliseconds()),
-						})
+						_ = writeAck(&buf, AckSuccess{BlockID: uint32(b.id)})
 						payload := buf.Bytes()
 						dropped := false
 						select {
@@ -456,14 +448,6 @@ func (m *rxManager) start(rx RXOptions) {
 			}
 		}
 		minUnseenNack := 200 * time.Millisecond
-		recSeenMax := 4
-		recSeenMaxEnvSet := false
-		if v := os.Getenv("QUIC_FEC_ARQ_REC_SEEN_MAX"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				recSeenMax = n
-				recSeenMaxEnvSet = true
-			}
-		}
 		for {
 			select {
 			case <-m.stopCh:
@@ -473,10 +457,9 @@ func (m *rxManager) start(rx RXOptions) {
 			now := time.Now()
 			// collect work outside the lock
 			type nackMsg struct {
-				blockID uint16
+				blockID uint32
 				attempt int
 				rxu     int
-				rec     int
 				send    bool
 			}
 			var toDecode []*rxBlock
@@ -488,15 +471,10 @@ func (m *rxManager) start(rx RXOptions) {
 				}
 				if now.After(b.nextDDL) || now.Equal(b.nextDDL) {
 					nextDDL := now.Add(m.ddl)
-					// Calculate NACK recommendation under lock for deficit cases.
+					// Calculate the number of symbols still needed to reach K+1.
 					if m.ctrlOut != nil {
 						rxu := b.srcSeenCount + len(b.syms)
-						deficit := b.K - rxu
-						// If decoding is failing despite rx_unique>=K, treat as a small
-						// effective deficit so we continue ARQ for extra repairs.
-						if deficit <= 0 && b.decodeFailed {
-							deficit = 2
-						}
+						deficit := b.K + 1 - rxu
 						if deficit > 0 {
 							// Seen-block soft deadline:
 							// Count from lastSymAt (refreshed on every arrival). If idle for softDDL,
@@ -599,51 +577,7 @@ func (m *rxManager) start(rx RXOptions) {
 								// repeated decode-failure-driven NACKs from persisting after new symbols arrive.
 								// It will be re-set by the decode worker if decode still fails.
 								b.decodeFailed = false
-								// Recommend repairs.
-								// - Unseen placeholders (no symbols received at all): request a small bootstrap.
-								// - Seen blocks: scale up with deficit/attempt to reduce multi-round ARQ.
-								rec := deficit
-								if b.firstSeen.IsZero() {
-									// Unseen block (no symbols observed): bootstrap more aggressively than a fixed 4.
-									// This avoids many RTT-rounds and improves success when an entire block is
-									// erased by a burst and R0 is small.
-									unseenCap := 4
-									if b.K > 0 {
-										unseenCap = b.K / 2
-									}
-									if unseenCap < 4 {
-										unseenCap = 4
-									}
-									if unseenCap > 20 {
-										unseenCap = 20
-									}
-									if rec < 1 {
-										rec = 1
-									}
-									if rec > unseenCap {
-										rec = unseenCap
-									}
-								} else {
-									seenCap := recSeenMax
-									if !recSeenMaxEnvSet {
-										// Default cap scales with block size so larger K doesn't require dozens
-										// of RTT-rounds to fill a big deficit (which causes overhead spikes).
-										seenCap = b.K / 4
-										if seenCap < 4 {
-											seenCap = 4
-										}
-										if seenCap > 20 {
-											seenCap = 20
-										}
-									}
-									if rec < 1 {
-										rec = 1
-									}
-									if rec > seenCap {
-										rec = seenCap
-									}
-								}
-								nacks = append(nacks, nackMsg{blockID: b.id, attempt: b.attempt, rxu: rxu, rec: rec, send: true})
+								nacks = append(nacks, nackMsg{blockID: b.id, attempt: b.attempt, rxu: rxu, send: true})
 								// Update per-block debounce state.
 								if b.firstSeen.IsZero() {
 									b.unseenNackSent = true
@@ -707,12 +641,9 @@ func (m *rxManager) start(rx RXOptions) {
 				}
 				var buf bytespkg.Buffer
 				_ = writeNack(&buf, NackNeedMore{
-					FileID:         0,
-					ClusterID:      uint32(n.blockID),
-					AttemptIdx:     uint16(n.attempt),
-					RxUnique:       uint16(n.rxu),
-					RecommendExtra: uint16(n.rec),
-					Reason:         0,
+					BlockID:    n.blockID,
+					AttemptIdx: uint16(n.attempt),
+					RecvCount:  uint16(n.rxu),
 				})
 				payload := buf.Bytes()
 				dropped := false
@@ -742,7 +673,7 @@ func (m *rxManager) start(rx RXOptions) {
 				if m.met != nil {
 					m.met.OnCtrlTx(len(payload), "nack", dropped)
 				}
-				fmt.Fprintf(os.Stderr, "[arq] nack block=%d rx_unique=%d rec_extra=%d attempt=%d\n", n.blockID, n.rxu, n.rec, n.attempt)
+				fmt.Fprintf(os.Stderr, "[arq] nack block=%d recv_count=%d attempt=%d\n", n.blockID, n.rxu, n.attempt)
 			}
 			for _, b := range toDecode {
 				// during shutdown, avoid blocking or panicking on closed decodeQ
@@ -767,11 +698,24 @@ func (m *rxManager) start(rx RXOptions) {
 }
 
 // ingest one symbol; returns whether accepted.
-func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, dataSize int) bool {
+func (m *rxManager) ingest(blockID uint32, esi int, N, K, L int, data []byte, dataSize int) bool {
 	// Record receive activity early (even if this symbol is later dropped as duplicate)
 	// so the scheduler doesn't send unseen-block NACKs while traffic is ongoing.
 	m.lastRxAt.Store(time.Now().UnixNano())
 	isRepair := esi >= K
+	if L <= 0 || len(data) > L {
+		return false
+	}
+	// DATAGRAM mode gives us the actual payload length. Source symbols may be
+	// shorter than L (most notably the final source symbol of the file); the
+	// systematic fast path already stores them into a zero-initialized K*L
+	// buffer. Repairs, however, are passed directly to the FEC decoder and
+	// therefore must be explicitly padded to exactly L bytes.
+	if isRepair && len(data) < L {
+		padded := make([]byte, L)
+		copy(padded, data)
+		data = padded
+	}
 	m.mu.Lock()
 	// On first observed symbol, record global K and compute total blocks.
 	if m.K == 0 && K > 0 {
@@ -785,7 +729,7 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 		// Pre-create placeholders for all expected blocks to enable early ARQ on missing ones.
 		if !m.seeded && m.totalBlocks > 0 && m.ctrlOut != nil {
 			for i := 0; i < m.totalBlocks; i++ {
-				bid := uint16(i)
+				bid := uint32(i)
 				if _, ok := m.blocks[bid]; !ok {
 					now := time.Now()
 					m.blocks[bid] = &rxBlock{
@@ -855,7 +799,7 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 		m.maxSeen = int(blockID)
 		if blockID > 0 && m.ctrlOut != nil && m.K > 0 && m.L > 0 {
 			for i := 0; i < int(blockID); i++ {
-				bid := uint16(i)
+				bid := uint32(i)
 				if _, ok := m.blocks[bid]; !ok {
 					now := time.Now()
 					m.blocks[bid] = &rxBlock{
@@ -879,7 +823,7 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 			m.maxSeen = int(blockID)
 			if prev >= 0 && m.ctrlOut != nil && m.K > 0 && m.L > 0 {
 				for i := prev + 1; i < int(blockID); i++ {
-					bid := uint16(i)
+					bid := uint32(i)
 					if _, ok := m.blocks[bid]; !ok {
 						now := time.Now()
 						m.blocks[bid] = &rxBlock{
@@ -1048,7 +992,7 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 	var sysUsedRep int
 	var sysAttempt int
 	var sysFirstSeen time.Time
-	var sysBlockID uint16
+	var sysBlockID uint32
 	if !b.done && b.srcBuf != nil && b.srcSeenCount >= K && K > 0 {
 		if b.dataSize > 0 && b.dataSize <= len(b.srcBuf) {
 			sysBuf = b.srcBuf[:b.dataSize]
@@ -1088,14 +1032,7 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 		}
 		if m.ctrlOut != nil {
 			var buf bytespkg.Buffer
-			_ = writeAck(&buf, AckSuccess{
-				FileID:          0,
-				ClusterID:       uint32(sysBlockID),
-				AttemptIdx:      uint16(sysAttempt),
-				RxUnique:        uint16(sysRxUnique),
-				UsedRepairs:     uint16(sysUsedRep),
-				DecodeLatencyMs: 0,
-			})
+			_ = writeAck(&buf, AckSuccess{BlockID: uint32(sysBlockID)})
 			payload := buf.Bytes()
 			dropped := false
 			select {
@@ -1162,7 +1099,7 @@ func (m *rxManager) ingest(blockID uint16, esi int, N, K, L int, data []byte, da
 	return true
 }
 
-func (m *rxManager) closeAndFinalize(expectedSHA [32]byte) (string, error) {
+func (m *rxManager) closeAndFinalize() (string, error) {
 	// stop scheduling, finish decoders, then drain writer
 	close(m.stopCh)
 	// wait for all decoders and scheduler to finish (they observe stopCh)
@@ -1180,58 +1117,6 @@ func (m *rxManager) closeAndFinalize(expectedSHA [32]byte) (string, error) {
 		return "", err
 	}
 	finalPath := filepath.Join(m.outDir, filepath.Base(m.tmpPath[:len(m.tmpPath)-5]))
-	// Match raw QUIC behavior: do not reread the output file unless the sender
-	// explicitly provided a non-zero SHA256 to verify.
-	var zero [32]byte
-	if expectedSHA == zero {
-		if err := os.Rename(m.tmpPath, finalPath); err != nil {
-			return "", err
-		}
-		return finalPath, nil
-	}
-	// Verify SHA by reopening file
-	out, err := os.Open(m.tmpPath)
-	if err != nil {
-		return "", err
-	}
-	sum, _, err := ComputeSHA256(out)
-	_ = out.Close()
-	if err != nil {
-		return "", err
-	}
-	if sum != expectedSHA {
-		// Diagnostics: report number of pending (unfinished) blocks and their rx_unique
-		func() {
-			m.mu.Lock()
-			defer m.mu.Unlock()
-			pending := len(m.blocks)
-			if pending > 0 {
-				fmt.Fprintf(os.Stderr, "[rx-finalize] pending_blocks=%d\n", pending)
-				i := 0
-				for _, b := range m.blocks {
-					fmt.Fprintf(os.Stderr, "[rx-finalize] block=%d rx_unique=%d K=%d attempts=%d\n", b.id, len(b.syms), b.K, b.attempt)
-					i++
-					if i >= 8 {
-						break
-					}
-				}
-			}
-			// Also, if we know totalBlocks, list a few missing block IDs with zero symbols.
-			if m.totalBlocks > 0 {
-				missing := 0
-				for i := 0; i < m.totalBlocks && missing < 8; i++ {
-					bid := uint16(i)
-					if _, ok := m.blocks[bid]; !ok {
-						if _, done := m.completed[bid]; !done {
-							fmt.Fprintf(os.Stderr, "[rx-finalize] missing_block=%d rx_unique=0\n", bid)
-							missing++
-						}
-					}
-				}
-			}
-		}()
-		return "", errors.New("sha256 mismatch")
-	}
 	if err := os.Rename(m.tmpPath, finalPath); err != nil {
 		return "", err
 	}

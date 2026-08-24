@@ -30,7 +30,7 @@ func main() {
 		arq       = flag.Bool("arq", false, "enable ARQ control plane (NACK/ACK)")
 		R0        = flag.Int("R0", -1, "initial extra repairs (>=0 exact; -1=auto: N-K)")
 		W         = flag.Int("W", 8, "ARQ window W (unfinished clusters)")
-		Rstep     = flag.Int("Rstep", 4, "ARQ extra repairs appended per NACK (0 allowed; <0 uses default)")
+		Rstep     = flag.Int("Rstep", 4, "extra repair symbols appended to each NACK response")
 		maxAtt    = flag.Int("max-attempts", 0, "ARQ max attempts per cluster (0=unlimited)")
 
 		devRetx   = flag.Bool("dev-retx", true, "enable QUIC retransmission reason logging (requires build tag quicfecdev)")

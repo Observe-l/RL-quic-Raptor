@@ -4,41 +4,39 @@ import (
 	"encoding/binary"
 )
 
-// FECScheme identifiers used on the wire.
+// Type values are shared across the QFEC wire records. The transport
+// context still determines which record parser is used.
 const (
-	SchemeRLC     uint8 = 0
-	SchemeRS      uint8 = 1
-	SchemePolar   uint8 = 2
-	SchemeRaptorQ uint8 = 3
+	TypeQFECHeader uint8 = 1
+	TypeFECSymbol  uint8 = 2
+	TypeACK        uint8 = 3
+	TypeNACK       uint8 = 4
+	TypeDONE       uint8 = 5
 )
 
 type FECHeader struct {
-	Version    uint8  // 1
-	Scheme     uint8  // 0=RLC,1=RS,2=Polar,3=RaptorQ
-	BlockID    uint16 // per-block counter
-	N          uint8
-	K          uint8
-	SymID      uint8  // 0..N-1 position in codeword
-	Flags      uint8  // reserved
-	PayloadLen uint32 // L bytes (symbol length)
-	SeedOrIdx  uint32 // RLC seed or RS column index or reserved
+	Type    uint8  // TypeFECSymbol
+	BlockID uint32 // per-block counter
+	N       uint8
+	K       uint8
+	SymID   uint8 // 0..N-1 position in codeword
 }
 
-const HeaderLen = 1 + 1 + 2 + 1 + 1 + 1 + 1 + 4 + 4
+// HeaderLen is the fixed FEC symbol header size. The payload occupies the
+// remainder of a DATAGRAM and its length is derived from the received
+// datagram length. For stream compatibility, the sender/receiver use the
+// QFEC file header's ChunkL as the fixed payload size.
+const HeaderLen = 1 + 4 + 1 + 1 + 1
 
 func (h *FECHeader) MarshalBinary(b []byte) []byte {
 	if len(b) < HeaderLen {
 		b = make([]byte, HeaderLen)
 	}
-	b[0] = h.Version
-	b[1] = h.Scheme
-	binary.LittleEndian.PutUint16(b[2:4], h.BlockID)
-	b[4] = h.N
-	b[5] = h.K
-	b[6] = h.SymID
-	b[7] = h.Flags
-	binary.LittleEndian.PutUint32(b[8:12], h.PayloadLen)
-	binary.LittleEndian.PutUint32(b[12:16], h.SeedOrIdx)
+	b[0] = h.Type
+	binary.LittleEndian.PutUint32(b[1:5], h.BlockID)
+	b[5] = h.N
+	b[6] = h.K
+	b[7] = h.SymID
 	return b[:HeaderLen]
 }
 
@@ -46,14 +44,10 @@ func (h *FECHeader) UnmarshalBinary(b []byte) bool {
 	if len(b) < HeaderLen {
 		return false
 	}
-	h.Version = b[0]
-	h.Scheme = b[1]
-	h.BlockID = binary.LittleEndian.Uint16(b[2:4])
-	h.N = b[4]
-	h.K = b[5]
-	h.SymID = b[6]
-	h.Flags = b[7]
-	h.PayloadLen = binary.LittleEndian.Uint32(b[8:12])
-	h.SeedOrIdx = binary.LittleEndian.Uint32(b[12:16])
+	h.Type = b[0]
+	h.BlockID = binary.LittleEndian.Uint32(b[1:5])
+	h.N = b[5]
+	h.K = b[6]
+	h.SymID = b[7]
 	return true
 }

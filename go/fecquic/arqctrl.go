@@ -4,31 +4,24 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+
+	"github.com/quic-go/quic-go/internal/fecwire"
 )
 
 const (
-	arqMsgACK  uint8 = 1
-	arqMsgNACK uint8 = 2
-	arqMsgPROG uint8 = 3
-	arqMsgDONE uint8 = 4 // receiver completed file (EOF-like signal)
+	arqMsgACK  uint8 = fecwire.TypeACK
+	arqMsgNACK uint8 = fecwire.TypeNACK
+	arqMsgDONE uint8 = fecwire.TypeDONE // receiver completed file (EOF-like signal)
 )
 
 type AckSuccess struct {
-	FileID          uint32
-	ClusterID       uint32
-	AttemptIdx      uint16
-	RxUnique        uint16
-	UsedRepairs     uint16
-	DecodeLatencyMs uint32
+	BlockID uint32
 }
 
 type NackNeedMore struct {
-	FileID         uint32
-	ClusterID      uint32
-	AttemptIdx     uint16
-	RxUnique       uint16
-	RecommendExtra uint16
-	Reason         uint8 // 0=DDL,1=CAP,2=OTHER
+	BlockID    uint32
+	AttemptIdx uint16
+	RecvCount  uint16
 }
 
 // DoneFile indicates the receiver has delivered the full file.
@@ -55,18 +48,9 @@ func writeAck(w io.Writer, a AckSuccess) error {
 	if _, err := w.Write([]byte{arqMsgACK}); err != nil {
 		return err
 	}
-	var b [16]byte
-	binary.LittleEndian.PutUint32(b[0:4], a.FileID)
-	binary.LittleEndian.PutUint32(b[4:8], a.ClusterID)
-	binary.LittleEndian.PutUint16(b[8:10], a.AttemptIdx)
-	binary.LittleEndian.PutUint16(b[10:12], a.RxUnique)
-	binary.LittleEndian.PutUint16(b[12:14], a.UsedRepairs)
-	if _, err := w.Write(b[:14]); err != nil {
-		return err
-	}
-	var c [4]byte
-	binary.LittleEndian.PutUint32(c[:], a.DecodeLatencyMs)
-	_, err := w.Write(c[:])
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[0:4], a.BlockID)
+	_, err := w.Write(b[:])
 	return err
 }
 
@@ -74,18 +58,11 @@ func writeNack(w io.Writer, n NackNeedMore) error {
 	if _, err := w.Write([]byte{arqMsgNACK}); err != nil {
 		return err
 	}
-	var b [13]byte
-	binary.LittleEndian.PutUint32(b[0:4], n.FileID)
-	binary.LittleEndian.PutUint32(b[4:8], n.ClusterID)
-	binary.LittleEndian.PutUint16(b[8:10], n.AttemptIdx)
-	binary.LittleEndian.PutUint16(b[10:12], n.RxUnique)
-	if _, err := w.Write(b[:12]); err != nil {
-		return err
-	}
-	var c [3]byte
-	binary.LittleEndian.PutUint16(c[0:2], n.RecommendExtra)
-	c[2] = n.Reason
-	_, err := w.Write(c[:])
+	var b [8]byte
+	binary.LittleEndian.PutUint32(b[0:4], n.BlockID)
+	binary.LittleEndian.PutUint16(b[4:6], n.AttemptIdx)
+	binary.LittleEndian.PutUint16(b[6:8], n.RecvCount)
+	_, err := w.Write(b[:])
 	return err
 }
 
@@ -97,31 +74,23 @@ func readCtrl(r io.Reader) (uint8, interface{}, error) {
 	}
 	switch t[0] {
 	case arqMsgACK:
-		var b [18]byte
+		var b [4]byte
 		if _, err := io.ReadFull(r, b[:]); err != nil {
 			return 0, nil, err
 		}
 		a := AckSuccess{
-			FileID:          binary.LittleEndian.Uint32(b[0:4]),
-			ClusterID:       binary.LittleEndian.Uint32(b[4:8]),
-			AttemptIdx:      binary.LittleEndian.Uint16(b[8:10]),
-			RxUnique:        binary.LittleEndian.Uint16(b[10:12]),
-			UsedRepairs:     binary.LittleEndian.Uint16(b[12:14]),
-			DecodeLatencyMs: binary.LittleEndian.Uint32(b[14:18]),
+			BlockID: binary.LittleEndian.Uint32(b[0:4]),
 		}
 		return t[0], a, nil
 	case arqMsgNACK:
-		var b [15]byte
+		var b [8]byte
 		if _, err := io.ReadFull(r, b[:]); err != nil {
 			return 0, nil, err
 		}
 		n := NackNeedMore{
-			FileID:         binary.LittleEndian.Uint32(b[0:4]),
-			ClusterID:      binary.LittleEndian.Uint32(b[4:8]),
-			AttemptIdx:     binary.LittleEndian.Uint16(b[8:10]),
-			RxUnique:       binary.LittleEndian.Uint16(b[10:12]),
-			RecommendExtra: binary.LittleEndian.Uint16(b[12:14]),
-			Reason:         b[14],
+			BlockID:    binary.LittleEndian.Uint32(b[0:4]),
+			AttemptIdx: binary.LittleEndian.Uint16(b[4:6]),
+			RecvCount:  binary.LittleEndian.Uint16(b[6:8]),
 		}
 		return t[0], n, nil
 	case arqMsgDONE:

@@ -37,7 +37,7 @@ class Action:
     # Action space for QUIC-FEC control:
     # - K: source symbols per block
     # - R0: initial repair symbols per block
-    # - RSTEP: incremental repair step size
+    # - RSTEP: extra repair symbols appended to each NACK response
     K: int = 30
     R0: int = 6
     RSTEP: int = 4
@@ -237,7 +237,7 @@ class QuicFecRunner:
         # Receiver decode/check pacing. Keep consistent with compare_fec_vs_raw_bbrv2_fixed defaults.
         env["DECODE_DDL_MS"] = os.environ.get("DECODE_DDL_MS", "25")
 
-        # ARQ policy (RSTEP is controlled by the policy).
+        # ARQ policy. RSTEP is appended to the K+1-RecvCount deficit by the Go sender.
         env["W"] = os.environ.get("W", "8")
         env["RSTEP"] = str(int(getattr(action, "RSTEP", int(os.environ.get("RSTEP", "4")))))
         # Default: no cap (0) to match compare harness semantics.

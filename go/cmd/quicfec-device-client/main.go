@@ -24,7 +24,7 @@ func main() {
 
 		K      = flag.Int("K", 26, "source symbols K")
 		R0     = flag.Int("R0", 6, "initial repair symbols R0 (N=K+R0)")
-		Rstep  = flag.Int("Rstep", 4, "ARQ minimum append per NACK")
+		Rstep  = flag.Int("Rstep", 4, "extra repair symbols appended to each NACK response")
 		L      = flag.Int("L", 1200, "symbol bytes L")
 		W      = flag.Int("W", 8, "ARQ window W (unfinished clusters)")
 		maxAtt = flag.Int("max-attempts", 5, "ARQ max attempts per cluster")

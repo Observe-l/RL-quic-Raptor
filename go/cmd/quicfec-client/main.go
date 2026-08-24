@@ -31,7 +31,7 @@ func main() {
 		arq       = flag.Bool("arq", false, "enable ARQ control plane (NACK/ACK)")
 		R0        = flag.Int("R0", -1, "initial extra repairs (>=0 exact; -1=auto: N-K)")
 		W         = flag.Int("W", 8, "ARQ window W (unfinished clusters)")
-		Rstep     = flag.Int("Rstep", 4, "ARQ minimum append per NACK")
+		Rstep     = flag.Int("Rstep", 4, "extra repair symbols appended to each NACK response")
 		maxAtt    = flag.Int("max-attempts", 5, "ARQ max attempts per cluster")
 	)
 	flag.Parse()

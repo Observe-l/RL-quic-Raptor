@@ -26,12 +26,12 @@ func devARQNowMs() int64 {
 
 func init() {
 	// Override hooks declared in arq_devhooks_default.go.
-	devARQOnClientNackHook = func(n NackNeedMore, deficit int, cand int, k int, nextESI int, repairsOut int) {
-		fmt.Fprintf(os.Stderr, "[dev-arq] t_ms=%d event=nack block=%d attempt=%d rx_unique=%d rec_extra=%d k=%d deficit=%d append=%d next_esi=%d repairs_out=%d\n",
-			devARQNowMs(), n.ClusterID, n.AttemptIdx, n.RxUnique, n.RecommendExtra, k, deficit, cand, nextESI, repairsOut)
+	devARQOnClientNackHook = func(n NackNeedMore, deficit int, rstep int, cand int, k int, nextESI int, repairsOut int) {
+		fmt.Fprintf(os.Stderr, "[dev-arq] t_ms=%d event=nack block=%d attempt=%d recv_count=%d k=%d deficit=%d rstep=%d append=%d next_esi=%d repairs_out=%d\n",
+			devARQNowMs(), n.BlockID, n.AttemptIdx, n.RecvCount, k, deficit, rstep, cand, nextESI, repairsOut)
 	}
 
-	devARQOnClientRepairSentHook = func(blockID uint16, esi int) {
+	devARQOnClientRepairSentHook = func(blockID uint32, esi int) {
 		if os.Getenv("QUIC_FEC_DEV_ARQ_REPAIR_SENT") != "1" {
 			return
 		}
@@ -39,7 +39,7 @@ func init() {
 	}
 
 	devARQOnClientAckHook = func(a AckSuccess) {
-		fmt.Fprintf(os.Stderr, "[dev-arq] t_ms=%d event=ack block=%d attempt=%d rx_unique=%d used_repairs=%d decode_lat_ms=%d\n",
-			devARQNowMs(), a.ClusterID, a.AttemptIdx, a.RxUnique, a.UsedRepairs, a.DecodeLatencyMs)
+		fmt.Fprintf(os.Stderr, "[dev-arq] t_ms=%d event=ack block=%d\n",
+			devARQNowMs(), a.BlockID)
 	}
 }

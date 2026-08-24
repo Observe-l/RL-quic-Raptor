@@ -49,7 +49,7 @@ type SendOptions struct {
 	UseARQ         bool // enable ARQ control plane and on-demand repairs
 	InitialRepairs int  // R0: initial repair symbols (>=0 exact; -1=auto: max(0, N-K))
 	WindowW        int  // max unfinished clusters in flight (0=unlimited)
-	RStep          int  // minimum repairs per NACK
+	RStep          int  // extra repairs appended to each NACK response
 	MaxAttempts    int  // max ARQ attempts per cluster (0=no cap)
 }
 
@@ -139,7 +139,6 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		return errors.New("negative file size")
 	}
 	size := uint64(sz)
-	var sum [32]byte // zero => receiver will skip SHA verification
 
 	tlsConf := &tls.Config{InsecureSkipVerify: opts.InsecureTLS, NextProtos: []string{alpn}}
 	qconf := &quic.Config{
@@ -188,7 +187,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	if err != nil {
 		return err
 	}
-	hdr := FileHeader{Version: 1, FileSize: uint64(size), SHA256: sum, ChunkL: uint32(L)}
+	hdr := FileHeader{FileSize: uint64(size), ChunkL: uint32(L)}
 	hdr.RxDDLMS = ddlMS
 	if _, err := str.Write(hdr.MarshalBinary()); err != nil {
 		return err
@@ -346,7 +345,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		attempt    int // last processed attempt idx
 	}
 	txMu := &sync.Mutex{}
-	active := make(map[uint16]*blockTx)
+	active := make(map[uint32]*blockTx)
 	cond := sync.NewCond(txMu)
 
 	// DONE ACK (server->client) via control uni-stream.
@@ -389,7 +388,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 							continue
 						}
 						n := msg.(NackNeedMore)
-						bid := uint16(n.ClusterID)
+						bid := n.BlockID
 						txMu.Lock()
 						bt := active[bid]
 						txMu.Unlock()
@@ -409,38 +408,13 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 							fmt.Fprintf(os.Stderr, "[arq] giveup block=%d at attempt=%d (max=%d)\n", bid, n.AttemptIdx, opts.MaxAttempts)
 							continue
 						}
-						toSend := int(n.RecommendExtra)
-						if toSend < 0 {
-							toSend = 0
+						// Request enough fresh symbols to reach K+1 received symbols,
+						// then append the bandit-controlled RSTEP safety margin.
+						deficit := bt.K + 1 - int(n.RecvCount)
+						if deficit < 0 {
+							deficit = 0
 						}
-						// Policy: append exactly (rec_extra + R_step) repair symbols on every NACK.
-						deficit := 0
-						if bt.K-int(n.RxUnique) > 0 {
-							deficit = bt.K - int(n.RxUnique)
-						}
-						rstep := opts.RStep
-						// Semantics: Rstep=0 means "no extra". Negative values fall back to default.
-						if rstep < 0 {
-							rstep = 4
-						}
-						// Policy: append repairs on every NACK, but avoid many small ARQ rounds.
-						// Ensure we send at least enough to cover the current deficit, capped.
-						cand := toSend + rstep
-						maxBurst := 24
-						if v := os.Getenv("QUIC_FEC_ARQ_MAX_REPAIR_BURST"); v != "" {
-							if n, err := strconv.Atoi(v); err == nil && n > 0 {
-								maxBurst = n
-							}
-						}
-						if deficit > 0 {
-							need := deficit
-							if need > maxBurst {
-								need = maxBurst
-							}
-							if need > cand {
-								cand = need
-							}
-						}
+						cand := arqRepairCount(bt.K, int(n.RecvCount), opts.RStep)
 						// Wire format uses uint8 SymID. Do not allow ESI to exceed 255, otherwise
 						// SymID wraps and we start re-sending duplicate IDs (wasting bandwidth and
 						// preventing decoding from ever finishing).
@@ -454,7 +428,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 						if cand <= 0 {
 							continue
 						}
-						devARQOnClientNack(n, deficit, cand, bt.K, bt.nextESI, bt.repairsOut)
+						devARQOnClientNack(n, deficit, maxInt(0, opts.RStep), cand, bt.K, bt.nextESI, bt.repairsOut)
 						// send cand fresh repairs
 						for i := 0; i < cand; i++ {
 							esi := bt.nextESI
@@ -472,13 +446,11 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 							// Guard N to avoid overflow and unrealistic growth
 							advN := minInt(255, bt.K+bt.repairsOut+1)
 							h := fecwire.FECHeader{
-								Version:    1,
-								Scheme:     fecwire.SchemeRaptorQ,
-								BlockID:    bid,
-								N:          uint8(advN),
-								K:          uint8(bt.K),
-								SymID:      uint8(esi),
-								PayloadLen: uint32(bt.L),
+								Type:    fecwire.TypeFECSymbol,
+								BlockID: bid,
+								N:       uint8(advN),
+								K:       uint8(bt.K),
+								SymID:   uint8(esi),
 							}
 							h.MarshalBinary(b[:fecwire.HeaderLen])
 							if err := sendSymbol(b); err == nil {
@@ -504,7 +476,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 						}
 						a := msg.(AckSuccess)
 						devARQOnClientAck(a)
-						bid := uint16(a.ClusterID)
+						bid := a.BlockID
 						txMu.Lock()
 						delete(active, bid)
 						txMu.Unlock()
@@ -565,6 +537,9 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		if blockDataLen > curK*L {
 			blockDataLen = curK * L
 		}
+		if uint64(blockID) > uint64(^uint32(0)) {
+			return fmt.Errorf("block id %d exceeds uint32 wire range", blockID)
+		}
 		tEnc := time.Now()
 		enc, encErr := fec.NewRaptorQEncoder(blockBytes, curK, L)
 		if encErr != nil {
@@ -591,7 +566,7 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 		// Initialize attempt to -1 so the first NACK with attempt_idx=0 is processed once.
 		bt := &blockTx{K: curK, L: L, enc: enc, nextESI: curK, repairsOut: 0, attempt: -1}
 		txMu.Lock()
-		active[uint16(blockID)] = bt
+		active[uint32(blockID)] = bt
 		txMu.Unlock()
 		// Emit initial symbols 0..initN-1
 		for esi := 0; esi < initN; esi++ {
@@ -612,8 +587,15 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 						payloadLen = L
 					}
 				}
-				// Send only the non-padding bytes. Receiver will treat missing tail as zeros.
-				b = make([]byte, fecwire.HeaderLen+payloadLen)
+				// In DATAGRAM mode, send only the non-padding bytes. The receiver
+				// derives the payload length from the DATAGRAM itself and pads the
+				// symbol to ChunkL when feeding the decoder. Stream mode has no
+				// message boundary, so it uses a fixed ChunkL payload per record.
+				wirePayloadLen := payloadLen
+				if opts.Transport == "stream" {
+					wirePayloadLen = L
+				}
+				b = make([]byte, fecwire.HeaderLen+wirePayloadLen)
 				pay = b[fecwire.HeaderLen:]
 				if payloadLen > 0 {
 					copy(pay, blockBytes[start:start+payloadLen])
@@ -632,13 +614,11 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 			// Advertise a stable N that doesn't explode with many appends; cap to 255.
 			advN := minInt(255, initN)
 			h := fecwire.FECHeader{
-				Version:    1,
-				Scheme:     fecwire.SchemeRaptorQ,
-				BlockID:    uint16(blockID),
-				N:          uint8(advN),
-				K:          uint8(curK),
-				SymID:      uint8(esi),
-				PayloadLen: uint32(payloadLen),
+				Type:    fecwire.TypeFECSymbol,
+				BlockID: uint32(blockID),
+				N:       uint8(advN),
+				K:       uint8(curK),
+				SymID:   uint8(esi),
 			}
 			h.MarshalBinary(b[:fecwire.HeaderLen])
 			if opts.WarnDgramSize > 0 && len(b) > opts.WarnDgramSize {
@@ -845,7 +825,6 @@ afterArqDrain:
 }
 
 // ServerRecvFile listens for a connection on ln, receives the file and writes to outDir.
-// If the sender provided a non-zero SHA256 in the header, it is verified during finalize.
 // Returns the path to the stored file.
 func ServerRecvFile(ctx context.Context, ln *quic.Listener, outDir string) (string, error) {
 	return ServerRecvFileWithRX(ctx, ln, outDir, RXOptions{})
@@ -861,7 +840,7 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 	defer conn.CloseWithError(0, "done")
 	recvStart := time.Now()
 
-	// Receive header: find the stream that starts with magic "QFEC"
+	// Receive header: find the stream that starts with the one-byte QFEC type.
 	var (
 		hdrBytes = make([]byte, fileHeaderLen)
 		hdr      FileHeader
@@ -872,21 +851,21 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 		if err != nil {
 			return "", err
 		}
-		// peek magic
-		if _, err := io.ReadFull(s, hdrBytes[:4]); err != nil {
+		// peek type
+		if _, err := io.ReadFull(s, hdrBytes[:1]); err != nil {
 			// not enough data; drain and continue
 			_, _ = io.Copy(io.Discard, s)
 			_ = s.Close()
 			continue
 		}
-		if string(hdrBytes[:4]) != fileHeaderMagic {
+		if hdrBytes[0] != fecwire.TypeQFECHeader {
 			// not our header; drain
 			_, _ = io.Copy(io.Discard, s)
 			_ = s.Close()
 			continue
 		}
 		// read the rest of the header
-		if _, err := io.ReadFull(s, hdrBytes[4:]); err != nil {
+		if _, err := io.ReadFull(s, hdrBytes[1:]); err != nil {
 			return "", err
 		}
 		if err := hdr.UnmarshalBinary(hdrBytes); err != nil {
@@ -1030,13 +1009,17 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 				fmt.Fprintf(os.Stderr, "[server-progress] dgrams=%d written=%d/%d\n", rcvDgrams, rxm.delivered.Load(), hdr.FileSize)
 			}
 			var fh fecwire.FECHeader
-			if !fh.UnmarshalBinary(b) || fh.Scheme != fecwire.SchemeRaptorQ {
+			if !fh.UnmarshalBinary(b) || fh.Type != fecwire.TypeFECSymbol {
 				continue
 			}
-			if int(fh.PayloadLen) > len(b)-fecwire.HeaderLen {
+			data := b[fecwire.HeaderLen:]
+			if len(data) > int(hdr.ChunkL) {
 				continue
 			}
-			data := b[fecwire.HeaderLen : fecwire.HeaderLen+int(fh.PayloadLen)]
+			// DATAGRAMs preserve message boundaries, so the actual payload is
+			// exactly the bytes after the FEC header. A short source symbol is
+			// the final, non-padding part of that symbol; rxbuf supplies
+			// ChunkL-len(data) zero bytes when building the decoder input.
 			// IMPORTANT: Always decode blocks as if they were full-sized (K*L), even for the last
 			// partial block. The sender pads source symbols beyond EOF with zeros, and the decoder
 			// must see the same effective K to interpret ESIs consistently (otherwise late-ESI
@@ -1090,13 +1073,13 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 						return
 					}
 					var fh fecwire.FECHeader
-					if !fh.UnmarshalBinary(hdrb) || fh.Scheme != fecwire.SchemeRaptorQ {
+					if !fh.UnmarshalBinary(hdrb) || fh.Type != fecwire.TypeFECSymbol {
 						return
 					}
-					plen := int(fh.PayloadLen)
-					if plen < 0 || plen > 1<<20 {
-						return
-					}
+					// Stream mode is retained only as a compatibility path. Since a
+					// byte stream has no datagram boundaries and no per-symbol length
+					// field, every symbol record is fixed at ChunkL bytes.
+					plen := int(hdr.ChunkL)
 					buf := make([]byte, plen)
 					if _, err := io.ReadFull(us, buf); err != nil {
 						return
@@ -1111,7 +1094,7 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 	// wait for reception to complete
 	<-doneCh
 	// E2E completion time: transport + retransmissions + decode only.
-	// IMPORTANT: log this BEFORE closeAndFinalize(), which may include disk IO (and optional SHA verification).
+	// IMPORTANT: log this BEFORE closeAndFinalize(), which may include disk IO.
 	e2eDur := time.Since(recvStart)
 	e2eOk := 0
 	if rxm != nil && rxm.delivered.Load() >= hdr.FileSize {
@@ -1152,7 +1135,7 @@ func ServerRecvFileWithRX(ctx context.Context, ln *quic.Listener, outDir string,
 	}
 	cancelRx()
 	close(progStop)
-	finalPath, err := rxm.closeAndFinalize(hdr.SHA256)
+	finalPath, err := rxm.closeAndFinalize()
 	if err != nil {
 		// Best-effort DONE ACK with ok=0 on failure.
 		if rxm != nil && rxm.ctrlOut != nil {
@@ -1444,6 +1427,17 @@ func ResolveUDPAddr(addr string) error {
 }
 
 // small helpers
+func arqRepairCount(k, recvCount, rstep int) int {
+	deficit := k + 1 - recvCount
+	if deficit < 0 {
+		deficit = 0
+	}
+	if rstep < 0 {
+		rstep = 0
+	}
+	return deficit + rstep
+}
+
 func minInt(a, b int) int {
 	if a < b {
 		return a
