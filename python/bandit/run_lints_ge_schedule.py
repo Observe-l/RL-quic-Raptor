@@ -63,94 +63,40 @@ def _ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
 
 
-def _fmt_score(x: float) -> str:
-    s = f"{float(x):.6f}"
-    return s.replace("-", "m").replace(".", "p")
-
-
-def _safe_unlink(prefix: str) -> None:
-    for ext in (".npz", ".json"):
-        try:
-            os.remove(prefix + ext)
-        except FileNotFoundError:
-            pass
-        except Exception:
-            pass
-
-
-def _load_block_best(block_dir: str) -> List[Tuple[float, int, str]]:
-    """Load existing per-block top-k summary if present.
-
-    Returns list of (reward, t, prefix), sorted descending by reward.
-    """
-
-    path = os.path.join(block_dir, "best_models.json")
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        topk = data.get("topk")
-        if not isinstance(topk, list):
-            return []
-        out: List[Tuple[float, int, str]] = []
-        for item in topk:
-            if not isinstance(item, dict):
-                continue
-            try:
-                r = float(item.get("reward"))
-                t = int(item.get("t"))
-                pfx = str(item.get("prefix"))
-            except Exception:
-                continue
-            if not pfx:
-                continue
-            out.append((r, t, pfx))
-        out.sort(key=lambda x: x[0], reverse=True)
-        return out
-    except FileNotFoundError:
-        return []
-    except Exception:
-        return []
-
-
 def _find_latest_saved_prefix(dest_dir: str) -> Optional[str]:
     """Find the latest saved model prefix under a result dir.
 
     Priority:
-      1) <dest_dir>/bandit_model.json (latest checkpoint)
-      2) newest per-block checkpoint under <dest_dir>/best_models/**/model_t*_r*.json
+      1) newest fixed-interval checkpoint under <dest_dir>/checkpoints/model_t*.json
+      2) <dest_dir>/bandit_model.json (latest checkpoint)
     """
 
     dest_dir = os.path.abspath(dest_dir)
+    checkpoint_root = os.path.join(dest_dir, "checkpoints")
+    latest_t = None
+    latest_prefix = None
+    if os.path.isdir(checkpoint_root):
+        for fn in os.listdir(checkpoint_root):
+            if not (fn.startswith("model_t") and fn.endswith(".json")):
+                continue
+            try:
+                stem = fn[:-5]
+                t_val = int(stem[len("model_t") :])
+            except Exception:
+                continue
+            prefix = os.path.join(checkpoint_root, stem)
+            if not os.path.exists(prefix + ".npz"):
+                continue
+            if latest_t is None or t_val > latest_t:
+                latest_t = t_val
+                latest_prefix = prefix
+    if latest_prefix is not None:
+        return latest_prefix
+
     latest = os.path.join(dest_dir, "bandit_model")
     if os.path.exists(latest + ".json") and os.path.exists(latest + ".npz"):
         return latest
-
-    best_root = os.path.join(dest_dir, "best_models")
-    if not os.path.isdir(best_root):
-        return None
-
-    best_t = None
-    best_prefix = None
-    for root, _dirs, files in os.walk(best_root):
-        for fn in files:
-            if not (fn.startswith("model_t") and fn.endswith(".json")):
-                continue
-            # Expected: model_t{t}_r{score}.json
-            try:
-                stem = fn[:-5]
-                # split once: "model_t{t}" and "r..."
-                left, _right = stem.split("_r", 1)
-                t_str = left[len("model_t") :]
-                t_val = int(t_str)
-            except Exception:
-                continue
-            prefix = os.path.join(root, stem)
-            if not os.path.exists(prefix + ".npz"):
-                continue
-            if best_t is None or int(t_val) > int(best_t):
-                best_t = int(t_val)
-                best_prefix = str(prefix)
-    return best_prefix
+    return None
 
 
 def _load_senders(params_path: str) -> List[Tuple[int, Dict[str, Any]]]:
@@ -265,21 +211,17 @@ def main() -> int:
     # without requiring optional runtime dependencies (gym/gymnasium).
     from fecenv_env import FecEnv  # noqa: E402
 
-    ap = argparse.ArgumentParser(
-        description="LinTS runner with external GE schedule (per-episode net params) and block-topk checkpointing"
-    )
+    ap = argparse.ArgumentParser(description="LinTS runner with external GE schedule and fixed-interval checkpoints")
 
     ap.add_argument("--steps", type=int, default=50000, help="number of bandit steps (transfers)")
     ap.add_argument("--episode-steps", type=int, default=10, help="steps per episode (per GE sender)")
-    ap.add_argument("--block-steps", type=int, default=1000, help="checkpointing block size in steps")
-    ap.add_argument("--save-topk", type=int, default=3, help="save top-k models within each block")
+    ap.add_argument("--checkpoint-interval", type=int, default=500, help="save a checkpoint every N valid steps")
+    # Retain old flags so existing launch commands fail neither parsing nor startup.
+    # They no longer affect checkpoint selection or save frequency.
+    ap.add_argument("--block-steps", type=int, default=1000, help=argparse.SUPPRESS)
+    ap.add_argument("--save-topk", type=int, default=0, help=argparse.SUPPRESS)
     ap.add_argument("--warmup", type=int, default=20, help="random warmup steps before LinTS")
-    ap.add_argument(
-        "--checkpoint-every-episodes",
-        type=int,
-        default=1,
-        help="save latest checkpoint every N episodes (0 disables). Recommended >=1 for resume.",
-    )
+    ap.add_argument("--checkpoint-every-episodes", type=int, default=0, help=argparse.SUPPRESS)
 
     ap.add_argument(
         "--ge-params",
@@ -356,23 +298,17 @@ def main() -> int:
 
     total_steps = int(args.steps)
     episode_steps = int(args.episode_steps)
-    block_steps = int(args.block_steps)
-    save_topk = max(0, int(args.save_topk))
+    checkpoint_interval = int(args.checkpoint_interval)
     warmup = int(args.warmup)
-    ckpt_every_episodes = int(args.checkpoint_every_episodes)
 
     if episode_steps <= 0:
         raise ValueError("--episode-steps must be > 0")
-    if block_steps <= 0:
-        raise ValueError("--block-steps must be > 0")
+    if checkpoint_interval <= 0:
+        raise ValueError("--checkpoint-interval must be > 0")
     if total_steps <= 0:
         raise ValueError("--steps must be > 0")
     if total_steps % episode_steps != 0:
         raise ValueError("--steps must be divisible by --episode-steps to align resets")
-    if block_steps % episode_steps != 0:
-        raise ValueError("--block-steps must be divisible by --episode-steps to align block saving")
-    if ckpt_every_episodes < 0:
-        raise ValueError("--checkpoint-every-episodes must be >= 0")
 
     # Load senders (cycled sequentially).
     senders = _load_senders(str(args.ge_params))
@@ -502,67 +438,41 @@ def main() -> int:
             )
             start_t = start_t_aligned
 
-    # Block-based top-k
-    best_root = os.path.join(dest_dir, "best_models")
-    _ensure_dir(best_root)
+    checkpoint_root = os.path.join(dest_dir, "checkpoints")
+    _ensure_dir(checkpoint_root)
 
-    current_block = None
-    best_in_block: List[Tuple[float, int, str]] = []  # (reward, t, prefix)
+    def save_periodic_checkpoint(step_t: int, *, note: str) -> None:
+        """Persist a fixed-step checkpoint and update the latest alias."""
 
-    def _write_block_summary(block_idx: int) -> None:
-        if save_topk <= 0:
-            return
-        block_dir = os.path.join(best_root, f"block_{int(block_idx):04d}")
-        payload = [
-            {
-                "rank": int(i + 1),
-                "reward": float(r),
-                "t": int(t_step),
-                "prefix": str(pfx),
-                "npz": str(pfx + ".npz"),
-                "json": str(pfx + ".json"),
-            }
-            for i, (r, t_step, pfx) in enumerate(best_in_block)
-        ]
-        with open(os.path.join(block_dir, "best_models.json"), "w", encoding="utf-8") as f:
-            json.dump({"block": int(block_idx), "topk": payload}, f, indent=2, sort_keys=True)
-
-    def maybe_save_topk_in_block(*, reward_val: float, step_t: int, block_idx: int) -> None:
-        nonlocal best_in_block
-        if save_topk <= 0:
-            return
-
-        block_dir = os.path.join(best_root, f"block_{int(block_idx):04d}")
-        _ensure_dir(block_dir)
-
-        if len(best_in_block) >= save_topk:
-            worst = min(best_in_block, key=lambda x: x[0])[0]
-            if float(reward_val) <= float(worst):
-                return
-
-        cand_prefix = os.path.join(block_dir, f"model_t{int(step_t)}_r{_fmt_score(float(reward_val))}")
+        periodic_prefix = os.path.join(checkpoint_root, f"model_t{int(step_t)}")
+        meta = {
+            "env_cfg": env_cfg,
+            "dest_dir": dest_dir,
+            "note": str(note),
+            "checkpoint_interval": int(checkpoint_interval),
+            "checkpoint_selection": "fixed_interval",
+        }
         save_checkpoint(
-            path_prefix=cand_prefix,
+            path_prefix=periodic_prefix,
             agent=agent,
             agent_cfg=lints_cfg,
             ctx=ctx,
             ctx_cfg=ctx_cfg,
             action_set=action_set,
             step_t=int(step_t),
-            extra_meta={"env_cfg": env_cfg, "dest_dir": dest_dir, "reward": float(reward_val), "block": int(block_idx)},
+            extra_meta=meta,
         )
-
-        best_in_block.append((float(reward_val), int(step_t), cand_prefix))
-        best_in_block.sort(key=lambda x: x[0], reverse=True)
-
-        # Trim and delete dropped.
-        if len(best_in_block) > save_topk:
-            dropped = best_in_block[save_topk:]
-            best_in_block = best_in_block[:save_topk]
-            for _r, _t, pfx in dropped:
-                _safe_unlink(pfx)
-
-        _write_block_summary(int(block_idx))
+        save_checkpoint(
+            path_prefix=str(save_ckpt_prefix),
+            agent=agent,
+            agent_cfg=lints_cfg,
+            ctx=ctx,
+            ctx_cfg=ctx_cfg,
+            action_set=action_set,
+            step_t=int(step_t),
+            extra_meta={**meta, "note": "latest"},
+        )
+        print(f"[checkpoint] step={int(step_t)} path={periodic_prefix}")
 
     # Start at the correct sender offset if resuming.
     # We align episode boundaries to t % episode_steps == 0.
@@ -621,10 +531,6 @@ def main() -> int:
 
     dim = int(getattr(agent, "dim", 0))
     last_t = int(start_t)
-    # Initialize block state based on global t.
-    current_block = int(start_t // block_steps)
-    block_dir0 = os.path.join(best_root, f"block_{int(current_block):04d}")
-    best_in_block = _load_block_best(block_dir0)
 
     max_invalid_skips = int(os.environ.get("BANDIT_INVALID_SKIP_CAP", "500"))
     invalid_skips = 0
@@ -633,15 +539,6 @@ def main() -> int:
         t = int(start_t)
         while int(t) < int(total_steps):
             last_t = int(t)
-
-            # Block book-keeping
-            block_idx = int(int(t) // block_steps)
-            if int(block_idx) != int(current_block):
-                # Finalize previous block summary (already kept updated), then reset block state.
-                _write_block_summary(int(current_block))
-                current_block = int(block_idx)
-                block_dir = os.path.join(best_root, f"block_{int(current_block):04d}")
-                best_in_block = _load_block_best(block_dir)
 
             x = ctx.get_context()
 
@@ -696,7 +593,7 @@ def main() -> int:
                 "active_loss_mode": str(active_loss_mode),
                 "gemodel_h_pct": float(active_h_pct),
                 "gemodel_k_pct": float(active_k_pct),
-                "block_idx": int(block_idx),
+                "checkpoint_idx": int((int(t) + 1) // checkpoint_interval),
                 "ctx_cfg": asdict(ctx_cfg) if t == int(start_t) else None,
                 "lints_cfg": asdict(lints_cfg) if t == int(start_t) else None,
                 "resume_from": str(loaded_from) if (t == int(start_t) and loaded_from is not None) else None,
@@ -707,32 +604,13 @@ def main() -> int:
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False, default=_json_default) + "\n")
 
-            maybe_save_topk_in_block(reward_val=float(reward), step_t=int(t), block_idx=int(block_idx))
+            # Checkpointing is purely step-based. Reward is deliberately not used
+            # for selecting, replacing, or deleting checkpoints.
+            step_done = int(t) + 1
+            if step_done % checkpoint_interval == 0:
+                save_periodic_checkpoint(step_done, note="fixed_interval")
 
             if bool(terminated) or bool(truncated):
-                # Periodic latest checkpoint at episode boundaries.
-                if ckpt_every_episodes > 0:
-                    # t is the last step of the episode; t+1 is an episode boundary.
-                    epi_done = int((int(t) + 1) // episode_steps)
-                    if epi_done % int(ckpt_every_episodes) == 0:
-                        try:
-                            save_checkpoint(
-                                path_prefix=str(save_ckpt_prefix),
-                                agent=agent,
-                                agent_cfg=lints_cfg,
-                                ctx=ctx,
-                                ctx_cfg=ctx_cfg,
-                                action_set=action_set,
-                                step_t=int(t) + 1,
-                                extra_meta={
-                                    "env_cfg": env_cfg,
-                                    "dest_dir": dest_dir,
-                                    "note": "latest",
-                                    "checkpoint_every_episodes": int(ckpt_every_episodes),
-                                },
-                            )
-                        except Exception:
-                            pass
                 sender_id, active_loss_mode, active_h_pct, active_k_pct = _episode_reset()
 
             # Count only valid transfers.
@@ -741,28 +619,17 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        final_step = int(last_t) + 1
         try:
-            save_checkpoint(
-                path_prefix=str(save_ckpt_prefix),
-                agent=agent,
-                agent_cfg=lints_cfg,
-                ctx=ctx,
-                ctx_cfg=ctx_cfg,
-                action_set=action_set,
-                step_t=int(last_t) + 1,
-                extra_meta={"env_cfg": env_cfg, "dest_dir": dest_dir, "note": "latest"},
-            )
-        except Exception:
-            pass
-
-        try:
-            _write_block_summary(int(current_block))
+            # Preserve the final state even when the run ends between intervals.
+            # This is also step-based and never depends on reward.
+            if final_step > 0 and final_step % checkpoint_interval != 0:
+                save_periodic_checkpoint(final_step, note="final")
         except Exception:
             pass
 
     print(f"wrote {log_path}")
-    if save_topk > 0:
-        print(f"saved per-block top-{save_topk} models under {best_root}")
+    print(f"saved fixed-interval checkpoints under {os.path.abspath(checkpoint_root)}")
     print(f"saved latest model to {os.path.abspath(str(save_ckpt_prefix))}.npz/.json")
     return 0
 

@@ -109,9 +109,60 @@ class LinTS:
         return best, theta_tilde.astype(np.float64)
 
     def _sample_theta(self) -> np.ndarray:
-        cov = (float(self.cfg.sigma) ** 2) * self.A_inv
-        # Sample theta~N(theta_hat, sigma^2 A^{-1}).
-        return self.rng.multivariate_normal(mean=self.theta_hat, cov=cov)
+        """Sample theta with a numerically robust covariance factorization.
+
+        ``RandomState.multivariate_normal`` uses an SVD internally.  For this
+        runner the covariance is 1925x1925 and is maintained by an approximate
+        Sherman--Morrison update between exact inversions, so an otherwise
+        finite matrix can occasionally make that SVD fail under heavy system
+        load.  Cholesky is the natural factorization for the positive-definite
+        LinTS covariance; retry with small diagonal jitter and refresh the
+        inverse before falling back to an eigenvalue-clipped factorization.
+        """
+
+        sigma2 = float(self.cfg.sigma) ** 2
+        if sigma2 == 0.0:
+            return np.asarray(self.theta_hat, dtype=np.float64).copy()
+
+        if not np.isfinite(self.theta_hat).all() or not np.isfinite(self.A_inv).all():
+            self._recompute()
+
+        eye = np.eye(self.dim, dtype=np.float64)
+        cov = sigma2 * (0.5 * (self.A_inv + self.A_inv.T))
+        scale = max(1.0, float(np.max(np.abs(np.diag(cov)))))
+        jitters = (0.0, 1e-12 * scale, 1e-10 * scale, 1e-8 * scale, 1e-6 * scale)
+
+        for jitter in jitters:
+            try:
+                factor = np.linalg.cholesky(cov + float(jitter) * eye)
+                noise = self.rng.normal(size=self.dim)
+                return np.asarray(self.theta_hat, dtype=np.float64) + factor @ noise
+            except np.linalg.LinAlgError:
+                continue
+
+        # The approximate inverse may have drifted. Recompute from A and retry
+        # before using the more expensive eigenvalue-clipped fallback.
+        self._recompute()
+        cov = sigma2 * (0.5 * (self.A_inv + self.A_inv.T))
+        try:
+            factor = np.linalg.cholesky(cov + 1e-8 * max(1.0, float(np.max(np.abs(np.diag(cov))))) * eye)
+            noise = self.rng.normal(size=self.dim)
+            return np.asarray(self.theta_hat, dtype=np.float64) + factor @ noise
+        except np.linalg.LinAlgError:
+            pass
+
+        # Last-resort PSD projection. This keeps one numerical incident from
+        # terminating a long experiment while preserving the LinTS sampling
+        # distribution as closely as possible.
+        try:
+            eigvals, eigvecs = np.linalg.eigh(cov)
+            eigvals = np.clip(eigvals, 0.0, None)
+            noise = self.rng.normal(size=self.dim)
+            return np.asarray(self.theta_hat, dtype=np.float64) + eigvecs @ (np.sqrt(eigvals) * noise)
+        except np.linalg.LinAlgError as exc:
+            raise np.linalg.LinAlgError(
+                f"unable to factor LinTS covariance after refresh; dim={self.dim}"
+            ) from exc
 
     def update(self, *, phi: np.ndarray, reward: float) -> None:
         """Online update with exponential forgetting."""
