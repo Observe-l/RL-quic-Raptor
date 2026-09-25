@@ -15,6 +15,7 @@ _METHOD_LABELS_DEFAULT: Dict[str, str] = {
     "bandit": "BC-DIR",
     "quic_bbrv2": "QUIC",
     "flec": "FLEC",
+    "flec_raptorq": "FLEC-RQ",
     # Current DIR-FEC baselines.
     "fec_k40_r0_0_rstep_4": "DIR-only",
     "fec_k40_r0_4_rstep_0": "FEC-only",
@@ -42,6 +43,7 @@ _METHOD_COLORS_DEFAULT: Dict[str, str] = {
     "fec_k30_r0_2_rstep_6": "#A6C97A",
     "fec_k30_r0_10_rstep_6": "#B8A3C7",
     "flec": "#86AFC1",
+    "flec_raptorq": "#A6C97A",
 }
 
 
@@ -56,6 +58,7 @@ _METHOD_MARKERS_DEFAULT: Dict[str, str] = {
     "fec_k40_r0_10_rstep_8": "s",  # square
     "quic_bbrv2": "D",  # diamond
     "flec": "X",  # filled cross
+    "flec_raptorq": "P",  # filled plus
 }
 
 
@@ -397,7 +400,7 @@ def load_trials_from_bandit_eval_metrics_jsonl_glob(glob_s: str) -> List[TrialRo
     return out
 
 
-def load_trials_from_flec_jsonl(flec_jsonl: Path) -> List[TrialRow]:
+def load_trials_from_flec_jsonl(flec_jsonl: Path, *, method_name: str = "flec") -> List[TrialRow]:
     if not flec_jsonl.exists():
         return []
 
@@ -467,7 +470,7 @@ def load_trials_from_flec_jsonl(flec_jsonl: Path) -> List[TrialRow]:
             out.append(
                 TrialRow(
                     task=str(task),
-                    method="flec",
+                    method=str(method_name),
                     sender_id=int(sender_id),
                     loss_mode=str(loss_mode),
                     rep=int(rep),
@@ -497,6 +500,7 @@ def load_all_trials(
     baseline_glob: str,
     bandit_glob: str,
     flec_jsonl: str,
+    flec_raptorq_jsonl: str = "",
     baseline_in_dirs: Optional[Sequence[str]] = None,
     baseline_csvs: Optional[Sequence[str]] = None,
     bandit_eval_results_csvs: Optional[Sequence[str]] = None,
@@ -533,6 +537,21 @@ def load_all_trials(
             trials.extend(load_trials_from_flec_jsonl_glob(flec_pat))
         else:
             trials.extend(load_trials_from_flec_jsonl(Path(flec_pat).expanduser()))
+
+    # Optional FLEC controller + RaptorQ input. It uses the same JSONL schema
+    # as FLEC, but remains a separate method so the plot can compare the two
+    # implementations without conflating their samples.
+    flec_rq_pat = str(flec_raptorq_jsonl or "").strip()
+    if flec_rq_pat:
+        if any(ch in flec_rq_pat for ch in "*?[]"):
+            for p in sorted(glob.glob(flec_rq_pat)):
+                trials.extend(load_trials_from_flec_jsonl(Path(p), method_name="flec_raptorq"))
+        else:
+            trials.extend(
+                load_trials_from_flec_jsonl(
+                    Path(flec_rq_pat).expanduser(), method_name="flec_raptorq"
+                )
+            )
     return trials
 
 
@@ -566,6 +585,9 @@ def auto_methods_in_trials(trials: Sequence[TrialRow]) -> List[str]:
 
     default_order = [
         "bandit",
+        "flec",
+        "flec_raptorq",
+        "quic_bbrv2",
         "fec_k40_r0_0_rstep_4",
         "fec_k40_r0_4_rstep_0",
         "fec_k40_r0_0_rstep_10",
@@ -574,8 +596,6 @@ def auto_methods_in_trials(trials: Sequence[TrialRow]) -> List[str]:
         "fec_k40_r0_10_rstep_8",
         "fec_k30_r0_2_rstep_6",
         "fec_k30_r0_10_rstep_6",
-        "quic_bbrv2",
-        "flec",
     ]
 
     ordered = [m for m in default_order if m in seen]

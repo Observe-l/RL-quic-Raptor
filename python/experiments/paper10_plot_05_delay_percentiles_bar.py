@@ -67,7 +67,7 @@ def main() -> None:
 
     ap.add_argument("--scenario", choices=["ge", "iid"], default="ge")
     ap.add_argument("--file-bytes", type=int, default=128 * 1024)
-    ap.add_argument("--methods", type=str, default="bandit,fec_k40_r0_0_rstep_4,fec_k40_r0_4_rstep_0,quic_bbrv2,flec")
+    ap.add_argument("--methods", type=str, default="bandit,flec,flec_raptorq,quic_bbrv2")
 
     ap.add_argument("--pct", type=float, default=95.0)
     ap.add_argument("--bin-ranges", type=str, default="0-10,1-30,2-50,3-100")
@@ -75,6 +75,7 @@ def main() -> None:
     ap.add_argument("--xlabel", type=str, default="Traffic Intensity")
 
     ap.add_argument("--flec-jsonl", type=str, default="python/results/flec_data/*.jsonl")
+    ap.add_argument("--flec-raptorq-jsonl", type=str, default="", help="Optional FLEC+RaptorQ JSONL")
     ap.add_argument("--baseline-glob", type=str, default="python/results/*-baseline-data/results.csv")
     ap.add_argument("--bandit-glob", type=str, default="python/results/*-bandit-*/bandit_eval_results.csv")
 
@@ -111,6 +112,7 @@ def main() -> None:
         baseline_glob=args.baseline_glob,
         bandit_glob=args.bandit_glob,
         flec_jsonl=args.flec_jsonl,
+        flec_raptorq_jsonl=args.flec_raptorq_jsonl,
         baseline_in_dirs=args.baseline_in_dir,
         baseline_csvs=args.baseline_results_csv,
         bandit_eval_results_csvs=args.bandit_eval_results_csv,
@@ -163,9 +165,20 @@ def main() -> None:
         plt.xlabel(str(args.xlabel))
         plt.ylabel("E2E delay (ms)")
         # plt.title(f"p95 delay by pi_bad bins ({args.scenario}, task={task})")
-        plt.legend()
 
         ax = plt.gca()
+        fig = plt.gcf()
+        handles, legend_labels = ax.get_legend_handles_labels()
+        fig.legend(
+            handles,
+            legend_labels,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.99),
+            ncol=min(max(1, len(methods)), 4),
+            columnspacing=0.9,
+            handlelength=1.3,
+            handletextpad=0.35,
+        )
         xmin0, xmax0 = ax.get_xlim()
         ymin0, ymax0 = ax.get_ylim()
         if args.xmin is not None or args.xmax is not None:
@@ -173,7 +186,7 @@ def main() -> None:
         if args.ymin is not None or args.ymax is not None:
             ax.set_ylim(bottom=(args.ymin if args.ymin is not None else ymin0), top=(args.ymax if args.ymax is not None else ymax0))
 
-        plt.tight_layout()
+        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.88))
 
     save_current_figure(Path(args.out))
 

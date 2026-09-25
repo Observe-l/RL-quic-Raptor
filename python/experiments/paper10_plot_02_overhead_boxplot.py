@@ -63,9 +63,10 @@ def main() -> None:
 
     ap.add_argument("--scenario", choices=["ge", "iid"], default="ge")
     ap.add_argument("--file-bytes", type=int, default=128 * 1024)
-    ap.add_argument("--methods", type=str, default="bandit,fec_k40_r0_0_rstep_4,fec_k40_r0_4_rstep_0,quic_bbrv2,flec")
+    ap.add_argument("--methods", type=str, default="bandit,flec,flec_raptorq,quic_bbrv2")
 
     ap.add_argument("--flec-jsonl", type=str, default="python/results/flec_data/*.jsonl")
+    ap.add_argument("--flec-raptorq-jsonl", type=str, default="", help="Optional FLEC+RaptorQ JSONL")
     ap.add_argument("--baseline-glob", type=str, default="python/results/*-baseline-data/results.csv")
     ap.add_argument("--bandit-glob", type=str, default="python/results/*-bandit-*/bandit_eval_results.csv")
 
@@ -124,6 +125,7 @@ def main() -> None:
         baseline_glob=args.baseline_glob,
         bandit_glob=args.bandit_glob,
         flec_jsonl=args.flec_jsonl,
+        flec_raptorq_jsonl=args.flec_raptorq_jsonl,
         baseline_in_dirs=args.baseline_in_dir,
         baseline_csvs=args.baseline_results_csv,
         bandit_eval_results_csvs=args.bandit_eval_results_csv,
@@ -184,7 +186,10 @@ def main() -> None:
     if data:
         bp = plt.boxplot(
             data,
-            tick_labels=labels,
+            # `labels` is supported by the matplotlib versions used by the
+            # project's conda environment; newer versions also expose the
+            # same argument as `tick_labels`.
+            labels=labels,
             patch_artist=True,
             widths=0.55,
             showfliers=False,

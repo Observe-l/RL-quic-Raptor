@@ -5,9 +5,11 @@ import os
 from typing import Any, Mapping, Optional
 
 
-# FLEC metrics v2 logs include plugin-adjusted fields. We prefer these.
-# Some environments may still require an E2E time offset due to different QUIC
-# implementations; this is configurable via env var.
+# New FlEC metrics logs expose the same canonical fields as the RL runner:
+#   e2e_delay_s = dur_s + RTT/2
+#   overhead_ratio = max(0, (quic_sent_bytes - file_bytes) / file_bytes)
+# `overhead_if` is additionally available for the lower-layer veth accounting.
+# The legacy fields remain supported for reading old JSONL files.
 FLEC_E2E_OFFSET_MS_ENV = "FLEC_E2E_OFFSET_MS"
 
 
@@ -49,9 +51,16 @@ def _flec_e2e_offset_s(offset_ms: Optional[float] = None) -> float:
 def flec_corrected_attempted_bytes(d: Mapping[str, Any]) -> Optional[int]:
     """Return attempted bytes suitable for overhead comparisons.
 
-    For flec_metrics_v2, prefer `tx_total_bytes_attempted_minus_plugin_payload`.
-    Otherwise fall back to `tx_total_bytes_attempted`.
+    Prefer the whole-transfer QUIC attempted-byte field used by the RL runner.
+    Keep the pre-v4 fields as fallbacks for older FlEC logs.
     """
+
+    quic = _get_int(d, "quic_sent_bytes")
+    if quic is not None:
+        return max(0, int(quic))
+    quic_alias = _get_int(d, "tx_total_bytes_quic_attempted")
+    if quic_alias is not None:
+        return max(0, int(quic_alias))
 
     v2 = _get_int(d, "tx_total_bytes_attempted_minus_plugin_payload")
     if v2 is not None:
@@ -65,14 +74,18 @@ def flec_corrected_attempted_bytes(d: Mapping[str, Any]) -> Optional[int]:
 def flec_corrected_e2e_delay_s(d: Mapping[str, Any], *, offset_ms: Optional[float] = None) -> Optional[float]:
     """Compute corrected end-to-end delay seconds.
 
-    Requirement (current):
-      1) Use `e2e_s_minus_plugin_time_est` as base E2E delay.
-      2) Add an optional per-scenario offset (ms), default 0.
-
-    Falls back to `e2e_s` if v2 field is missing.
+    Prefer the RL-compatible `e2e_delay_s` / `e2e_delay_ms` fields. For old
+    records, fall back to the historical plugin-adjusted fields and then raw
+    `e2e_s`.
     """
 
-    base = _get_float(d, "e2e_s_minus_plugin_time_est")
+    base = _get_float(d, "e2e_delay_s")
+    if base is None:
+        delay_ms = _get_float(d, "e2e_delay_ms")
+        if delay_ms is not None:
+            base = delay_ms / 1000.0
+    if base is None:
+        base = _get_float(d, "e2e_s_minus_plugin_time_est")
     if base is None:
         base = _get_float(d, "e2e_s")
     if base is None:
@@ -88,15 +101,23 @@ def flec_corrected_e2e_delay_s(d: Mapping[str, Any], *, offset_ms: Optional[floa
 def flec_corrected_overhead_ratio(d: Mapping[str, Any]) -> Optional[float]:
     """Compute corrected overhead ratio (extra bytes / data bytes).
 
-    Requirement (current): use `overhead_attempted_minus_plugin_payload`.
-
-    Fallbacks:
-      - `overhead_attempted`
-      - `overhead`
-      - compute from bytes: (attempted_minus_plugin_payload - tx_data_bytes) / tx_data_bytes
+    Prefer whole-transfer QUIC attempted bytes, matching the RL runner's
+    `quic_overhead_ratio`. The veth-layer metric is deliberately not selected
+    here; it is available as `overhead_if`.
     """
 
-    for k in ("overhead_attempted_minus_plugin_payload", "overhead_attempted", "overhead"):
+    for k in ("quic_overhead_ratio", "overhead_ratio", "overhead_total", "overhead"):
+        v = _get_float(d, k)
+        if v is not None:
+            return float(max(0.0, v))
+
+    file_bytes = _get_int(d, "file_bytes")
+    quic_sent_bytes = _get_int(d, "quic_sent_bytes")
+    if file_bytes is not None and file_bytes > 0 and quic_sent_bytes is not None and quic_sent_bytes >= 0:
+        return float(max(0, quic_sent_bytes - file_bytes)) / float(file_bytes)
+
+    # Legacy fallback for pre-v3 records.
+    for k in ("overhead_attempted_minus_plugin_payload", "overhead_attempted"):
         v = _get_float(d, k)
         if v is not None:
             return float(max(0.0, v))

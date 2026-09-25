@@ -158,7 +158,9 @@ def _load_jsonl_points_from_results(
     return out
 
 
-def _load_flec_points(*, flec_jsonl: Path, tasks_ok: Tuple[str, ...]) -> List[_Point]:
+def _load_flec_points(
+    *, flec_jsonl: Path, tasks_ok: Tuple[str, ...], method_name: str = "flec"
+) -> List[_Point]:
     if not flec_jsonl.exists():
         return []
 
@@ -210,7 +212,7 @@ def _load_flec_points(*, flec_jsonl: Path, tasks_ok: Tuple[str, ...]) -> List[_P
 
             out.append(
                 _Point(
-                    method="flec",
+                    method=str(method_name),
                     loss_mode=str(loss_mode),
                     success=int(ok),
                     nack_triggers=float(_to_int(d.get("retransmission_event_count_total", 0), 0)),
@@ -297,13 +299,14 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="(Paper10 extra) GE NACK triggers by pi_bad bins")
 
     ap.add_argument("--file-bytes", type=int, default=128 * 1024)
-    ap.add_argument("--methods", type=str, default="fec_k40_r0_0_rstep_4,fec_k40_r0_4_rstep_0,quic_bbrv2,flec")
+    ap.add_argument("--methods", type=str, default="bandit,flec,flec_raptorq,quic_bbrv2")
 
     ap.add_argument("--bin-ranges", type=str, default="0-10,1-30,2-50,3-100")
     ap.add_argument("--bin-labels", type=str, default="300,600,900,1200")
     ap.add_argument("--xlabel", type=str, default="Traffic Intensity")
 
     ap.add_argument("--flec-jsonl", type=str, default="python/results/flec_data/*.jsonl")
+    ap.add_argument("--flec-raptorq-jsonl", type=str, default="", help="Optional FLEC+RaptorQ JSONL")
 
     ap.add_argument("--bandit-jsonl-glob", type=str, default="python/results/*-bandit-*/bandit_eval_metrics.jsonl")
     ap.add_argument("--bandit-eval-log", action="append", default=[], help="Explicit bandit_eval_metrics.jsonl path. Repeatable.")
@@ -397,12 +400,20 @@ def main() -> None:
         bandit_jsonls.append(Path(str(p_s)).expanduser())
 
     flec_paths: List[Path] = []
+    flec_raptorq_paths: List[Path] = []
     flec_pat = str(args.flec_jsonl or "").strip()
     if flec_pat:
         if any(ch in flec_pat for ch in "*?[]"):
             flec_paths.extend(sorted(Path().glob(flec_pat)))
         else:
             flec_paths.append(Path(flec_pat))
+
+    flec_rq_pat = str(args.flec_raptorq_jsonl or "").strip()
+    if flec_rq_pat:
+        if any(ch in flec_rq_pat for ch in "*?[]"):
+            flec_raptorq_paths.extend(sorted(Path(p) for p in Path().glob(flec_rq_pat)))
+        else:
+            flec_raptorq_paths.append(Path(flec_rq_pat).expanduser())
 
     # Load points.
     pts: List[_Point] = []
@@ -420,6 +431,8 @@ def main() -> None:
         pts.extend(_load_bandit_points(bandit_jsonl=p, tasks_ok=tasks_ok))
     for p in flec_paths:
         pts.extend(_load_flec_points(flec_jsonl=p, tasks_ok=tasks_ok))
+    for p in flec_raptorq_paths:
+        pts.extend(_load_flec_points(flec_jsonl=p, tasks_ok=tasks_ok, method_name="flec_raptorq"))
 
     # GE only.
     pts_ge: List[Tuple[float, _Point]] = []
@@ -457,9 +470,20 @@ def main() -> None:
     else:
         plt.ylabel("Retransmissions (pkts, mean)")
     plt.grid(True, axis="y")
-    plt.legend()
 
     ax = plt.gca()
+    fig = plt.gcf()
+    handles, legend_labels = ax.get_legend_handles_labels()
+    fig.legend(
+        handles,
+        legend_labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.99),
+        ncol=min(max(1, len(methods)), 4),
+        columnspacing=0.9,
+        handlelength=1.3,
+        handletextpad=0.35,
+    )
     xmin0, xmax0 = ax.get_xlim()
     ymin0, ymax0 = ax.get_ylim()
     if args.xmin is not None or args.xmax is not None:
@@ -467,7 +491,7 @@ def main() -> None:
     if args.ymin is not None or args.ymax is not None:
         ax.set_ylim(bottom=(args.ymin if args.ymin is not None else ymin0), top=(args.ymax if args.ymax is not None else ymax0))
 
-    plt.tight_layout()
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.88))
 
     save_current_figure(Path(args.out))
 
