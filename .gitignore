@@ -29,3 +29,4 @@ wandb/
 .venv/
 figures/
 data/
+figure/

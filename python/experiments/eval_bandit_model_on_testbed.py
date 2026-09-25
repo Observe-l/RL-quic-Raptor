@@ -67,17 +67,32 @@ def _netns_env_for_tag(tag: str) -> Dict[str, str]:
     veth_host = ("vh" + tag)[:15]
     veth_ns = ("vn" + tag)[:15]
 
-    base = 20 + (zlib.crc32(tag.encode("utf-8")) % 200)
-    used = _used_10_10_subnets()
-    subnet = base
-    for off in range(0, 200):
-        cand = 20 + ((base - 20 + off) % 200)
-        if cand not in used:
-            subnet = cand
-            break
+    # Batch evaluators may start many instances concurrently.  A deterministic
+    # slot supplied by the coordinator avoids the startup race in which several
+    # processes observe the same free subnet before their veth is created.
+    slot_raw = os.environ.get("QUICFEC_EVAL_SLOT", "").strip()
+    if slot_raw:
+        try:
+            slot = int(slot_raw)
+        except ValueError as exc:
+            raise ValueError(f"invalid QUICFEC_EVAL_SLOT: {slot_raw!r}") from exc
+        if not 0 <= slot < 200:
+            raise ValueError("QUICFEC_EVAL_SLOT must be in [0, 199]")
+        subnet = slot + 1
+        host_ip = f"10.240.{subnet}.1/24"
+        ns_ip = f"10.240.{subnet}.2/24"
+    else:
+        base = 20 + (zlib.crc32(tag.encode("utf-8")) % 200)
+        used = _used_10_10_subnets()
+        subnet = base
+        for off in range(0, 200):
+            cand = 20 + ((base - 20 + off) % 200)
+            if cand not in used:
+                subnet = cand
+                break
 
-    host_ip = f"10.10.{subnet}.1/24"
-    ns_ip = f"10.10.{subnet}.2/24"
+        host_ip = f"10.10.{subnet}.1/24"
+        ns_ip = f"10.10.{subnet}.2/24"
 
     return {
         "NS": f"qns_{tag}",
@@ -311,6 +326,12 @@ def _pick_policy_action(
     # Build Phi matrix: (n_actions, dim)
     Phi = np.asarray([phi_fn(x=x, a_onehot=ao) for ao in action_onehots], dtype=np.float64)
 
+    if str(policy) == "random":
+        a_idx = int(rng.randint(0, len(action_onehots)))
+        theta = np.zeros_like(np.asarray(theta_hat, dtype=np.float64).reshape(-1))
+        scores = np.zeros((len(action_onehots),), dtype=np.float64)
+        return a_idx, theta, scores
+
     if str(policy) == "greedy":
         theta = np.asarray(theta_hat, dtype=np.float64).reshape(-1)
     else:
@@ -351,10 +372,22 @@ def main() -> int:
     ap.add_argument("--out-dir", type=str, required=True)
     ap.add_argument("--run-tag", type=str, default="", help="Tag for netns/veth isolation")
 
-    ap.add_argument("--policy", type=str, default="greedy", choices=["greedy", "ts"], help="Action selection policy")
+    ap.add_argument(
+        "--policy",
+        type=str,
+        default="greedy",
+        choices=["greedy", "ts", "random"],
+        help="Action selection policy; random samples one action independently at each transfer",
+    )
     ap.add_argument("--seed", type=int, default=0, help="Seed for TS sampling (and tie-breaking RNG)")
     ap.add_argument("--policy-repeats", type=int, default=1, help="Repeat evaluation with seed+i and average in plotting")
-    ap.add_argument("--ctx-reset", type=str, default="per_scenario", choices=["never", "per_scenario"], help="When to reset context state")
+    ap.add_argument(
+        "--ctx-reset",
+        type=str,
+        default="per_scenario",
+        choices=["never", "per_scenario"],
+        help="When to reset context state; never means once at evaluation start, then continuous",
+    )
 
     ap.add_argument("--loss-profile", type=str, default="ge", choices=["ge", "iid"], help="Loss profile")
     ap.add_argument("--iid-loss-pcts", type=str, default="0.1,0.2,0.3,0.4,0.5")
@@ -381,6 +414,12 @@ def main() -> int:
     ap.add_argument("--file-bytes", type=int, default=128 * 1024)
     ap.add_argument("--symbol-bytes", type=int, default=1200)
     ap.add_argument("--decode-ddl-ms", type=int, default=25)
+    ap.add_argument(
+        "--done-deadline-ms",
+        type=int,
+        default=500,
+        help="Training-compatible completion deadline used for done_flag (500ms for the 100KB experiment)",
+    )
 
     ap.add_argument("--enable-quic-overhead", type=int, default=1, choices=[0, 1])
 
@@ -394,6 +433,12 @@ def main() -> int:
 
     # Freeze posterior: never call agent.update(). Override RNG for reproducible evaluation.
     base_seed = int(args.seed)
+
+    # A checkpoint may contain the training-time context state, but evaluation
+    # starts a fresh continuous trajectory.  With ctx-reset=never this is the
+    # only reset: subsequent GE scenes and repetitions share the evolving ctx.
+    if str(args.ctx_reset) == "never":
+        ctx.reset()
 
     # Precompute action onehots and mapping from a_idx to concrete (K,R0,RSTEP).
     k_values = list(action_set.k_values)
@@ -509,6 +554,12 @@ def main() -> int:
                 # Start each scenario with the current context.
                 for rep in range(int(args.steps_per_scenario)):
                     x = ctx.get_context()
+                    # Configure the netem qdisc once at the start of each
+                    # scenario, then keep its GE state continuous across that
+                    # scenario's repeated transfers. This matches the training
+                    # and oracle harnesses, which configure once per episode /
+                    # action-scenario rather than resetting GE on every trial.
+                    qdisc_reconfigured = int(rep == 0)
 
                     # Select action.
                     a_idx, theta_used, scores = _pick_policy_action(
@@ -535,6 +586,7 @@ def main() -> int:
 
                     env_fec = {
                         **common_env,
+                        "SKIP_TC_CONFIG": "0" if qdisc_reconfigured else "1",
                         "RTT_MS": str(int(rtt_ms)),
                         "LOSS_MODE": str(loss_mode),
                         "K": str(int(K)),
@@ -572,10 +624,25 @@ def main() -> int:
                     raw_obs.setdefault("fec_overhead", float(overhead_ratio))
                     raw_obs.setdefault("ctrl_tx_nack_msgs", float(raw_obs.get("ctrl_tx_nack_msgs", 0.0) or 0.0))
 
-                    # done_flag: treat success+on-time as 1.
-                    auto_ddl_ms = int(float(raw_obs.get("auto_ddl_ms", 0.0) or 0.0))
-                    on_time_flag = 1 if (step_valid == 1 and dur_ms > 0 and auto_ddl_ms > 0 and dur_ms <= float(auto_ddl_ms)) else 0
-                    raw_obs.setdefault("done_flag", float(on_time_flag))
+                    # Keep evaluation aligned with FecEnv training.  The
+                    # protocol's autoSoftDDL is a separate pacing-derived
+                    # field (often 43-74ms); it must not define done_flag.
+                    protocol_auto_ddl_ms = int(float(raw_obs.get("auto_ddl_ms", 0.0) or 0.0))
+                    done_deadline_ms = int(args.done_deadline_ms)
+                    on_time_flag = 1 if (
+                        step_valid == 1
+                        and dur_ms > 0
+                        and done_deadline_ms > 0
+                        and dur_ms <= float(done_deadline_ms)
+                    ) else 0
+                    # The merged shell observation does not carry the
+                    # training environment's done_flag, so set it explicitly.
+                    raw_obs["done_flag"] = float(on_time_flag)
+                    # Keep the experiment-facing DDL field consistent with
+                    # training, while retaining the actual protocol value for
+                    # diagnostics.
+                    raw_obs["auto_ddl_ms"] = float(done_deadline_ms)
+                    raw_obs["protocol_auto_ddl_ms"] = float(protocol_auto_ddl_ms)
 
                     # fec_rate: best-effort from action.
                     fec_rate = float(R0) / float(max(1, K))
@@ -604,6 +671,9 @@ def main() -> int:
                         "quic_overhead_ratio": float(overhead_ratio),
                         "quic_sent_bytes": int(_to_int(kv, "fec_quic_sent_bytes", 0)),
                         "on_time_flag": int(on_time_flag),
+                        "done_deadline_ms": int(done_deadline_ms),
+                        "protocol_auto_ddl_ms": int(protocol_auto_ddl_ms),
+                        "qdisc_reconfigured": qdisc_reconfigured,
                         "net_params": {
                             "rtt_ms": int(rtt_ms),
                             "loss_mode": str(loss_mode),
@@ -622,7 +692,8 @@ def main() -> int:
                             "ctrl_tx_nack_msgs": float(raw_obs.get("ctrl_tx_nack_msgs", 0.0) or 0.0),
                             "done_flag": float(raw_obs.get("done_flag", 0.0) or 0.0),
                             "fec_rate": float(raw_obs.get("fec_rate", 0.0) or 0.0),
-                            "auto_ddl_ms": float(auto_ddl_ms),
+                            "auto_ddl_ms": float(done_deadline_ms),
+                            "protocol_auto_ddl_ms": float(protocol_auto_ddl_ms),
                         },
                         "extra": {"run": kv},
                     }
@@ -644,9 +715,9 @@ def main() -> int:
                             "K": int(K),
                             "R0": int(R0),
                             "RSTEP": int(RSTEP),
-                            "auto_ddl_ms": int(auto_ddl_ms),
+                            "auto_ddl_ms": int(done_deadline_ms),
                         },
-                        ddl_ms=int(auto_ddl_ms),
+                        ddl_ms=int(done_deadline_ms),
                         context=[float(v) for v in list(np.asarray(x, dtype=np.float64).reshape(-1))],
                         env_info=env_info,
                     )
@@ -655,7 +726,7 @@ def main() -> int:
                     csv_rows.append(
                         {
                             "task": str(task),
-                            "method": "bandit",
+                            "method": "random" if str(args.policy) == "random" else "bandit",
                             "policy": str(args.policy),
                             "policy_rep": int(policy_rep),
                             "sender_id": int(sender_id),
@@ -669,7 +740,7 @@ def main() -> int:
                             "K": int(K),
                             "R0": int(R0),
                             "RSTEP": int(RSTEP),
-                            "ddl_ms": int(auto_ddl_ms),
+                            "ddl_ms": int(done_deadline_ms),
                         }
                     )
 
@@ -678,7 +749,8 @@ def main() -> int:
                     # Short progress line.
                     print(
                         f"t={t_global:05d} rep={rep:02d} policy_rep={policy_rep} sender={sender_id} "
-                        f"loss={loss_mode} a={a_idx} K={K} R0={R0} RSTEP={RSTEP} auto_ddl={auto_ddl_ms} "
+                        f"loss={loss_mode} a={a_idx} K={K} R0={R0} RSTEP={RSTEP} "
+                        f"done_deadline={done_deadline_ms} protocol_auto_ddl={protocol_auto_ddl_ms} "
                         f"ok={step_valid} dur_ms={int(dur_ms)} ov={overhead_ratio:.3f}"
                     )
 
@@ -701,6 +773,7 @@ def main() -> int:
         "task": str(task),
         "args": vars(args),
         "checkpoint_step_t": int(step_t),
+        "network_state_policy": "configure tc qdisc on the first transfer of each scenario; reuse it for subsequent repetitions",
         "lints_cfg": asdict(lints_cfg),
         "ctx_cfg": asdict(ctx_cfg),
         "action_set": {
