@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<launch>
+    <basedir path="../scenario"/>
+    <copy file="erlangen.net.xml"/>
+    <copy file="period6.rou.xml"/>
+    <copy file="erlangen.poly.xml"/>
+    <copy file="period6.sumo.cfg" type="config"/>
+</launch>

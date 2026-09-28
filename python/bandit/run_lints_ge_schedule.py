@@ -287,6 +287,12 @@ def main() -> int:
 
     ap.add_argument("--result-dir", type=str, default=None, help="directory to write bandit_metrics.json")
     ap.add_argument(
+        "--timing-jsonl",
+        type=str,
+        default=None,
+        help="optional per-attempt action-scoring/feature-map/posterior-update timing log",
+    )
+    ap.add_argument(
         "--checkpoint-prefix",
         type=str,
         default=None,
@@ -323,6 +329,10 @@ def main() -> int:
     _ensure_dir(dest_dir)
 
     log_path = os.path.join(dest_dir, "bandit_metrics.json")
+    timing_path = os.path.abspath(args.timing_jsonl) if args.timing_jsonl else None
+    if timing_path:
+        _ensure_dir(os.path.dirname(timing_path))
+    timing_rows: List[Dict[str, Any]] = []
 
     save_ckpt_prefix = args.checkpoint_prefix
     if not save_ckpt_prefix:
@@ -539,17 +549,26 @@ def main() -> int:
         t = int(start_t)
         while int(t) < int(total_steps):
             last_t = int(t)
+            attempt_idx = invalid_skips + 1
 
             x = ctx.get_context()
+            action_score_wall_ns: Optional[int] = None
+            action_score_cpu_ns: Optional[int] = None
 
             if int(t) < warmup:
                 a_idx = int(np.random.RandomState(int(args.seed) + t).randint(0, len(action_set)))
                 theta = None
             else:
+                if timing_path:
+                    score_wall_start = time.perf_counter_ns()
+                    score_cpu_start = time.process_time_ns()
                 a_idx, theta = agent.select_action_features(
                     x=x,
                     action_features=action_features,
                 )
+                if timing_path:
+                    action_score_wall_ns = time.perf_counter_ns() - score_wall_start
+                    action_score_cpu_ns = time.process_time_ns() - score_cpu_start
 
             a = action_set.get_action(a_idx)
             env_action = a.to_env_action()
@@ -568,15 +587,58 @@ def main() -> int:
                     raise RuntimeError(
                         f"too many invalid transfers skipped (>{max_invalid_skips}); last info={info}"
                     )
+                if timing_path:
+                    timing_rows.append({
+                        "t": int(t),
+                        "attempt": int(attempt_idx),
+                        "step_valid": False,
+                        "warmup": bool(int(t) < warmup),
+                        "action_scoring_wall_ns": action_score_wall_ns,
+                        "action_scoring_cpu_ns": action_score_cpu_ns,
+                        "feature_map_wall_ns": None,
+                        "feature_map_cpu_ns": None,
+                        "posterior_update_wall_ns": None,
+                        "posterior_update_cpu_ns": None,
+                    })
                 # Do not advance t.
                 continue
             invalid_skips = 0
 
             ctx.update_from_obs(obs=obs)
 
+            feature_map_wall_ns: Optional[int] = None
+            feature_map_cpu_ns: Optional[int] = None
+            posterior_update_wall_ns: Optional[int] = None
+            posterior_update_cpu_ns: Optional[int] = None
             if int(t) >= warmup:
-                ph = phi_fn(x=x, a_onehot=action_set.get_onehot(a_idx))
+                if timing_path:
+                    feature_wall_start = time.perf_counter_ns()
+                    feature_cpu_start = time.process_time_ns()
+                action_onehot = action_set.get_onehot(a_idx)
+                ph = phi_fn(x=x, a_onehot=action_onehot)
+                if timing_path:
+                    feature_map_wall_ns = time.perf_counter_ns() - feature_wall_start
+                    feature_map_cpu_ns = time.process_time_ns() - feature_cpu_start
+                    update_wall_start = time.perf_counter_ns()
+                    update_cpu_start = time.process_time_ns()
                 agent.update(phi=ph, reward=float(reward))
+                if timing_path:
+                    posterior_update_wall_ns = time.perf_counter_ns() - update_wall_start
+                    posterior_update_cpu_ns = time.process_time_ns() - update_cpu_start
+
+            if timing_path:
+                timing_rows.append({
+                    "t": int(t),
+                    "attempt": int(attempt_idx),
+                    "step_valid": True,
+                    "warmup": bool(int(t) < warmup),
+                    "action_scoring_wall_ns": action_score_wall_ns,
+                    "action_scoring_cpu_ns": action_score_cpu_ns,
+                    "feature_map_wall_ns": feature_map_wall_ns,
+                    "feature_map_cpu_ns": feature_map_cpu_ns,
+                    "posterior_update_wall_ns": posterior_update_wall_ns,
+                    "posterior_update_cpu_ns": posterior_update_cpu_ns,
+                })
 
             rec: Dict[str, Any] = {
                 "t": int(t),
@@ -627,8 +689,16 @@ def main() -> int:
                 save_periodic_checkpoint(final_step, note="final")
         except Exception:
             pass
+        if timing_path:
+            with open(timing_path, "w", encoding="utf-8") as timing_file:
+                for timing_rec in timing_rows:
+                    timing_file.write(
+                        json.dumps(timing_rec, ensure_ascii=False, default=_json_default) + "\n"
+                    )
 
     print(f"wrote {log_path}")
+    if timing_path:
+        print(f"wrote {timing_path}")
     print(f"saved fixed-interval checkpoints under {os.path.abspath(checkpoint_root)}")
     print(f"saved latest model to {os.path.abspath(str(save_ckpt_prefix))}.npz/.json")
     return 0

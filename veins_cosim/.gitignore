@@ -1,0 +1,11 @@
+/out/
+/bin/quicfec-veins-client
+/bin/quicfec-veins-server
+/src/Makefile
+/src/Makefile.vc
+/src/*.o
+/src/*.d
+/src/*.so
+/src/QuicFecDatagram_m.cc
+/src/QuicFecDatagram_m.h
+__pycache__/

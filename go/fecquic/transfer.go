@@ -51,6 +51,9 @@ type SendOptions struct {
 	WindowW        int  // max unfinished clusters in flight (0=unlimited)
 	RStep          int  // extra repairs appended to each NACK response
 	MaxAttempts    int  // max ARQ attempts per cluster (0=no cap)
+	// PacketConn optionally supplies the UDP-like transport used by QUIC. When nil,
+	// ClientSendFile keeps using its normal UDP socket via DialAddr.
+	PacketConn net.PacketConn
 }
 
 // autoSoftDDL computes the receiver soft deadline from the sender-side QUIC
@@ -166,7 +169,17 @@ func ClientSendFile(ctx context.Context, addr, alpn, path string, opts SendOptio
 	if opts.DialTimeout > 0 {
 		dialCtx, cancelDial = context.WithTimeout(ctx, opts.DialTimeout)
 	}
-	conn, err := quic.DialAddr(dialCtx, addr, tlsConf, qconf)
+	var conn *quic.Conn
+	if opts.PacketConn != nil {
+		remoteAddr, resolveErr := net.ResolveUDPAddr("udp", addr)
+		if resolveErr != nil {
+			cancelDial()
+			return resolveErr
+		}
+		conn, err = quic.Dial(dialCtx, opts.PacketConn, remoteAddr, tlsConf, qconf)
+	} else {
+		conn, err = quic.DialAddr(dialCtx, addr, tlsConf, qconf)
+	}
 	cancelDial()
 	if err != nil {
 		return err
@@ -1364,7 +1377,7 @@ func ListenAndServeLoopWithRX(ctx context.Context, addr, alpn, outDir string, tl
 		return errors.New("tlsConf required")
 	}
 	ecnStats := NewECNStats()
-	ln, err := quic.ListenAddr(addr, tlsConf, &quic.Config{
+	qconf := &quic.Config{
 		Tracer: func(ctx context.Context, p logging.Perspective, cid logging.ConnectionID) *logging.ConnectionTracer {
 			return devWrapConnTracer(logging.NewMultiplexedConnectionTracer(
 				NewECNConnTracer(ecnStats),
@@ -1376,7 +1389,14 @@ func ListenAndServeLoopWithRX(ctx context.Context, addr, alpn, outDir string, tl
 		MaxIdleTimeout:                 90 * time.Second,
 		InitialStreamReceiveWindow:     8 * 1024 * 1024,
 		InitialConnectionReceiveWindow: 16 * 1024 * 1024,
-	})
+	}
+	var ln *quic.Listener
+	var err error
+	if rx.PacketConn != nil {
+		ln, err = quic.Listen(rx.PacketConn, tlsConf, qconf)
+	} else {
+		ln, err = quic.ListenAddr(addr, tlsConf, qconf)
+	}
 	if err != nil {
 		return err
 	}

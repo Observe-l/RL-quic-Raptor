@@ -230,6 +230,33 @@ cmd_server_start() {
   exit "$rc"
 }
 
+cmd_raw_server_start() {
+  [[ $# == 5 ]] || die "raw-server-start expects: NS SERVER_BIN ADDR OUT_DIR TIMEOUT"
+  local ns=$1 bin=$2 addr=$3 out=$4 timeout=$5
+  valid_name "$ns" || die "invalid namespace name"
+  [[ "$bin" == */quicraw-server && -x "$bin" ]] || die "server binary must be an executable quicraw-server"
+  [[ "$addr" =~ ^[0-9.]+:[0-9]+$ ]] || die "invalid server address"
+  caller_out_dir_ok "$out" || die "output directory must exist and belong to the sudo caller"
+  [[ "$timeout" =~ ^[0-9]+(ms|s|m)$ ]] || die "invalid server timeout"
+  [[ -n "$sudo_user" ]] || die "missing sudo caller"
+  need_cmd "$RUNUSER"
+
+  # The raw QUIC server only needs a UDP socket and a caller-owned output
+  # directory. Enter the namespace as root, then drop privileges before
+  # executing the caller-owned binary.
+  local state="/tmp/quicraw-helper-${sudo_uid}-${PPID}"
+  local child rc=0
+  trap 'if [[ -n "${child:-}" ]]; then kill -TERM "$child" 2>/dev/null || true; fi; rm -f "$state"; exit 143' TERM INT
+  "$SETSID" "$IP" netns exec "$ns" "$RUNUSER" -u "$sudo_user" -- "$bin" \
+    -addr "$addr" -out "$out" -timeout "$timeout" &
+  child=$!
+  printf '%s\n' "$child" >"$state"
+  wait "$child" || rc=$?
+  rm -f "$state"
+  trap - TERM INT
+  exit "$rc"
+}
+
 cmd_server_stop() {
   [[ $# == 1 ]] || die "server-stop expects: LAUNCHER_PID"
   local launcher=$1 child state
@@ -290,6 +317,7 @@ case "${1:-}" in
   buffers) shift; [[ $# == 0 ]] || die "buffers takes no arguments"; cmd_buffers ;;
   tc-config) shift; cmd_tc_config "$@" ;;
   server-start) shift; cmd_server_start "$@" ;;
+  raw-server-start) shift; cmd_raw_server_start "$@" ;;
   server-stop) shift; cmd_server_stop "$@" ;;
   server-stop-ns) shift; cmd_server_stop_ns "$@" ;;
   wait-port) shift; cmd_wait_port "$@" ;;

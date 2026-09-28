@@ -95,8 +95,42 @@ type summaryRecord struct {
 	RoundTripPass int
 }
 
+type failureRateSummary struct {
+	FileSizeBytes          int                   `json:"file_size_bytes"`
+	K                      int                   `json:"configured_k"`
+	R                      int                   `json:"configured_r"`
+	SymbolBytes            int                   `json:"symbol_bytes"`
+	Repeats                int                   `json:"file_trials"`
+	Seed                   int64                 `json:"seed"`
+	ErasureSampling        string                `json:"erasure_sampling"`
+	BlocksPerFile          int                   `json:"blocks_per_file"`
+	BlockTrials            int                   `json:"block_trials"`
+	BlockDecodeFailures    int                   `json:"block_decode_failures"`
+	BlockFailureRate       float64               `json:"block_failure_rate"`
+	FailedFiles            int                   `json:"failed_files"`
+	FileFailureRate        float64               `json:"file_failure_rate"`
+	RoundTripMismatchFiles int                   `json:"round_trip_mismatch_files"`
+	SuccessfulFiles        int                   `json:"successful_files"`
+	ElapsedSeconds         float64               `json:"elapsed_seconds"`
+	Blocks                 []blockFailureSummary `json:"blocks"`
+	SummaryPath            string                `json:"summary_path,omitempty"`
+}
+
+type blockFailureSummary struct {
+	BlockIndex            int     `json:"block_index"`
+	SourceSymbolsK        int     `json:"source_symbols_k"`
+	SourceSymbolsErased   int     `json:"source_symbols_erased"`
+	SourceSymbolsReceived int     `json:"source_symbols_received"`
+	RepairSymbolsReceived int     `json:"repair_symbols_received"`
+	TotalSymbolsReceived  int     `json:"total_symbols_received"`
+	Trials                int     `json:"trials"`
+	DecodeFailures        int     `json:"decode_failures"`
+	DecodeFailureRate     float64 `json:"decode_failure_rate"`
+}
+
 func main() {
 	worker := flag.Bool("worker", false, "internal worker mode")
+	failureRate := flag.Bool("failure-rate", false, "run randomized source-erasure decode-failure test")
 	fileBytes := flag.Int("file-bytes", 100*1024, "file size in bytes (binary units are used by the parent runner)")
 	sizeLabel := flag.String("size-label", "", "display label for this file size")
 	k := flag.Int("K", 20, "source symbols per full block")
@@ -105,7 +139,24 @@ func main() {
 	repeats := flag.Int("repeats", 1000, "repetitions per configuration")
 	seed := flag.Int64("seed", 20260923, "deterministic payload seed")
 	outPrefix := flag.String("out-prefix", "", "output filename prefix; defaults to a timestamped path under ../python/results")
+	summaryPath := flag.String("summary-path", "", "failure-rate JSON output path; defaults under ../python/results")
 	flag.Parse()
+
+	if *failureRate {
+		label := *sizeLabel
+		if label == "" {
+			label = fmt.Sprintf("%dB", *fileBytes)
+		}
+		cfg := config{FileBytes: *fileBytes, SizeLabel: label, K: *k, R: *r, L: *l}
+		path := *summaryPath
+		if path == "" {
+			path = filepath.Join("..", "python", "results", fmt.Sprintf("raptorq_failure_rate_%dB_K%d_R%d_%dtrials_%s.json", *fileBytes, *k, *r, *repeats, time.Now().Format("20060102_150405_000000000")))
+		}
+		if err := runFailureRate(cfg, *repeats, *seed, path); err != nil {
+			fatalf("%v", err)
+		}
+		return
+	}
 
 	if *worker {
 		label := *sizeLabel
@@ -345,6 +396,161 @@ func runWorker(cfg config, repeats int, seed int64) error {
 		RoundTripPassCount: passes,
 	}
 	return encoder.Encode(workerMessage{Kind: "summary", Summary: &group})
+}
+
+func runFailureRate(cfg config, repeats int, seed int64, summaryPath string) error {
+	if cfg.FileBytes <= 0 || cfg.K <= 0 || cfg.R <= 0 || cfg.L <= 0 {
+		return errors.New("file size, K, R, and L must be positive")
+	}
+	if cfg.K+cfg.R > 256 {
+		return fmt.Errorf("K+R=%d exceeds the symbol id limit 256", cfg.K+cfg.R)
+	}
+	if repeats <= 0 {
+		return errors.New("repeats must be positive")
+	}
+	if _, err := os.Stat(summaryPath); err == nil {
+		return fmt.Errorf("refusing to overwrite existing output %s", summaryPath)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	payload := make([]byte, cfg.FileBytes)
+	payloadRNG := mrand.New(mrand.NewSource(seed + int64(cfg.FileBytes)))
+	if _, err := payloadRNG.Read(payload); err != nil {
+		return fmt.Errorf("generate deterministic payload: %w", err)
+	}
+	// Keep payload generation and erasure selection on independent streams.
+	erasureRNG := mrand.New(mrand.NewSource(seed + 0x5deece66d))
+	erasureCount := cfg.R - 1
+	started := time.Now()
+	blockStats := make([]blockFailureSummary, 0, (cfg.FileBytes+cfg.K*cfg.L-1)/(cfg.K*cfg.L))
+	failedFiles, mismatchFiles, blockFailures := 0, 0, 0
+
+	fmt.Fprintf(os.Stderr, "[raptorq-failure-rate] start bytes=%d K=%d R=%d L=%d trials=%d source_erasures=%d seed=%d\n", cfg.FileBytes, cfg.K, cfg.R, cfg.L, repeats, erasureCount, seed)
+	for trial := 1; trial <= repeats; trial++ {
+		blocks, _, _, _, _, err := encodeFile(payload, cfg)
+		if err != nil {
+			return fmt.Errorf("encode trial %d: %w", trial, err)
+		}
+		if trial == 1 {
+			for blockIndex, block := range blocks {
+				if erasureCount > block.K {
+					return fmt.Errorf("block %d has K=%d, cannot erase exactly R-1=%d source symbols", blockIndex, block.K, erasureCount)
+				}
+				blockStats = append(blockStats, blockFailureSummary{
+					BlockIndex: blockIndex, SourceSymbolsK: block.K,
+					SourceSymbolsErased:   erasureCount,
+					SourceSymbolsReceived: block.K - erasureCount,
+					RepairSymbolsReceived: cfg.R,
+					TotalSymbolsReceived:  block.K - erasureCount + cfg.R,
+				})
+			}
+		}
+		if len(blocks) != len(blockStats) {
+			return fmt.Errorf("trial %d produced %d blocks, expected %d", trial, len(blocks), len(blockStats))
+		}
+
+		decodedFile := make([]byte, 0, cfg.FileBytes)
+		fileDecodeFailed := false
+		for blockIndex, block := range blocks {
+			ok, recovered, err := decodeBlockWithRandomErasures(block, cfg, erasureCount, erasureRNG)
+			if err != nil {
+				return fmt.Errorf("trial %d block %d: %w", trial, blockIndex, err)
+			}
+			blockStats[blockIndex].Trials++
+			if !ok {
+				blockStats[blockIndex].DecodeFailures++
+				blockFailures++
+				fileDecodeFailed = true
+				continue
+			}
+			decodedFile = append(decodedFile, recovered...)
+		}
+
+		if fileDecodeFailed {
+			failedFiles++
+		} else if !bytes.Equal(payload, decodedFile) {
+			failedFiles++
+			mismatchFiles++
+		}
+		if trial%1000 == 0 || trial == repeats {
+			fmt.Fprintf(os.Stderr, "[raptorq-failure-rate] trial=%d/%d block_failures=%d failed_files=%d elapsed=%.1fs\n", trial, repeats, blockFailures, failedFiles, time.Since(started).Seconds())
+		}
+	}
+
+	totalBlockTrials := repeats * len(blockStats)
+	summary := failureRateSummary{
+		FileSizeBytes: cfg.FileBytes, K: cfg.K, R: cfg.R, SymbolBytes: cfg.L,
+		Repeats: repeats, Seed: seed,
+		ErasureSampling: "uniform without replacement: exactly R-1 source symbols erased independently in each block; all R repair symbols supplied",
+		BlocksPerFile:   len(blockStats), BlockTrials: totalBlockTrials,
+		BlockDecodeFailures: blockFailures, BlockFailureRate: float64(blockFailures) / float64(totalBlockTrials),
+		FailedFiles: failedFiles, FileFailureRate: float64(failedFiles) / float64(repeats),
+		RoundTripMismatchFiles: mismatchFiles, SuccessfulFiles: repeats - failedFiles,
+		ElapsedSeconds: time.Since(started).Seconds(), Blocks: blockStats, SummaryPath: summaryPath,
+	}
+	for i := range summary.Blocks {
+		if summary.Blocks[i].Trials > 0 {
+			summary.Blocks[i].DecodeFailureRate = float64(summary.Blocks[i].DecodeFailures) / float64(summary.Blocks[i].Trials)
+		}
+	}
+
+	if err := os.MkdirAll(filepath.Dir(summaryPath), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(summaryPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(summary); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return json.NewEncoder(os.Stdout).Encode(summary)
+}
+
+func decodeBlockWithRandomErasures(block encodedBlock, cfg config, erasureCount int, rng *mrand.Rand) (bool, []byte, error) {
+	if erasureCount < 0 || erasureCount > block.K {
+		return false, nil, fmt.Errorf("cannot erase %d of %d source symbols", erasureCount, block.K)
+	}
+	dec, err := fec.NewRaptorQDecoder(block.OriginalBytes, cfg.L)
+	if err != nil {
+		return false, nil, fmt.Errorf("create decoder: %w", err)
+	}
+	lost := make([]bool, block.K)
+	for _, index := range rng.Perm(block.K)[:erasureCount] {
+		lost[index] = true
+	}
+	for i := 0; i < block.K; i++ {
+		if lost[i] {
+			continue
+		}
+		symbol := make([]byte, cfg.L)
+		copy(symbol, block.Symbols[i])
+		if _, err := dec.AddSymbol(uint32(i), symbol); err != nil {
+			return false, nil, fmt.Errorf("add source symbol %d: %w", i, err)
+		}
+	}
+	for j := 0; j < cfg.R; j++ {
+		id := uint32(block.K + j)
+		if _, err := dec.AddSymbol(id, block.Symbols[block.K+j]); err != nil {
+			return false, nil, fmt.Errorf("add repair symbol %d: %w", id, err)
+		}
+	}
+	ok, recovered, err := dec.Decode()
+	if err != nil || !ok || len(recovered) != block.OriginalBytes {
+		return false, nil, nil
+	}
+	return true, recovered, nil
 }
 
 func encodeFile(payload []byte, cfg config) ([]encodedBlock, int, int, int, int, error) {

@@ -4,6 +4,7 @@ import (
 	bytespkg "bytes"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -29,6 +30,10 @@ type RXOptions struct {
 	// DisableObservation disables emitting the final "[rl-observation]" JSON line.
 	// This only affects logging, not metric collection.
 	DisableObservation bool
+
+	// PacketConn optionally supplies the UDP-like transport used by QUIC. When nil,
+	// the server keeps using its normal UDP socket via ListenAddr.
+	PacketConn net.PacketConn
 }
 
 func (o *RXOptions) setDefaults() {

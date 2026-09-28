@@ -105,7 +105,7 @@ plt.ylabel("Success probability P")
 # plt.title("Corrected: Shared deadline T, shared bw; GE(α=0.03, β=0.3)")
 plt.grid(True)
 plt.legend(loc="best")
-OUTPUT_DIR = Path(__file__).resolve().parent / "results"
+OUTPUT_DIR = Path(__file__).resolve().parents[2] / "figures" / "IR-analysis"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 plt.savefig(OUTPUT_DIR / "vary_ddl.png", dpi=200, bbox_inches="tight")
 plt.show()
