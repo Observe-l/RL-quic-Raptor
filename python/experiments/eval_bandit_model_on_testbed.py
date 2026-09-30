@@ -15,6 +15,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+try:
+    import torch
+except Exception:
+    torch = None
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _PY_ROOT = Path(__file__).resolve().parents[1]
 
@@ -23,7 +28,6 @@ import sys
 if str(_PY_ROOT) not in sys.path:
     sys.path.insert(0, str(_PY_ROOT))
 
-from bandit.features import phi as phi_fn  # noqa: E402
 from bandit.model_io import load_checkpoint  # noqa: E402
 from bandit.run_lints_ge_schedule import _ge_to_tc_gemodel_loss_mode  # noqa: E402
 
@@ -40,7 +44,7 @@ def _default_run_tag() -> str:
     return raw[:8] or "run"
 
 
-def _used_10_10_subnets() -> set[int]:
+def _used_172_31_subnets() -> set[int]:
     used: set[int] = set()
     try:
         p = subprocess.run(
@@ -51,10 +55,24 @@ def _used_10_10_subnets() -> set[int]:
             check=False,
         )
         for line in (p.stdout or "").splitlines():
-            m = re.search(r"\binet\s+10\.10\.(\d+)\.(\d+)/(\d+)", line)
+            m = re.search(r"\binet\s+172\.31\.(\d+)\.(\d+)/(\d+)", line)
             if not m:
                 continue
             used.add(int(m.group(1)))
+    except Exception:
+        pass
+    try:
+        p = subprocess.run(
+            ["ip", "-4", "route", "show", "table", "all"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+        for line in (p.stdout or "").splitlines():
+            m = re.match(r"\s*172\.31\.(\d+)\.\d+/\d+\b", line)
+            if m:
+                used.add(int(m.group(1)))
     except Exception:
         pass
     return used
@@ -78,12 +96,12 @@ def _netns_env_for_tag(tag: str) -> Dict[str, str]:
             raise ValueError(f"invalid QUICFEC_EVAL_SLOT: {slot_raw!r}") from exc
         if not 0 <= slot < 200:
             raise ValueError("QUICFEC_EVAL_SLOT must be in [0, 199]")
-        subnet = slot + 1
-        host_ip = f"10.240.{subnet}.1/24"
-        ns_ip = f"10.240.{subnet}.2/24"
+        subnet = slot + 20
+        host_ip = f"172.31.{subnet}.1/24"
+        ns_ip = f"172.31.{subnet}.2/24"
     else:
         base = 20 + (zlib.crc32(tag.encode("utf-8")) % 200)
-        used = _used_10_10_subnets()
+        used = _used_172_31_subnets()
         subnet = base
         for off in range(0, 200):
             cand = 20 + ((base - 20 + off) % 200)
@@ -91,8 +109,8 @@ def _netns_env_for_tag(tag: str) -> Dict[str, str]:
                 subnet = cand
                 break
 
-        host_ip = f"10.10.{subnet}.1/24"
-        ns_ip = f"10.10.{subnet}.2/24"
+        host_ip = f"172.31.{subnet}.1/24"
+        ns_ip = f"172.31.{subnet}.2/24"
 
     return {
         "NS": f"qns_{tag}",
@@ -315,30 +333,59 @@ def _pick_policy_action(
     theta_hat: np.ndarray,
     A_inv: np.ndarray,
     x: np.ndarray,
-    action_onehots: np.ndarray,
+    action_onehots,
     sigma: float,
 ) -> Tuple[int, np.ndarray, np.ndarray]:
     """Return (a_idx, theta_used, scores)."""
 
-    x = np.asarray(x, dtype=np.float32).reshape(-1)
-    action_onehots = np.asarray(action_onehots, dtype=np.float32)
-
-    # Build Phi matrix: (n_actions, dim)
-    Phi = np.asarray([phi_fn(x=x, a_onehot=ao) for ao in action_onehots], dtype=np.float64)
-
     if str(policy) == "random":
         a_idx = int(rng.randint(0, len(action_onehots)))
-        theta = np.zeros_like(np.asarray(theta_hat, dtype=np.float64).reshape(-1))
+        if torch is not None and isinstance(theta_hat, torch.Tensor):
+            theta = np.zeros((int(theta_hat.numel()),), dtype=np.float64)
+        else:
+            theta = np.zeros_like(np.asarray(theta_hat, dtype=np.float64).reshape(-1))
         scores = np.zeros((len(action_onehots),), dtype=np.float64)
         return a_idx, theta, scores
 
+    if torch is not None and isinstance(theta_hat, torch.Tensor):
+        device = theta_hat.device
+        x_t = torch.as_tensor(x, dtype=theta_hat.dtype, device=device).reshape(-1)
+        actions_t = action_onehots
+        if not isinstance(actions_t, torch.Tensor):
+            actions_t = torch.as_tensor(action_onehots, dtype=theta_hat.dtype, device=device)
+        if str(policy) == "greedy":
+            theta_t = theta_hat
+        else:
+            cov = (float(sigma) ** 2) * A_inv
+            factor = torch.linalg.cholesky(0.5 * (cov + cov.T))
+            noise = torch.as_tensor(rng.normal(size=int(theta_hat.numel())), dtype=theta_hat.dtype, device=device)
+            theta_t = theta_hat + factor @ noise
+        d = int(x_t.numel())
+        m = int(actions_t.shape[1])
+        off = 1 + d
+        theta_a = theta_t[off : off + m]
+        theta_xa = theta_t[off + m :].reshape(d, m)
+        scores_t = actions_t @ (theta_a + theta_xa.T @ x_t)
+        a_idx = int(torch.argmax(scores_t).item())
+        return (
+            a_idx,
+            theta_t.detach().cpu().numpy().astype(np.float64, copy=False),
+            scores_t.detach().cpu().numpy().astype(np.float64, copy=False),
+        )
+
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    action_onehots = np.asarray(action_onehots, dtype=np.float64)
     if str(policy) == "greedy":
         theta = np.asarray(theta_hat, dtype=np.float64).reshape(-1)
     else:
         cov = (float(sigma) ** 2) * np.asarray(A_inv, dtype=np.float64)
         theta = rng.multivariate_normal(mean=np.asarray(theta_hat, dtype=np.float64).reshape(-1), cov=cov)
-
-    scores = Phi @ theta
+    d = int(x.size)
+    m = int(action_onehots.shape[1])
+    off = 1 + d
+    theta_a = theta[off : off + m]
+    theta_xa = theta[off + m :].reshape(d, m)
+    scores = action_onehots @ (theta_a + theta_xa.T @ x)
     a_idx = int(np.argmax(scores))
     return a_idx, theta.astype(np.float64), scores.astype(np.float64)
 
@@ -370,6 +417,7 @@ def main() -> int:
 
     ap.add_argument("--checkpoint-prefix", type=str, required=True, help="Prefix path for checkpoint (reads <prefix>.npz and <prefix>.json)")
     ap.add_argument("--out-dir", type=str, required=True)
+    ap.add_argument("--device", type=str, default="cpu", help="device for checkpoint policy scoring")
     ap.add_argument("--run-tag", type=str, default="", help="Tag for netns/veth isolation")
 
     ap.add_argument(
@@ -429,7 +477,9 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Load checkpoint (agent + ctx + action set).
-    agent, lints_cfg, ctx, ctx_cfg, action_set, step_t = load_checkpoint(path_prefix=str(args.checkpoint_prefix))
+    agent, lints_cfg, ctx, ctx_cfg, action_set, step_t = load_checkpoint(
+        path_prefix=str(args.checkpoint_prefix), device=str(args.device)
+    )
 
     # Freeze posterior: never call agent.update(). Override RNG for reproducible evaluation.
     base_seed = int(args.seed)
@@ -447,7 +497,8 @@ def main() -> int:
     if not k_values or not r0_values or not rstep_values:
         raise SystemExit("checkpoint action_set missing factor values")
 
-    action_onehots = np.asarray([action_set.get_onehot(i) for i in range(len(action_set))], dtype=np.float32)
+    action_onehots_np = np.asarray([action_set.get_onehot(i) for i in range(len(action_set))], dtype=np.float64)
+    action_onehots = agent.tensor(action_onehots_np)
 
     run_tag = str(args.run_tag or "").strip() or _default_run_tag()
     net_env = _netns_env_for_tag(run_tag)
@@ -565,8 +616,8 @@ def main() -> int:
                     a_idx, theta_used, scores = _pick_policy_action(
                         policy=str(args.policy),
                         rng=rng,
-                        theta_hat=np.asarray(agent.theta_hat, dtype=np.float64),
-                        A_inv=np.asarray(agent.A_inv, dtype=np.float64),
+                        theta_hat=agent.theta_hat,
+                        A_inv=agent.A_inv,
                         x=x,
                         action_onehots=action_onehots,
                         sigma=float(getattr(lints_cfg, "sigma", 0.2)),

@@ -12,6 +12,18 @@ from bandit.context import ContextBuilder, ContextConfig
 from bandit.lints import LinTS, LinTSConfig
 
 
+def _as_numpy(value: Any, *, dtype=np.float64) -> np.ndarray:
+    """Serialize CPU or CUDA tensors using the existing portable NPZ format."""
+    try:
+        import torch
+
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().numpy()
+    except Exception:
+        pass
+    return np.asarray(value, dtype=dtype)
+
+
 def _rng_state_to_dict(rng: np.random.RandomState) -> Dict[str, Any]:
     # RandomState.get_state(): (str, ndarray, int, int, float)
     algo, keys, pos, has_gauss, cached_gauss = rng.get_state()
@@ -59,10 +71,10 @@ def save_checkpoint(
 
     np.savez_compressed(
         npz_path,
-        A=np.asarray(agent.A, dtype=np.float64),
-        b=np.asarray(agent.b, dtype=np.float64),
-        A_inv=np.asarray(agent.A_inv, dtype=np.float64),
-        theta_hat=np.asarray(agent.theta_hat, dtype=np.float64),
+        A=_as_numpy(agent.A),
+        b=_as_numpy(agent.b),
+        A_inv=_as_numpy(agent.A_inv),
+        theta_hat=_as_numpy(agent.theta_hat),
         t=np.asarray([int(agent.t)], dtype=np.int64),
         dim=np.asarray([int(agent.dim)], dtype=np.int64),
     )
@@ -117,6 +129,7 @@ def save_checkpoint(
 def load_checkpoint(
     *,
     path_prefix: str,
+    device: str = "cpu",
 ) -> Tuple[LinTS, LinTSConfig, ContextBuilder, ContextConfig, ActionSet, int]:
     """Load checkpoint saved by save_checkpoint()."""
 
@@ -144,11 +157,17 @@ def load_checkpoint(
     expected_dim += int(ContextBuilder(ctx_cfg).get_context().size) * int(action_set.onehot_dim)
     if dim != expected_dim:
         raise ValueError(f"checkpoint feature dimension {dim} does not match current 3-factor action map dimension {expected_dim}")
-    agent = LinTS(dim=dim, cfg=agent_cfg)
-    agent.A = np.asarray(arr["A"], dtype=np.float64)
-    agent.b = np.asarray(arr["b"], dtype=np.float64)
-    agent.A_inv = np.asarray(arr["A_inv"], dtype=np.float64)
-    agent.theta_hat = np.asarray(arr["theta_hat"], dtype=np.float64)
+    agent = LinTS(dim=dim, cfg=agent_cfg, device=device)
+    if agent.uses_torch:
+        agent.A = agent.tensor(np.asarray(arr["A"], dtype=np.float64))
+        agent.b = agent.tensor(np.asarray(arr["b"], dtype=np.float64))
+        agent.A_inv = agent.tensor(np.asarray(arr["A_inv"], dtype=np.float64))
+        agent.theta_hat = agent.tensor(np.asarray(arr["theta_hat"], dtype=np.float64))
+    else:
+        agent.A = np.asarray(arr["A"], dtype=np.float64)
+        agent.b = np.asarray(arr["b"], dtype=np.float64)
+        agent.A_inv = np.asarray(arr["A_inv"], dtype=np.float64)
+        agent.theta_hat = np.asarray(arr["theta_hat"], dtype=np.float64)
     agent.t = int(np.asarray(arr["t"]).reshape(-1)[0])
 
     # Restore RNG state

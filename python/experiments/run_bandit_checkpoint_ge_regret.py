@@ -126,6 +126,7 @@ def _run_checkpoint(
     decode_ddl_ms: int,
     done_deadline_ms: int,
     sender_ids: Sequence[int],
+    device: str,
 ) -> Tuple[int, int, str]:
     prefix = checkpoint_dir / f"model_t{int(step)}"
     out_dir = out_root / f"checkpoint_t{int(step)}"
@@ -139,6 +140,8 @@ def _run_checkpoint(
         str(EVALUATOR),
         "--checkpoint-prefix",
         str(prefix),
+        "--device",
+        str(device),
         "--out-dir",
         str(out_dir),
         "--run-tag",
@@ -293,7 +296,7 @@ def _summarize_checkpoint(
     repeats: int,
     oracle: Dict[str, Any],
     env_cfg: Dict[str, Any],
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     records = _load_jsonl(out_dir / "bandit_eval_metrics.jsonl")
     expected = _expected_records(sender_ids, repeats)
     if len(records) != expected:
@@ -307,12 +310,29 @@ def _summarize_checkpoint(
         by_sender[sid].append(record)
 
     rows: List[Dict[str, Any]] = []
+    excluded: List[Dict[str, Any]] = []
     scenes = oracle.get("scenes", {})
     for sid in sender_ids:
         reps = by_sender[sid]
         if len(reps) != int(repeats):
             raise ValueError(f"checkpoint t={step}, sender={sid}: expected {repeats}, found {len(reps)}")
         rewards = [_reward_from_record(r, env_cfg=env_cfg) for r in reps]
+        if all(reward == -1.0 for reward in rewards):
+            excluded.append(
+                {
+                    "checkpoint_step": int(step),
+                    "sender_id": int(sid),
+                    "repeat_count": len(rewards),
+                    "timeout_repeats": sum(
+                        int(r.get("env_info", {}).get("is_timeout", 0) or 0) == 1 for r in reps
+                    ),
+                    "md5_fail_repeats": sum(
+                        int(r.get("env_info", {}).get("is_md5_fail", 0) or 0) == 1 for r in reps
+                    ),
+                    "excluded_reason": "all_repeat_rewards_are_minus_one",
+                }
+            )
+            continue
         oracle_scene = scenes[str(sid)]["oracle"]
         oracle_reward = _to_float(oracle_scene.get("mean_reward"))
         action_counts: Dict[int, int] = {}
@@ -321,7 +341,11 @@ def _summarize_checkpoint(
             action_counts[aid] = action_counts.get(aid, 0) + 1
         modal_a_idx = min(action_counts, key=lambda aid: (-action_counts[aid], aid))
         modal = next(
-            (r.get("action", {}) for r in reps if int(r.get("action", {}).get("a_idx", -1)) == modal_a_idx),
+            (
+                r.get("action", {})
+                for r in reps
+                if int(r.get("action", {}).get("a_idx", r.get("a_idx", -1))) == modal_a_idx
+            ),
             {},
         )
         successes = [
@@ -353,11 +377,25 @@ def _summarize_checkpoint(
             }
         )
 
+    scene_fields = [
+        "checkpoint_step", "sender_id", "oracle_reward", "bandit_reward", "regret",
+        "bandit_reward_std", "bandit_success_rate", "mean_duration_ms",
+        "mean_goodput_mbps", "mean_overhead", "modal_a_idx", "modal_action_count",
+        "distinct_actions", "modal_K", "modal_R0", "modal_RSTEP",
+    ]
     with (out_dir / "checkpoint_scene_regret.csv").open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer = csv.DictWriter(f, fieldnames=scene_fields)
         writer.writeheader()
         writer.writerows(rows)
-    return rows
+    excluded_fields = [
+        "checkpoint_step", "sender_id", "repeat_count", "timeout_repeats",
+        "md5_fail_repeats", "excluded_reason",
+    ]
+    with (out_dir / "excluded_all_minus_one_senders.csv").open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=excluded_fields)
+        writer.writeheader()
+        writer.writerows(excluded)
+    return rows, excluded
 
 
 def _percentile(values: Iterable[float], q: float) -> float:
@@ -365,10 +403,17 @@ def _percentile(values: Iterable[float], q: float) -> float:
     return float(np.percentile(np.asarray(values, dtype=np.float64), q)) if values else 0.0
 
 
-def _write_aggregate(rows: Sequence[Dict[str, Any]], out_root: Path) -> Tuple[Path, Path]:
+def _write_aggregate(
+    rows: Sequence[Dict[str, Any]],
+    excluded_rows: Sequence[Dict[str, Any]],
+    out_root: Path,
+) -> Tuple[Path, Path, Path]:
     by_step: Dict[int, List[Dict[str, Any]]] = {}
     for row in rows:
         by_step.setdefault(int(row["checkpoint_step"]), []).append(row)
+    excluded_by_step: Dict[int, List[Dict[str, Any]]] = {}
+    for row in excluded_rows:
+        excluded_by_step.setdefault(int(row["checkpoint_step"]), []).append(row)
 
     scene_path = out_root / "per_scene_regret.csv"
     with scene_path.open("w", newline="", encoding="utf-8") as f:
@@ -378,24 +423,26 @@ def _write_aggregate(rows: Sequence[Dict[str, Any]], out_root: Path) -> Tuple[Pa
             writer.writerows(rows)
 
     summary: List[Dict[str, Any]] = []
-    for step in sorted(by_step):
-        group = by_step[step]
+    all_steps = sorted(set(by_step) | set(excluded_by_step))
+    for step in all_steps:
+        group = by_step.get(step, [])
         regrets = [float(r["regret"]) for r in group]
         summary.append(
             {
                 "checkpoint_step": int(step),
                 "scenes": int(len(group)),
-                "mean_regret": float(mean(regrets)),
-                "median_regret": float(median(regrets)),
+                "excluded_all_minus_one_senders": int(len(excluded_by_step.get(step, []))),
+                "mean_regret": float(mean(regrets)) if regrets else float("nan"),
+                "median_regret": float(median(regrets)) if regrets else float("nan"),
                 "p10_regret": _percentile(regrets, 10),
                 "p90_regret": _percentile(regrets, 90),
-                "positive_regret_fraction": float(mean(1.0 if x > 0 else 0.0 for x in regrets)),
-                "mean_oracle_reward": float(mean(_to_float(r["oracle_reward"]) for r in group)),
-                "mean_bandit_reward": float(mean(_to_float(r["bandit_reward"]) for r in group)),
-                "mean_success_rate": float(mean(_to_float(r["bandit_success_rate"]) for r in group)),
-                "mean_duration_ms": float(mean(_to_float(r["mean_duration_ms"]) for r in group)),
-                "mean_goodput_mbps": float(mean(_to_float(r["mean_goodput_mbps"]) for r in group)),
-                "mean_overhead": float(mean(_to_float(r["mean_overhead"]) for r in group)),
+                "positive_regret_fraction": float(mean(1.0 if x > 0 else 0.0 for x in regrets)) if regrets else float("nan"),
+                "mean_oracle_reward": float(mean(_to_float(r["oracle_reward"]) for r in group)) if group else float("nan"),
+                "mean_bandit_reward": float(mean(_to_float(r["bandit_reward"]) for r in group)) if group else float("nan"),
+                "mean_success_rate": float(mean(_to_float(r["bandit_success_rate"]) for r in group)) if group else float("nan"),
+                "mean_duration_ms": float(mean(_to_float(r["mean_duration_ms"]) for r in group)) if group else float("nan"),
+                "mean_goodput_mbps": float(mean(_to_float(r["mean_goodput_mbps"]) for r in group)) if group else float("nan"),
+                "mean_overhead": float(mean(_to_float(r["mean_overhead"]) for r in group)) if group else float("nan"),
             }
         )
 
@@ -404,7 +451,16 @@ def _write_aggregate(rows: Sequence[Dict[str, Any]], out_root: Path) -> Tuple[Pa
         writer = csv.DictWriter(f, fieldnames=list(summary[0]) if summary else ["checkpoint_step"])
         writer.writeheader()
         writer.writerows(summary)
-    return scene_path, summary_path
+    excluded_path = out_root / "excluded_all_minus_one_senders.csv"
+    excluded_fields = [
+        "checkpoint_step", "sender_id", "repeat_count", "timeout_repeats",
+        "md5_fail_repeats", "excluded_reason",
+    ]
+    with excluded_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=excluded_fields)
+        writer.writeheader()
+        writer.writerows(excluded_rows)
+    return scene_path, summary_path, excluded_path
 
 
 def _plot_results(*, summary_path: Path, scene_path: Path, out_root: Path) -> Tuple[Path, Path]:
@@ -480,6 +536,7 @@ def main() -> int:
     parser.add_argument("--bitrate-mbps", type=int, default=10)
     parser.add_argument("--decode-ddl-ms", type=int, default=25)
     parser.add_argument("--done-deadline-ms", type=int, default=500)
+    parser.add_argument("--device", type=str, default="cuda", help="device for checkpoint policy scoring")
     parser.add_argument("--steps", type=str, default="all", help="all, a comma list, or inclusive ranges such as 500-59500")
     args = parser.parse_args()
 
@@ -535,6 +592,7 @@ def main() -> int:
         "expected_transfers_per_checkpoint": int(expected_records),
         "total_expected_transfers": int(len(steps) * expected_records),
         "workers": int(args.workers),
+        "device": str(args.device),
         "file_bytes": int(args.file_bytes),
         "bitrate_mbps": int(args.bitrate_mbps),
         "timeout_transfer_s": int(args.timeout_transfer_s),
@@ -545,6 +603,7 @@ def main() -> int:
         "network_state_policy": "configure tc qdisc on the first transfer of each scenario and reuse it for the scenario repeats",
         "cc": "bbrv2",
         "reward_definition": "exact qarc_v1 formula reconstructed from evaluator raw_obs and run counters; regret=oracle_mean_reward-bandit_mean_reward",
+        "all_minus_one_filter": "for each checkpoint, exclude a sender from both policy and oracle aggregates if all repeated policy rewards for that sender equal -1; raw records are retained",
         "oracle_completed_trials": oracle.get("completed_trials"),
         "oracle_total_trials": oracle.get("total_trials"),
         "completed_steps_before_run": done_steps,
@@ -583,6 +642,7 @@ def main() -> int:
                     decode_ddl_ms=args.decode_ddl_ms,
                     done_deadline_ms=args.done_deadline_ms,
                     sender_ids=sender_ids,
+                    device=args.device,
                 )
             finally:
                 slots.put(slot)
@@ -597,31 +657,35 @@ def main() -> int:
                     raise SystemExit(f"checkpoint t={step} evaluator failed with code {code}; see {out_dir}/launcher.log")
 
     all_scene_rows: List[Dict[str, Any]] = []
+    all_excluded_rows: List[Dict[str, Any]] = []
     failed_summaries: List[int] = []
     for step in steps:
         out_dir = out_root / f"checkpoint_t{step}"
         try:
-            all_scene_rows.extend(
-                _summarize_checkpoint(
-                    step=step,
-                    out_dir=out_dir,
-                    sender_ids=sender_ids,
-                    repeats=args.repeats,
-                    oracle=oracle,
-                    env_cfg=env_cfg,
-                )
+            scene_rows, excluded_rows = _summarize_checkpoint(
+                step=step,
+                out_dir=out_dir,
+                sender_ids=sender_ids,
+                repeats=args.repeats,
+                oracle=oracle,
+                env_cfg=env_cfg,
             )
+            all_scene_rows.extend(scene_rows)
+            all_excluded_rows.extend(excluded_rows)
         except Exception as exc:
             failed_summaries.append(step)
             print(f"SUMMARY_FAILED checkpoint_t{step}: {exc}", file=sys.stderr, flush=True)
 
     if failed_summaries:
         raise SystemExit(f"could not summarize checkpoints: {failed_summaries}")
-    scene_path, summary_path = _write_aggregate(all_scene_rows, out_root)
+    if not all_scene_rows:
+        raise SystemExit("no valid sender/checkpoint comparisons remain after the all-minus-one filter")
+    scene_path, summary_path, excluded_path = _write_aggregate(all_scene_rows, all_excluded_rows, out_root)
     line_path, heatmap_path = _plot_results(summary_path=summary_path, scene_path=scene_path, out_root=out_root)
     print(f"OUT: {out_root}")
     print(f"- {summary_path}")
     print(f"- {scene_path}")
+    print(f"- {excluded_path}")
     print(f"- {line_path}")
     print(f"- {heatmap_path}")
     return 0

@@ -73,15 +73,16 @@ class QuicFecRunner:
         self._veth_host = (os.environ.get("QUICFEC_VETH_HOST") or f"vh{isolate_key}")[:15]
         self._veth_ns = (os.environ.get("QUICFEC_VETH_NS") or f"vn{isolate_key}")[:15]
 
-        # Per-run subnet to avoid having multiple host veth interfaces share an IP.
-        # Use a stable third octet derived from PID by default.
+        # Per-run subnet to avoid multiple host veth interfaces sharing an IP.
+        # The local VPN filters the 10/8 lab subnets, so use a 172.31/16
+        # private pool for the host<->namespace veth pair.
         if os.environ.get("QUICFEC_HOST_IP") and os.environ.get("QUICFEC_NS_IP"):
             self._host_ip_cidr = str(os.environ.get("QUICFEC_HOST_IP"))
             self._ns_ip_cidr = str(os.environ.get("QUICFEC_NS_IP"))
         else:
-            subnet_id = (int(os.getpid()) % 200) + 20
-            self._host_ip_cidr = f"10.200.{subnet_id}.1/24"
-            self._ns_ip_cidr = f"10.200.{subnet_id}.2/24"
+            subnet_id = self._choose_172_31_subnet()
+            self._host_ip_cidr = f"172.31.{subnet_id}.1/24"
+            self._ns_ip_cidr = f"172.31.{subnet_id}.2/24"
 
         # Avoid output file collisions on shared basenames.
         self._out_dir = os.environ.get("QUICFEC_OUT_DIR", f"/tmp/quicfec_out_{isolate_key}")
@@ -101,6 +102,53 @@ class QuicFecRunner:
         # Cache of the last applied network shaping parameters.
         # When stable within an episode, we can skip netns/tc reconfiguration per step.
         self._net_cfg_key: Optional[Tuple[int, str, int]] = None  # (rtt_ms, loss_mode, bitrate_mbps)
+
+    @staticmethod
+    def _choose_172_31_subnet() -> int:
+        used: set[int] = set()
+        try:
+            result = subprocess.run(
+                ["ip", "-4", "-o", "addr", "show"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+            )
+            for line in (result.stdout or "").splitlines():
+                match = re.search(r"\binet\s+172\.31\.(\d+)\.", line)
+                if match:
+                    used.add(int(match.group(1)))
+        except Exception:
+            pass
+        try:
+            result = subprocess.run(
+                ["ip", "-4", "route", "show", "table", "all"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+            )
+            for line in (result.stdout or "").splitlines():
+                match = re.match(r"\s*172\.31\.(\d+)\.\d+/\d+\b", line)
+                if match:
+                    used.add(int(match.group(1)))
+        except Exception:
+            pass
+        pool_start = int(os.environ.get("QUICFEC_TRAIN_NET_SUBNET_START", "20"))
+        pool_end = int(os.environ.get("QUICFEC_TRAIN_NET_SUBNET_END", "219"))
+        if pool_start < 20 or pool_end > 255 or pool_start > pool_end:
+            raise ValueError(
+                "QUICFEC_TRAIN_NET_SUBNET_START/END must define an ordered range within [20, 255]"
+            )
+        pool_size = pool_end - pool_start + 1
+        base = pool_start + (int(os.getpid()) % pool_size)
+        for offset in range(pool_size):
+            candidate = pool_start + ((base - pool_start + offset) % pool_size)
+            if candidate not in used:
+                return candidate
+        raise RuntimeError(
+            "no free 172.31.x.0/24 subnet remains in the configured isolated QUIC testbed pool"
+        )
 
     def _ensure_train_file(self) -> Optional[str]:
         if self.train_file_bytes is None:
@@ -194,7 +242,8 @@ class QuicFecRunner:
             env=env,
             capture_output=True,
             text=True,
-            timeout=self.timeout_sec,
+            # Namespace/qdisc setup is not part of the transfer deadline.
+            timeout=max(30, self.timeout_sec + 10),
         )
         if p.returncode != 0:
             raise RuntimeError(f"network setup failed: code={p.returncode} stderr={p.stderr[-400:]}\nstdout={p.stdout[-400:]}")
@@ -261,16 +310,17 @@ class QuicFecRunner:
         # Training speed knobs: keep each trial bounded and avoid linger.
         # The harness defaults POST_WAIT to ~3*RTT to let ARQ settle, but for RL
         # we prefer faster feedback.
-        env.setdefault("POST_WAIT", self.post_wait)
-        env.setdefault("SRV_TIMEOUT", self.srv_timeout)
-        env.setdefault("CLI_TIMEOUT", self.srv_timeout)
-        # Avoid long tail waits during training; benchmarks can override.
-        env.setdefault("QUIC_FEC_ARQ_DRAIN_CAP_MS", "3000")
+        env["POST_WAIT"] = self.post_wait
+        env["SRV_TIMEOUT"] = self.srv_timeout
+        env["CLI_TIMEOUT"] = self.srv_timeout
+        # Keep the application/server/ARQ deadline aligned with the requested
+        # transfer timeout, including when the parent shell has stale values.
+        env["QUIC_FEC_ARQ_DRAIN_CAP_MS"] = str(max(1, int(self.timeout_sec)) * 1000)
         if self.obs_wait_secs is not None:
-            env.setdefault("OBS_WAIT_SECS", str(int(self.obs_wait_secs)))
+            env["OBS_WAIT_SECS"] = str(max(1, int(self.obs_wait_secs)))
 
         # Keep harness-side timeouts aligned with the Python-side timeout budget.
-        env.setdefault("TIMEOUT_S", str(int(self.timeout_sec)))
+        env["TIMEOUT_S"] = str(int(self.timeout_sec))
 
         # Default-enable QUIC-layer attempted-send stats for log comparability.
         # The harness will export QUIC_FEC_STATS=1 when FEC_STATS=1.

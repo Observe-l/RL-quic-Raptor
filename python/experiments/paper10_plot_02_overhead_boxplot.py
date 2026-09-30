@@ -108,10 +108,23 @@ def main() -> None:
     ap.add_argument("--xmax", type=float, default=None, help="Optional x-axis max")
     ap.add_argument("--ymin", type=float, default=None, help="Optional y-axis min")
     ap.add_argument("--ymax", type=float, default=None, help="Optional y-axis max")
+    ap.add_argument(
+        "--figsize",
+        type=str,
+        default="3.5,3.0",
+        help="Figure size in inches as WIDTH,HEIGHT (default: 3.5,3.0).",
+    )
 
     ap.add_argument("--out", type=str, default="python/results/paper10_figs/02_overhead_boxplot.pdf")
 
     args = ap.parse_args()
+
+    try:
+        figure_width, figure_height = (float(x.strip()) for x in str(args.figsize).split(",", 1))
+    except (TypeError, ValueError):
+        ap.error("--figsize must be WIDTH,HEIGHT, e.g. 3.8,2.4")
+    if figure_width <= 0 or figure_height <= 0:
+        ap.error("--figsize dimensions must be positive")
 
     configure_matplotlib_like_paper()
     label_fontsize = 10
@@ -179,10 +192,11 @@ def main() -> None:
         if not xs:
             continue
         data.append(xs)
-        labels.append(method_label(m))
+        label = "Fixed\nBC-DIR" if str(m) == "fixed_bc_dir" else method_label(m)
+        labels.append(label)
         colors.append(str(method_color(m) or "C0"))
 
-    plt.figure(figsize=(3.5, 3.0))
+    plt.figure(figsize=(figure_width, figure_height))
     if data:
         bp = plt.boxplot(
             data,

@@ -13,6 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 _METHOD_LABELS_DEFAULT: Dict[str, str] = {
     "bandit": "BC-DIR",
+    "fixed_bc_dir": "Fixed BC-DIR",
     "quic_bbrv2": "QUIC",
     "flec": "FLEC",
     "flec_raptorq": "FLEC-RQ",
@@ -33,6 +34,7 @@ _METHOD_LABELS_DEFAULT: Dict[str, str] = {
 _METHOD_COLORS_DEFAULT: Dict[str, str] = {
     # Opaque paper-style colors close to the reference screenshot.
     "bandit": "#E7B05D",
+    "fixed_bc_dir": "#C8893C",
     "quic_bbrv2": "#D1B98C",
     "fec_k40_r0_0_rstep_4": "#A6C97A",
     "fec_k40_r0_4_rstep_0": "#B8A3C7",
@@ -50,6 +52,7 @@ _METHOD_COLORS_DEFAULT: Dict[str, str] = {
 _METHOD_MARKERS_DEFAULT: Dict[str, str] = {
     # Filled, distinct shapes for scatter plots.
     "bandit": "^",  # triangle
+    "fixed_bc_dir": "v",  # inverted triangle
     "fec_k40_r0_0_rstep_4": "o",  # circle
     "fec_k40_r0_4_rstep_0": "s",  # square
     "fec_k40_r0_0_rstep_10": "o",  # circle
@@ -585,6 +588,7 @@ def auto_methods_in_trials(trials: Sequence[TrialRow]) -> List[str]:
 
     default_order = [
         "bandit",
+        "fixed_bc_dir",
         "flec",
         "flec_raptorq",
         "quic_bbrv2",

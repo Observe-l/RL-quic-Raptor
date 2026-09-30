@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import csv
 import json
 import os
@@ -58,21 +59,28 @@ def _used_10_10_subnets() -> set[int]:
 	return used
 
 
-def _netns_env_for_tag(tag: str) -> Dict[str, str]:
+def _netns_env_for_tag(tag: str, *, subnet_override: Optional[int] = None) -> Dict[str, str]:
 	tag = re.sub(r"[^0-9a-zA-Z]+", "", str(tag or ""))
 	tag = tag[:8] if tag else _default_run_tag()
 
 	veth_host = ("vh" + tag)[:15]
 	veth_ns = ("vn" + tag)[:15]
 
-	base = 20 + (zlib.crc32(tag.encode("utf-8")) % 200)
 	used = _used_10_10_subnets()
-	subnet = base
-	for off in range(0, 200):
-		cand = 20 + ((base - 20 + off) % 200)
-		if cand not in used:
-			subnet = cand
-			break
+	if subnet_override is not None:
+		subnet = int(subnet_override)
+		if not 20 <= subnet <= 219:
+			raise ValueError("--net-subnet must be between 20 and 219")
+		if subnet in used:
+			raise ValueError(f"requested subnet 10.10.{subnet}.0/24 is already in use")
+	else:
+		base = 20 + (zlib.crc32(tag.encode("utf-8")) % 200)
+		subnet = base
+		for off in range(0, 200):
+			cand = 20 + ((base - 20 + off) % 200)
+			if cand not in used:
+				subnet = cand
+				break
 
 	host_ip = f"10.10.{subnet}.1/24"
 	ns_ip = f"10.10.{subnet}.2/24"
@@ -84,6 +92,21 @@ def _netns_env_for_tag(tag: str) -> Dict[str, str]:
 		"HOST_IP": host_ip,
 		"NS_IP": ns_ip,
 	}
+
+
+def _cleanup_netns(net_env: Dict[str, str]) -> None:
+	helper = str(os.environ.get("QUIC_FEC_PRIV_HELPER", "") or "").strip()
+	if not helper:
+		return
+	try:
+		subprocess.run(
+			["sudo", "-n", "--", helper, "cleanup", net_env["NS"], net_env["VETH_HOST"]],
+			stdout=subprocess.DEVNULL,
+			stderr=subprocess.DEVNULL,
+			check=False,
+		)
+	except Exception:
+		pass
 
 
 def _extract_last_run_record(s: str) -> str:
@@ -347,11 +370,18 @@ class Rec:
 def main() -> int:
 	ap = argparse.ArgumentParser(
 		description=(
-			"Run baselines only (quic-raw, IR-FEC1, IR-FEC2) under IID or GE loss, and write results (no plotting)."
+			"Run selected QUIC/FEC baselines under IID or GE loss, and write results (no plotting)."
 		)
 	)
 	ap.add_argument("--out-dir", type=str, required=True, help="Output directory")
 	ap.add_argument("--run-tag", type=str, default="", help="Tag for netns/veth isolation")
+	ap.add_argument("--net-subnet", type=int, default=None, help="Optional unique 10.10.X.0/24 subnet (20..219)")
+	ap.add_argument(
+		"--methods",
+		type=str,
+		default="quic,fec_k40_r0_0_rstep_4,fec_k40_r0_4_rstep_0",
+		help="Comma-separated methods: quic,fec_k40_r0_0_rstep_4,fec_k40_r0_4_rstep_0,fixed_bc_dir,fixed_bc_dir_k60_r14_rstep4",
+	)
 
 	ap.add_argument("--loss-profile", type=str, default="ge", choices=["ge", "iid"], help="Loss profile")
 	ap.add_argument("--iid-loss-pcts", type=str, default="0.1,0.2,0.3,0.4,0.5", help="IID loss percents list, e.g. '0.1,0.5,1.0'")
@@ -382,28 +412,30 @@ def main() -> int:
 
 	ap.add_argument("--file-bytes", type=int, default=128 * 1024)
 	ap.add_argument("--symbol-bytes", type=int, default=1200)
-	ap.add_argument(
-		"--ddl-ms",
-		type=int,
-		default=55,
-		help="Receiver ARQ soft deadline in ms (passed as DDL_MS to quicfec_run_once.sh)",
-	)
-	ap.add_argument(
-		"--decode-ddl-ms",
-		type=int,
-		default=25,
-		help="Receiver decode/check pacing in ms (passed as DECODE_DDL_MS to quicfec_run_once.sh)",
-	)
 
 	ap.add_argument("--enable-quic-overhead", type=int, default=1, choices=[0, 1])
 
 	args = ap.parse_args()
+	method_names = [part.strip() for part in str(args.methods).split(",") if part.strip()]
+	method_configs = {
+		"fec_k40_r0_0_rstep_4": (40, 0, 4),
+		"fec_k40_r0_4_rstep_0": (40, 4, 0),
+		"fixed_bc_dir": (40, 10, 10),
+		"fixed_bc_dir_k60_r14_rstep4": (60, 14, 4),
+	}
+	valid_method_names = {"quic", *method_configs.keys()}
+	unknown_methods = sorted(set(method_names) - valid_method_names)
+	if unknown_methods:
+		ap.error(f"unknown --methods entries: {', '.join(unknown_methods)}")
+	if not method_names:
+		ap.error("--methods must select at least one method")
 
 	out_dir = Path(str(args.out_dir))
 	out_dir.mkdir(parents=True, exist_ok=True)
 
 	run_tag = str(args.run_tag or "").strip() or _default_run_tag()
-	net_env = _netns_env_for_tag(run_tag)
+	net_env = _netns_env_for_tag(run_tag, subnet_override=args.net_subnet)
+	atexit.register(_cleanup_netns, net_env)
 
 	tmp_out_dir = Path("/tmp") / f"rl-quic-out-{net_env['NS']}"
 	tmp_out_dir.mkdir(parents=True, exist_ok=True)
@@ -437,31 +469,31 @@ def main() -> int:
 			sys.stderr.write("--- setup stderr (tail) ---\n" + _tail_text(setup_err).rstrip() + "\n")
 		return 2
 
-	# Build quic-raw binaries once as well.
-	raw_setup_env = {
-		**net_env,
-		"OUT_DIR": str(tmp_out_dir),
-		"SETUP_ONLY": "1",
-		"SKIP_NETNS_RESET": "1",
-		"SKIP_TC_CONFIG": "1",
-		"SKIP_BUILD": "0",
-		"BITRATE_MBPS": str(int(args.bitrate_mbps)),
-		"RTT_MS": str(int(args.rtt_ms)),
-		"LOSS_MODE": "none",
-		"TIMEOUT_S": str(int(args.timeout_transfer_s)),
-	}
-	raw_setup_out, raw_setup_err, raw_setup_rc, _, raw_setup_timed_out = _run_script(
-		script=_REPO_ROOT / "scripts" / "quicraw_run_once.sh", env=raw_setup_env, timeout_s=60
-	)
-	if raw_setup_timed_out == 1 or raw_setup_rc != 0:
-		sys.stderr.write("[error] setup failed (quicraw_run_once.sh).\n")
-		sys.stderr.write("- If this is the first run: run `sudo -v` once, then retry.\n")
-		sys.stderr.write(f"- rc={raw_setup_rc} timed_out={raw_setup_timed_out}\n")
-		if raw_setup_out.strip():
-			sys.stderr.write("--- setup stdout (tail) ---\n" + _tail_text(raw_setup_out).rstrip() + "\n")
-		if raw_setup_err.strip():
-			sys.stderr.write("--- setup stderr (tail) ---\n" + _tail_text(raw_setup_err).rstrip() + "\n")
-		return 2
+	if "quic" in method_names:
+		# Build quic-raw binaries once when raw QUIC is among the selected methods.
+		raw_setup_env = {
+			**net_env,
+			"OUT_DIR": str(tmp_out_dir),
+			"SETUP_ONLY": "1",
+			"SKIP_NETNS_RESET": "1",
+			"SKIP_TC_CONFIG": "1",
+			"SKIP_BUILD": "0",
+			"BITRATE_MBPS": str(int(args.bitrate_mbps)),
+			"RTT_MS": str(int(args.rtt_ms)),
+			"LOSS_MODE": "none",
+			"TIMEOUT_S": str(int(args.timeout_transfer_s)),
+		}
+		raw_setup_out, raw_setup_err, raw_setup_rc, _, raw_setup_timed_out = _run_script(
+			script=_REPO_ROOT / "scripts" / "quicraw_run_once.sh", env=raw_setup_env, timeout_s=60
+		)
+		if raw_setup_timed_out == 1 or raw_setup_rc != 0:
+			sys.stderr.write("[error] setup failed (quicraw_run_once.sh).\n")
+			sys.stderr.write(f"- rc={raw_setup_rc} timed_out={raw_setup_timed_out}\n")
+			if raw_setup_out.strip():
+				sys.stderr.write("--- setup stdout (tail) ---\n" + _tail_text(raw_setup_out).rstrip() + "\n")
+			if raw_setup_err.strip():
+				sys.stderr.write("--- setup stderr (tail) ---\n" + _tail_text(raw_setup_err).rstrip() + "\n")
+			return 2
 
 	common_env = {
 		**net_env,
@@ -587,27 +619,28 @@ def main() -> int:
 
 	for sender_id, rtt_ms, loss_mode in scenarios:
 		for rep in range(int(args.reps)):
-			env_raw = {
-				**common_env,
-				"RTT_MS": str(int(rtt_ms)),
-				"LOSS_MODE": str(loss_mode),
-			}
-			if int(args.enable_quic_overhead) == 1:
-				env_raw["RAW_STATS"] = "1"
-			_run_one(
-				method=f"quic_{str(args.cc)}",
-				script=_REPO_ROOT / "scripts" / "quicraw_run_once.sh",
-				env=env_raw,
-				sender_id=int(sender_id),
-				loss_mode=str(loss_mode),
-				rtt_ms=int(rtt_ms),
-				rep=int(rep),
-			)
+			if "quic" in method_names:
+				env_raw = {
+					**common_env,
+					"RTT_MS": str(int(rtt_ms)),
+					"LOSS_MODE": str(loss_mode),
+				}
+				if int(args.enable_quic_overhead) == 1:
+					env_raw["RAW_STATS"] = "1"
+				_run_one(
+					method=f"quic_{str(args.cc)}",
+					script=_REPO_ROOT / "scripts" / "quicraw_run_once.sh",
+					env=env_raw,
+					sender_id=int(sender_id),
+					loss_mode=str(loss_mode),
+					rtt_ms=int(rtt_ms),
+					rep=int(rep),
+				)
 
-			for method, k, r0, rstep in (
-				("fec_k40_r0_0_rstep_4", 40, 0, 4),
-				("fec_k40_r0_4_rstep_0", 40, 4, 0),
-			):
+			for method in method_names:
+				if method == "quic":
+					continue
+				k, r0, rstep = method_configs[method]
 				env_fec = {
 					**common_env,
 					"RTT_MS": str(int(rtt_ms)),
@@ -622,8 +655,8 @@ def main() -> int:
 					"K": str(int(k)),
 					"R0": str(int(r0)),
 					"RSTEP": str(int(rstep)),
-					"DDL_MS": str(int(args.ddl_ms)),
-					"DECODE_DDL_MS": str(int(args.decode_ddl_ms)),
+					# An empty override forces quicfec_run_once.sh to use its code default (25 ms).
+					"DECODE_DDL_MS": "",
 					"SYMBOL_BYTES": str(int(args.symbol_bytes)),
 					"USE_ARQ": "1",
 				}
@@ -639,7 +672,7 @@ def main() -> int:
 					rep=int(rep),
 				)
 
-			last = recs[-3:]
+			last = recs[-len(method_names):]
 			parts: List[str] = []
 			for r in last:
 				part = f"{r.method}(ok={r.success} dur_ms={int(r.dur_ms)} wall_ms={int(r.trial_wall_ms)}"
@@ -699,6 +732,10 @@ def main() -> int:
 		"net": net_env,
 		"tmp_out_dir": str(tmp_out_dir),
 		"args": vars(args),
+		"deadline_policy": {
+			"sender_soft_ddl": "auto from QUIC pacing (rho=1, DDL=N*Delta); legacy DDL_MS unset",
+			"receiver_decode_ddl_ms": "quicfec_run_once.sh default (25 ms)",
+		},
 	}
 	(out_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
