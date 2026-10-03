@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -75,6 +76,30 @@ def _ensure_go_binaries() -> None:
         subprocess.run(cmd, cwd=ROOT / "go", check=True)
 
 
+def _write_build_info(out_root: Path, cc: str) -> None:
+    binary_paths = {
+        name: ROOT / "go/bin" / name
+        for name in ("quicfec-server", "quicfec-client")
+    }
+    payload = {
+        "source_commit": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+        ).strip(),
+        "congestion_control": str(cc),
+        "simple_bbrv2_source_commit": "6970f5658d8662870b0856d367bee4191faf51af",
+        "controller_source_sha256": hashlib.sha256(
+            (ROOT / "go/internal/congestion/bbrv2_simple_sender.go").read_bytes()
+        ).hexdigest(),
+        "binary_sha256": {
+            name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for name, path in binary_paths.items()
+        },
+    }
+    (out_root / "build_info.json").write_text(
+        json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+    )
+
+
 def _cleanup_network(tag: str, log_path: Path) -> int:
     clean_tag = "".join(ch for ch in tag if ch.isalnum())[:8]
     ns = f"qns_{clean_tag}"
@@ -127,6 +152,7 @@ def _run_worker(
         str(args.seed),
         "--policy-repeats",
         "1",
+        "--skip-build",
         "--ctx-reset",
         args.ctx_reset,
         "--loss-profile",
@@ -160,8 +186,10 @@ def _run_worker(
         "--enable-quic-overhead",
         "1",
         "--cc",
-        "bbrv2",
+        args.cc,
     ]
+    if args.fixed_action:
+        command.extend(["--fixed-action", args.fixed_action])
     env = os.environ.copy()
     env.update(
         {
@@ -361,18 +389,25 @@ def main() -> int:
     ap.add_argument("--ge-key", default="GE_steady_rp")
     ap.add_argument("--ge-h-pct", type=float, default=0.0)
     ap.add_argument("--ge-k-pct", type=float, default=99.0)
+    ap.add_argument("--sender-ids", default="all", help="Optional comma-separated sender subset for smoke tests")
     ap.add_argument("--out-dir", type=Path, default=DEFAULT_OUT)
     ap.add_argument("--workers", type=int, default=21)
     ap.add_argument("--repeats", type=int, default=30)
     ap.add_argument("--file-bytes", type=int, default=128 * 1024)
     ap.add_argument("--bitrate-mbps", type=int, default=10)
-    ap.add_argument("--timeout-transfer-s", type=int, default=2)
+    ap.add_argument("--timeout-transfer-s", type=int, default=5)
     ap.add_argument("--timeout-s", type=int, default=60)
     ap.add_argument("--worker-timeout-s", type=int, default=1800)
     ap.add_argument("--decode-ddl-ms", type=int, default=25)
     ap.add_argument("--done-deadline-ms", type=int, default=500)
     ap.add_argument("--symbol-bytes", type=int, default=1200)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--fixed-action", default="", help="Fixed K,R0,RSTEP action; skips policy scoring")
+    ap.add_argument(
+        "--cc",
+        choices=["bbrv2", "bbr", "bbrv2-simple", "bbrv1", "bbr1", "cubic", "reno"],
+        default="bbrv2",
+    )
     ap.add_argument("--ctx-reset", choices=["per_scenario", "never"], default="per_scenario")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -388,7 +423,20 @@ def main() -> int:
         raise ValueError("workers must be in [1, 200]")
     if args.workers > 21:
         raise ValueError("the helper's reserved evaluator slot range for this run is 0..20")
-    senders = _sender_ids(args.ge_params, args.ge_key)
+    all_senders = _sender_ids(args.ge_params, args.ge_key)
+    if str(args.sender_ids).strip().lower() == "all":
+        senders = all_senders
+    else:
+        try:
+            requested_senders = sorted({int(part.strip()) for part in str(args.sender_ids).split(",") if part.strip()})
+        except ValueError as exc:
+            raise ValueError("--sender-ids must be 'all' or a comma-separated list of integers") from exc
+        unknown_senders = sorted(set(requested_senders) - set(all_senders))
+        if unknown_senders:
+            raise ValueError(f"sender IDs not present in GE params: {unknown_senders}")
+        senders = requested_senders
+        if not senders:
+            raise ValueError("--sender-ids selected no senders")
     checkpoint_step = _checkpoint_step(args.checkpoint)
     workers = _partition(senders, args.workers)
     if args.out_dir.exists():
@@ -428,7 +476,8 @@ def main() -> int:
                 "bitrate_mbps": args.bitrate_mbps,
                 "transfer_timeout_s": args.timeout_transfer_s,
                 "timeout_s": args.timeout_s,
-                "cc": "bbrv2",
+                "cc": args.cc,
+                "fixed_action": args.fixed_action or None,
                 "device": args.device,
                 "policy": "greedy",
                 "posterior_updates": False,
@@ -445,6 +494,7 @@ def main() -> int:
     )
 
     _ensure_go_binaries()
+    _write_build_info(args.out_dir, args.cc)
     worker_dirs: List[Path] = []
     failures: List[Tuple[int, int, int, str]] = []
     with ThreadPoolExecutor(max_workers=len(workers)) as pool:

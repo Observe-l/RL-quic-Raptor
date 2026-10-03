@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replot 1 MB IID E2E delay for BC-DIR, FLEC, and QUIC."""
+"""Replot 1 MB IID E2E delay for BC-DIR, FLEC, FLEC-RQ, and QUIC."""
 from __future__ import annotations
 
 import argparse
@@ -38,14 +38,18 @@ from plot_iid_loss_boxplots import (  # noqa: E402
 
 FILE_BYTES = 1024 * 1024
 LOSS_PCTS = (0.1, 0.2, 0.3, 0.4, 0.5)
-METHOD_ORDER = ("bandit", "flec", "quic_bbrv2")
+METHOD_ORDER = ("bandit", "flec", "flec_raptorq", "quic_bbrv2")
 
 
 def load_selected_points(
     baseline_csv: Path,
     bandit_log: Path,
     flec_jsonl: Path,
+    flec_rq_jsonl: Path,
 ) -> Dict[str, List[Point]]:
+    rq_source_points = _load_flec_points(
+        flec_jsonl=flec_rq_jsonl, methods={"flec"}, sender_ids=None
+    )
     methods: Dict[str, List[Point]] = {
         "bandit": _load_bandit_eval_points(
             eval_jsonl=bandit_log, methods={"bandit"}, sender_ids=None
@@ -53,6 +57,17 @@ def load_selected_points(
         "flec": _load_flec_points(
             flec_jsonl=flec_jsonl, methods={"flec"}, sender_ids=None
         ),
+        # Reuse FLEC's success filtering and corrected E2E-delay calculation;
+        # only relabel the rows so the RaptorQ variant stays a separate series.
+        "flec_raptorq": [
+            Point(
+                method="flec_raptorq",
+                loss_pct=point.loss_pct,
+                overhead=point.overhead,
+                e2e_delay_ms=point.e2e_delay_ms,
+            )
+            for point in rq_source_points
+        ],
         "quic_bbrv2": _load_baseline_points(
             results_csv=baseline_csv,
             file_bytes=FILE_BYTES,
@@ -149,6 +164,11 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--flec-rq-jsonl",
+        type=Path,
+        default=REPO_ROOT / "python/results/flec_data/flec_raptorq_iid_1m.jsonl",
+    )
+    parser.add_argument(
         "--out",
         type=Path,
         default=REPO_ROOT / "figures/vary_density/iid-1m-e2e-delay.png",
@@ -156,7 +176,10 @@ def main() -> None:
     args = parser.parse_args()
 
     points = load_selected_points(
-        args.baseline_csv.resolve(), args.bandit_log.resolve(), args.flec_jsonl.resolve()
+        args.baseline_csv.resolve(),
+        args.bandit_log.resolve(),
+        args.flec_jsonl.resolve(),
+        args.flec_rq_jsonl.resolve(),
     )
     render(points, args.out.resolve())
     print(f"wrote {args.out.resolve()}")

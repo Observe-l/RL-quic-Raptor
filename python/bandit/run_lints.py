@@ -268,7 +268,7 @@ def main() -> int:
     # LinTS
     ap.add_argument("--lints-lam", type=float, default=1.0)
     ap.add_argument("--lints-sigma", type=float, default=0.2)
-    ap.add_argument("--lints-rho", type=float, default=0.99)
+    ap.add_argument("--lints-rho", type=float, default=0.9999)
     ap.add_argument("--lints-recompute", type=int, default=100)
     ap.add_argument("--seed", type=int, default=0)
 

@@ -310,7 +310,28 @@ def _run_script(*, script: Path, env: Dict[str, str], timeout_s: int) -> str:
         text=True,
         timeout=int(timeout_s),
     )
-    return str(p.stderr or "")
+    stderr = str(p.stderr or "")
+    if p.returncode != 0 and not _extract_last_run_record(stderr):
+        raise RuntimeError(
+            f"{script.name} exited with rc={p.returncode}; stderr tail:\n{stderr[-4000:]}"
+        )
+    return stderr
+
+
+def _fixed_action_index(action_set, action_values: Tuple[int, int, int]) -> int:
+    k_values = list(action_set.k_values)
+    r0_values = list(action_set.r0_values)
+    rstep_values = list(action_set.rstep_values)
+    for idx in range(len(action_set)):
+        spec = action_set.get_action(idx)
+        candidate = (
+            int(k_values[int(spec.k_idx)]),
+            int(r0_values[int(spec.r0_idx)]),
+            int(rstep_values[int(spec.rstep_idx)]),
+        )
+        if candidate == action_values:
+            return int(idx)
+    raise ValueError(f"fixed action {action_values} is not present in the checkpoint action set")
 
 
 def _read_last_rl_observation(obs_json_path: Path) -> Dict[str, Any]:
@@ -430,6 +451,12 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0, help="Seed for TS sampling (and tie-breaking RNG)")
     ap.add_argument("--policy-repeats", type=int, default=1, help="Repeat evaluation with seed+i and average in plotting")
     ap.add_argument(
+        "--fixed-action",
+        type=str,
+        default="",
+        help="Optional fixed action K,R0,RSTEP; skips bandit policy scoring",
+    )
+    ap.add_argument(
         "--ctx-reset",
         type=str,
         default="per_scenario",
@@ -455,8 +482,13 @@ def main() -> int:
         "--cc",
         type=str,
         default="bbrv2",
-        choices=["bbrv2", "bbr", "bbrv1", "bbr1", "cubic", "reno"],
+        choices=["bbrv2", "bbr", "bbrv2-simple", "bbrv1", "bbr1", "cubic", "reno"],
         help="Congestion control algorithm (passed as QUIC_FEC_CC_ALGO to quicfec_run_once.sh)",
+    )
+    ap.add_argument(
+        "--skip-build",
+        action="store_true",
+        help="Reuse binaries built by an outer experiment coordinator",
     )
 
     ap.add_argument("--file-bytes", type=int, default=128 * 1024)
@@ -472,6 +504,17 @@ def main() -> int:
     ap.add_argument("--enable-quic-overhead", type=int, default=1, choices=[0, 1])
 
     args = ap.parse_args()
+
+    fixed_action_values: Optional[Tuple[int, int, int]] = None
+    fixed_action_idx: Optional[int] = None
+    if str(args.fixed_action).strip():
+        try:
+            parts = tuple(int(part.strip()) for part in str(args.fixed_action).split(","))
+        except ValueError as exc:
+            raise SystemExit("--fixed-action must be K,R0,RSTEP, e.g. 40,10,10") from exc
+        if len(parts) != 3:
+            raise SystemExit("--fixed-action must be K,R0,RSTEP, e.g. 40,10,10")
+        fixed_action_values = (parts[0], parts[1], parts[2])
 
     out_dir = Path(str(args.out_dir))
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -496,6 +539,9 @@ def main() -> int:
     rstep_values = list(action_set.rstep_values)
     if not k_values or not r0_values or not rstep_values:
         raise SystemExit("checkpoint action_set missing factor values")
+    if fixed_action_values is not None:
+        fixed_action_idx = _fixed_action_index(action_set, fixed_action_values)
+    policy_name = "fixed" if fixed_action_idx is not None else str(args.policy)
 
     action_onehots_np = np.asarray([action_set.get_onehot(i) for i in range(len(action_set))], dtype=np.float64)
     action_onehots = agent.tensor(action_onehots_np)
@@ -524,7 +570,7 @@ def main() -> int:
         "SETUP_ONLY": "1",
         "SKIP_NETNS_RESET": "0",
         "SKIP_TC_CONFIG": "0",
-        "SKIP_BUILD": "0",
+        "SKIP_BUILD": "1" if args.skip_build else "0",
         "BITRATE_MBPS": str(int(args.bitrate_mbps)),
         "RTT_MS": str(int(args.rtt_ms)),
         "LOSS_MODE": "none",
@@ -539,7 +585,7 @@ def main() -> int:
         "SKIP_NETNS_RESET": "1",
         "SKIP_TC_CONFIG": "0",
         "SKIP_SYSCTL": "1",
-        "SKIP_BUILD": "0",
+        "SKIP_BUILD": "1" if args.skip_build else "0",
         "BITRATE_MBPS": str(int(args.bitrate_mbps)),
         "TIMEOUT_S": str(int(args.timeout_transfer_s)),
         "QUIC_FEC_CC_BYPASS": "0",
@@ -613,15 +659,20 @@ def main() -> int:
                     qdisc_reconfigured = int(rep == 0)
 
                     # Select action.
-                    a_idx, theta_used, scores = _pick_policy_action(
-                        policy=str(args.policy),
-                        rng=rng,
-                        theta_hat=agent.theta_hat,
-                        A_inv=agent.A_inv,
-                        x=x,
-                        action_onehots=action_onehots,
-                        sigma=float(getattr(lints_cfg, "sigma", 0.2)),
-                    )
+                    if fixed_action_idx is None:
+                        a_idx, theta_used, scores = _pick_policy_action(
+                            policy=str(args.policy),
+                            rng=rng,
+                            theta_hat=agent.theta_hat,
+                            A_inv=agent.A_inv,
+                            x=x,
+                            action_onehots=action_onehots,
+                            sigma=float(getattr(lints_cfg, "sigma", 0.2)),
+                        )
+                    else:
+                        a_idx = fixed_action_idx
+                        theta_used = np.asarray(agent.theta_hat, dtype=np.float64)
+                        scores = np.zeros((len(action_set),), dtype=np.float64)
 
                     a_spec = action_set.get_action(int(a_idx))
                     K = int(k_values[int(a_spec.k_idx)])
@@ -652,6 +703,11 @@ def main() -> int:
 
                     stderr = _run_script(script=_REPO_ROOT / "scripts" / "quicfec_run_once.sh", env=env_fec, timeout_s=int(args.timeout_s))
                     run_line = _extract_last_run_record(stderr)
+                    if not run_line:
+                        raise RuntimeError(
+                            f"missing [run] record for sender={sender_id} rep={rep}; "
+                            f"stderr tail:\n{stderr[-4000:]}"
+                        )
                     kv = _parse_kv_from_run_line(run_line)
 
                     timed_out = _to_int(kv, "timed_out", 0)
@@ -751,7 +807,7 @@ def main() -> int:
 
                     rec = EvalRec(
                         t=int(t_global),
-                        policy=str(args.policy),
+                        policy=policy_name,
                         policy_rep=int(policy_rep),
                         sender_id=int(sender_id),
                         loss_mode=str(loss_mode),
@@ -777,8 +833,12 @@ def main() -> int:
                     csv_rows.append(
                         {
                             "task": str(task),
-                            "method": "random" if str(args.policy) == "random" else "bandit",
-                            "policy": str(args.policy),
+                            "method": (
+                                f"fixed_bc_dir_k{K}_r{R0}_dr{RSTEP}"
+                                if fixed_action_idx is not None
+                                else ("random" if str(args.policy) == "random" else "bandit")
+                            ),
+                            "policy": policy_name,
                             "policy_rep": int(policy_rep),
                             "sender_id": int(sender_id),
                             "loss_mode": str(loss_mode),

@@ -167,6 +167,13 @@ func newSentPacketHandler(
 				initialMaxDatagramSize,
 				tracer,
 			)
+		case "bbrv2-simple", "simple-bbrv2":
+			congestionCtrl = congestion.NewSimpleBBRv2Sender(
+				congestion.DefaultClock{},
+				rttStats,
+				initialMaxDatagramSize,
+				tracer,
+			)
 		case "bbr", "bbrv2":
 			congestionCtrl = congestion.NewBBRv2Sender(
 				congestion.DefaultClock{},

@@ -499,6 +499,43 @@ def _load_senders(params_path: str) -> List[Tuple[int, Dict[str, Any]]]:
     return parsed
 
 
+def _select_senders(
+    senders: List[Tuple[int, Dict[str, Any]]],
+    selection: str,
+    *,
+    option_name: str,
+) -> List[Tuple[int, Dict[str, Any]]]:
+    """Select sender rows by IDs/ranges while preserving the GE file order."""
+    available = {int(sid) for sid, _ in senders}
+    raw = str(selection or "all").strip().lower()
+    if raw == "all":
+        return list(senders)
+
+    requested: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            try:
+                lo, hi = (int(value.strip()) for value in part.split("-", 1))
+            except ValueError as exc:
+                raise ValueError(f"invalid {option_name} range: {part!r}") from exc
+            requested.update(range(min(lo, hi), max(lo, hi) + 1))
+        else:
+            try:
+                requested.add(int(part))
+            except ValueError as exc:
+                raise ValueError(f"invalid {option_name} sender ID: {part!r}") from exc
+
+    if not requested:
+        raise ValueError(f"{option_name} must select at least one sender or 'all'")
+    unknown = sorted(requested - available)
+    if unknown:
+        raise ValueError(f"{option_name} contains sender IDs absent from GE data: {unknown}")
+    return [(sid, row) for sid, row in senders if sid in requested]
+
+
 def _ge_to_tc_gemodel_loss_mode(
     ge_rp: Dict[str, Any],
     *,
@@ -671,6 +708,12 @@ def main() -> int:
     ap.add_argument("--eval-repeats", type=int, default=20, help="policy evaluation transfers per GE sender at each checkpoint")
     ap.add_argument("--random-baseline-repeats", type=int, default=20, help="one-time random-policy repeats per GE sender, at the first checkpoint")
     ap.add_argument("--eval-workers", type=int, default=4, help="maximum concurrent background greedy-policy evaluation processes")
+    ap.add_argument(
+        "--train-sender-ids",
+        type=str,
+        default="all",
+        help="GE sender IDs used only for online training (comma-separated IDs/ranges, or all)",
+    )
     ap.add_argument("--eval-sender-ids", type=str, default="all", help="GE sender IDs used for checkpoint evaluation (default: all)")
     ap.add_argument("--oracle-json", type=str, default=None, help="optional per-sender action-oracle JSON; enables online oracle-regret CSV/plot output")
 
@@ -712,8 +755,30 @@ def main() -> int:
     if total_steps % episode_steps != 0:
         raise ValueError("--steps must be divisible by --episode-steps to align resets")
 
-    # Load senders (cycled sequentially).
-    senders = _load_senders(str(args.ge_params))
+    # Keep the full GE population available for oracle validation/evaluation,
+    # while optionally training on a filtered sender subset.
+    all_senders = _load_senders(str(args.ge_params))
+    senders = _select_senders(
+        all_senders,
+        str(args.train_sender_ids),
+        option_name="--train-sender-ids",
+    )
+    evaluation_senders = _select_senders(
+        all_senders,
+        str(args.eval_sender_ids),
+        option_name="--eval-sender-ids",
+    )
+    training_sender_ids = [int(sid) for sid, _ in senders]
+    evaluation_sender_ids = [int(sid) for sid, _ in evaluation_senders]
+    excluded_training_sender_ids = sorted(
+        {int(sid) for sid, _ in all_senders} - set(training_sender_ids)
+    )
+    print(
+        f"[bandit] training_senders={len(training_sender_ids)}/{len(all_senders)} "
+        f"evaluation_senders={len(evaluation_sender_ids)}/{len(all_senders)} "
+        f"excluded_from_training={excluded_training_sender_ids}",
+        flush=True,
+    )
     ge_key = str(args.ge_key)
     oracle_data: Optional[Dict[str, Any]] = None
     if args.oracle_json:
@@ -722,7 +787,7 @@ def main() -> int:
         oracle_scenes = oracle_data.get("scenes") if isinstance(oracle_data, dict) else None
         if not isinstance(oracle_scenes, dict):
             raise ValueError(f"oracle JSON has no scenes mapping: {args.oracle_json}")
-        sender_ids_from_ge = {int(sid) for sid, _ in senders}
+        sender_ids_from_ge = {int(sid) for sid, _ in all_senders}
         sender_ids_from_oracle = {int(sid) for sid in oracle_scenes}
         if not sender_ids_from_ge.issubset(sender_ids_from_oracle):
             raise ValueError(
@@ -858,7 +923,12 @@ def main() -> int:
         "args": vars(args),
         "ge_params": os.path.abspath(str(args.ge_params)),
         "ge_key": ge_key,
-        "full_ge_sender_count": len(senders),
+        "full_ge_sender_count": len(all_senders),
+        "training_ge_sender_count": len(senders),
+        "training_sender_ids": training_sender_ids,
+        "excluded_training_sender_ids": excluded_training_sender_ids,
+        "evaluation_ge_sender_count": len(evaluation_senders),
+        "evaluation_sender_ids": evaluation_sender_ids,
         "n_actions": int(len(action_set)),
         "action_feature_dim": int(action_set.onehot_dim),
         "linear_feature_dim": int(agent.dim),
@@ -870,7 +940,7 @@ def main() -> int:
         "baseline_eval_workers": 1,
         "oracle_json": os.path.abspath(str(args.oracle_json)) if args.oracle_json else None,
         "oracle_available_sender_count": len(oracle_data["scenes"]) if oracle_data is not None else None,
-        "oracle_compared_sender_count": len(senders) if oracle_data is not None else None,
+        "oracle_compared_sender_count": len(evaluation_senders) if oracle_data is not None else None,
         "posterior_matrix_update": "exact_inverse_recomputed_after_every_update",
         "training_net_subnet_pool": "172.31.220.0/24-172.31.239.0/24",
     }
@@ -1147,9 +1217,15 @@ def main() -> int:
         )
         return sid, loss_mode, float(h_pct), float(k_pct)
 
-    # Initial reset (episode 0)
+    # Initial reset (episode 0). A fresh run has no saved model yet, so save
+    # the initialized t=0 policy before scheduling its first asynchronous
+    # evaluation. This makes the learning curve include a true cold-start point.
     sender_id, active_loss_mode, active_h_pct, active_k_pct = _episode_reset()
-    if eval_interval > 0 and start_t > 0 and start_t % eval_interval == 0:
+    if start_t == 0:
+        save_periodic_checkpoint(0, note="initial")
+        if eval_interval > 0:
+            _schedule_evaluation(0)
+    elif eval_interval > 0 and start_t % eval_interval == 0:
         _schedule_evaluation(start_t)
 
     dim = int(getattr(agent, "dim", 0))
